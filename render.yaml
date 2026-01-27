@@ -4,9 +4,12 @@ services:
     env: python
     region: oregon
     plan: free
-    buildCommand: pip install -r requirements.txt
-    # Your file is at python-backend/main.py so we need to reference it correctly
+    buildCommand: pip install -r python-backend/requirements.txt && python process_geotechnical_data.py
     startCommand: cd python-backend && uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: PYTHON_VERSION
         value: "3.11"
+      - key: SUPABASE_URL
+        fromEnv: SUPABASE_URL
+      - key: SUPABASE_SERVICE_KEY
+        fromEnv: SUPABASE_SERVICE_KEY
