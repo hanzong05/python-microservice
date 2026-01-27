@@ -13,8 +13,6 @@ python-multipart==0.0.20
 
 # Supabase and Database
 supabase==2.4.0
-postgis==2.0.0
 
-# PostGIS Support
-shapely==2.0.2
+# GIS Support (optional)
 geojson==3.1.0
