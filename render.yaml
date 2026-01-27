@@ -1,8 +1,12 @@
 services:
   - type: web
-    name: todo-python-api
-    runtime: python
+    name: geo-predict-api
+    env: python
     region: oregon
     plan: free
-    buildCommand: cd python-backend && pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt
+    # Your file is at python-backend/main.py so we need to reference it correctly
     startCommand: cd python-backend && uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
