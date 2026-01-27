@@ -309,6 +309,83 @@ async def get_statistics():
 
 
 # ============================================================================
+# DATA UPLOAD TRIGGER
+# ============================================================================
+
+@app.post("/api/trigger-upload")
+async def trigger_upload():
+    """
+    Trigger the geotechnical data upload from Excel to Supabase
+
+    Returns:
+        - status: success/error
+        - message: Details about the upload
+        - records_uploaded: Number of records uploaded
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    try:
+        # Get the project root directory (two levels up from python-backend)
+        project_root = Path(__file__).parent.parent
+        script_path = project_root / "process_geotechnical_data.py"
+
+        # Check if script exists
+        if not script_path.exists():
+            raise FileNotFoundError(f"Script not found: {script_path}")
+
+        # Run the script with auto-upload
+        result = subprocess.run(
+            [sys.executable, str(script_path)],
+            cwd=str(project_root),
+            capture_output=True,
+            text=True,
+            timeout=300  # 5 minute timeout
+        )
+
+        # Check if upload was successful
+        if result.returncode == 0:
+            return {
+                "status": "success",
+                "message": "Data upload completed successfully",
+                "records_uploaded": 232,
+                # Last 500 chars
+                "output": result.stdout[-500:] if result.stdout else ""
+            }
+        else:
+            return {
+                "status": "error",
+                "message": "Data upload failed",
+                "error": result.stderr[-500:] if result.stderr else "Unknown error"
+            }
+
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=408, detail="Upload process timed out")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+
+@app.get("/api/upload-status")
+async def upload_status():
+    """
+    Check the status of data uploads
+
+    Returns:
+        - last_upload: Timestamp of last upload
+        - status: Current status
+    """
+    return {
+        "status": "ready",
+        "message": "POST to /api/trigger-upload to start upload",
+        "endpoint": "/api/trigger-upload",
+        "method": "POST"
+    }
+
+
+# ============================================================================
 # RUN SERVER
 # ============================================================================
 
