@@ -3,8 +3,8 @@ fastapi==0.115.0
 uvicorn[standard]==0.32.1
 
 # Data Processing - CRITICAL!
-numpy==1.26.3
-pandas==2.1.4
+numpy==1.26.4
+pandas==2.2.3
 openpyxl==3.11.0
 
 # API utilities
