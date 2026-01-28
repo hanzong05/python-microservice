@@ -1,63 +1,9 @@
-# ============================================================================
-# LIQUEFACTION PREDICTION SYSTEM - COMPLETE REQUIREMENTS
-# Tarlac Province, Philippines
-# Install with: pip install -r requirements.txt
-# ============================================================================
-
-# ----------------------------------------------------------------------------
-# Core Data Processing (CRITICAL - Required for all scripts)
-# ----------------------------------------------------------------------------
 numpy==1.26.4
-pandas==2.2.3
-openpyxl==3.1.5
-
-# ----------------------------------------------------------------------------
-# Machine Learning (Required for Feature Engineering & Model Training)
-# ----------------------------------------------------------------------------
-scikit-learn>=1.3.0
-joblib>=1.3.0
-
-# ----------------------------------------------------------------------------
-# Database & Storage (Required for all pipeline stages)
-# ----------------------------------------------------------------------------
-supabase==2.4.0
-python-dotenv>=1.0.0
-
-# ----------------------------------------------------------------------------
-# Visualization (Recommended - for plots and confusion matrices)
-# ----------------------------------------------------------------------------
-matplotlib>=3.7.0
-seaborn>=0.12.0
-
-# ----------------------------------------------------------------------------
-# Web Framework (For Phase 5 - Web Application Deployment)
-# ----------------------------------------------------------------------------
-fastapi==0.115.0
-uvicorn[standard]==0.32.1
-pydantic==2.10.3
-python-multipart==0.0.20
-
-# ----------------------------------------------------------------------------
-# GIS Support (For spatial visualization and mapping)
-# ----------------------------------------------------------------------------
-geojson==3.1.0
-
-# ----------------------------------------------------------------------------
-# Additional Utilities
-# ----------------------------------------------------------------------------
-requests>=2.31.0
-python-dateutil>=2.8.0
-
-# ============================================================================
-# INSTALLATION NOTES:
-# ============================================================================
-# 
-# For Data Pipeline Only (Steps 1-4):
-#   pip install numpy pandas openpyxl scikit-learn joblib supabase python-dotenv matplotlib seaborn
-#
-# For Full System (including Web App):
-#   pip install -r requirements.txt
-#
-# Minimum Python Version: 3.8+
-# Recommended Python Version: 3.10+
-# ============================================================================
+scikit-learn==1.4.2
+pandas==2.2.1
+joblib==1.4.2
+fastapi==0.109.2
+uvicorn==0.27.1
+python-multipart==0.0.9
+supabase==2.3.4
+openpyxl==3.1.2
