@@ -1,0 +1,132 @@
+{
+  "feature_names": [
+    "layer_number",
+    "depth_from_m",
+    "depth_to_m",
+    "spt_n_value",
+    "spt_n60",
+    "spt_n160",
+    "unit_weight",
+    "moisture_content",
+    "plasticity_index",
+    "fines_content",
+    "mean_particle_size_d50",
+    "groundwater_depth_m",
+    "friction_angle",
+    "cohesion_kpa",
+    "csr",
+    "cyclic_strength_ratio",
+    "effective_overburden_pressure",
+    "total_overburden_pressure",
+    "relative_density_percent",
+    "foundation_width_m",
+    "foundation_depth_m",
+    "elastic_modulus_es",
+    "latitude",
+    "longitude",
+    "elevation",
+    "depth_total_m",
+    "depth_mid_m",
+    "depth_thickness_m",
+    "depth_to_groundwater_m",
+    "is_below_groundwater",
+    "spt_correction_ratio",
+    "spt_n_log",
+    "spt_n160_log",
+    "liquefaction_resistance",
+    "uscs_encoded",
+    "effective_stress_ratio",
+    "overburden_pressure_diff",
+    "normalized_effective_stress",
+    "factor_of_safety",
+    "liquefaction_potential_index",
+    "bearing_capacity_safety_factor",
+    "consolidation_potential",
+    "municipality_encoded",
+    "distance_from_center_km",
+    "depth_spt_interaction",
+    "fines_moisture_interaction",
+    "csr_depth_interaction",
+    "spt_fines_interaction",
+    "borehole_avg_spt",
+    "spt_deviation_from_borehole_avg",
+    "borehole_liquefaction_rate",
+    "relative_density_estimated",
+    "liquefaction_susceptibility_score"
+  ],
+  "num_features": 53,
+  "training_samples": 627,
+  "validation_samples": 90,
+  "test_samples": 180,
+  "timestamp": "2026-01-28T14:53:06.358390",
+  "model_architecture": {
+    "hidden_layers": [
+      128,
+      64,
+      32
+    ],
+    "activation": "relu",
+    "solver": "adam",
+    "max_iter": 500
+  },
+  "results": {
+    "liquefaction": {
+      "validation": {
+        "accuracy": 1.0,
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1_score": 1.0,
+        "confusion_matrix": [
+          [
+            63,
+            0
+          ],
+          [
+            0,
+            27
+          ]
+        ]
+      },
+      "test": {
+        "accuracy": 1.0,
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1_score": 1.0,
+        "confusion_matrix": [
+          [
+            125,
+            0
+          ],
+          [
+            0,
+            55
+          ]
+        ]
+      }
+    },
+    "settlement": {
+      "validation": {
+        "rmse": 0.027767517412817334,
+        "mae": 0.014971602828497329,
+        "r2": 0.9992613066933134
+      },
+      "test": {
+        "rmse": 0.036169262232464826,
+        "mae": 0.019227832440876908,
+        "r2": 0.9988008203934489
+      }
+    },
+    "bearing_capacity": {
+      "validation": {
+        "rmse": 25.27855806726151,
+        "mae": 15.774307055787904,
+        "r2": 0.9965588453150335
+      },
+      "test": {
+        "rmse": 20.07379286572516,
+        "mae": 12.62966601037867,
+        "r2": 0.996978918981795
+      }
+    }
+  }
+}

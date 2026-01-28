@@ -203,7 +203,7 @@ def main():
     # Upload
     upload_to_supabase_storage(
         OUTPUT_FILE_NAME, BUCKET_NAME, OUTPUT_STORAGE_PATH)
-    print("\ PROCESSING COMPLETED SUCCESSFULLY!")
+    print("\n✓ PROCESSING COMPLETED SUCCESSFULLY!")
     print("="*70)
 
 

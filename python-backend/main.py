@@ -1,27 +1,48 @@
 """
-Geotechnical ML Training Pipeline API - WITH DIAGNOSTICS
+Geotechnical ML Training Pipeline API - FIXED
 FastAPI service for Tarlac Liquefaction Prediction System
 
-This version includes diagnostics to find where scripts are located.
+FIX: Loads .env from parent directory
 """
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional, Dict, List
-import uvicorn
-import os
-import sys
-import subprocess
-import asyncio
-from pathlib import Path
-from datetime import datetime
+# ============================================================================
+# CRITICAL FIX: Load .env from parent directory FIRST!
+# ============================================================================
 import json
+from datetime import datetime
+import asyncio
+import subprocess
+import sys
+import uvicorn
+from typing import Optional, Dict, List
+from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+import os
+from dotenv import load_dotenv
+from pathlib import Path
+import numpy as np
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Get the parent directory (test-py/)
+parent_dir = Path(__file__).parent.parent
+env_path = parent_dir / '.env'
+
+# Load .env from parent directory
+load_dotenv(env_path)
+print(f"Loading .env from: {env_path}")
+print(f".env exists: {env_path.exists()}")
+
+print(f"SUPABASE_URL loaded: {bool(os.getenv('SUPABASE_URL'))}")
+print(
+    f"SUPABASE_SERVICE_ROLE_KEY loaded: {bool(os.getenv('SUPABASE_SERVICE_ROLE_KEY'))}")
+# ============================================================================
+
 
 app = FastAPI(
     title="Geo-ML Training API",
     description="ML Training Pipeline for Liquefaction Prediction System",
-    version="1.0.0"
+    version="1.0.1-FIXED"
 )
 
 # Configure CORS
@@ -169,6 +190,12 @@ async def run_script(script_name: str, step_name: str, progress: int,
 
     try:
         log_message(step_name, f"Running script: {script_path}")
+        log_message(
+            step_name, f"Working directory: {script_path.parent.parent}")
+
+        # Prepare environment with UTF-8 encoding for Windows compatibility
+        script_env = os.environ.copy()
+        script_env['PYTHONIOENCODING'] = 'utf-8'
 
         # Run the script
         process = await asyncio.create_subprocess_exec(
@@ -176,8 +203,9 @@ async def run_script(script_name: str, step_name: str, progress: int,
             str(script_path),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=str(script_path.parent),
-            env=os.environ.copy()  # ← ADD THIS LINE!
+            # ← Changed to parent's parent (test-py/)
+            cwd=str(script_path.parent.parent),
+            env=script_env
         )
 
         # Wait for completion with 30-minute timeout
@@ -186,13 +214,23 @@ async def run_script(script_name: str, step_name: str, progress: int,
             timeout=1800  # 30 minutes
         )
 
+        stdout_str = stdout.decode() if stdout else ""
+        stderr_str = stderr.decode() if stderr else ""
+
+        log_message(step_name, f"Return code: {process.returncode}")
+        if stdout_str:
+            log_message(step_name, f"STDOUT:\n{stdout_str[:1000]}")
+        if stderr_str:
+            log_message(step_name, f"STDERR:\n{stderr_str[:1000]}")
+
         if process.returncode == 0:
             log_message(
                 step_name, f"[SUCCESS] {step_name} completed successfully")
             pipeline_status["steps_completed"].append(step_name)
-            return True, stdout.decode()
+            return True, stdout_str
         else:
-            error_msg = stderr.decode() if stderr else "Unknown error"
+            # Capture both stderr and stdout for debugging
+            error_msg = stderr_str or stdout_str or f"Process exited with code {process.returncode}"
             log_message(step_name, f"[FAILED] {error_msg[:500]}")
             pipeline_status["error"] = error_msg
             return False, error_msg
@@ -208,6 +246,141 @@ async def run_script(script_name: str, step_name: str, progress: int,
         log_message(step_name, f"[ERROR] {error_msg}")
         pipeline_status["error"] = error_msg
         return False, error_msg
+
+
+# ============================================================================
+# MODEL DOWNLOADING FROM SUPABASE
+# ============================================================================
+
+def download_models_from_supabase():
+    """
+    Download trained models from Supabase Storage and cache them locally
+
+    Returns:
+        dict: Paths to downloaded/cached models or raises exception if failed
+    """
+    import joblib
+
+    model_dir = Path(__file__).parent.parent / 'ml_models'
+    model_dir.mkdir(exist_ok=True)
+
+    model_files = {
+        'scaler.pkl': 'scaler',
+        'ann_liquefaction.pkl': 'liquefaction classifier',
+        'ann_settlement.pkl': 'settlement regressor',
+        'ann_bearing_capacity.pkl': 'bearing capacity regressor'
+    }
+
+    # Check if models already exist locally (use cached version)
+    local_cache_valid = all((model_dir / filename).exists()
+                            for filename in model_files.keys())
+    if local_cache_valid:
+        print(f"✓ Using cached models from: {model_dir}")
+        return {
+            'scaler': model_dir / 'scaler.pkl',
+            'liquefaction': model_dir / 'ann_liquefaction.pkl',
+            'settlement': model_dir / 'ann_settlement.pkl',
+            'bearing_capacity': model_dir / 'ann_bearing_capacity.pkl'
+        }
+
+    # Download from Supabase Storage
+    print("📥 Downloading models from Supabase Storage...")
+    from supabase_client import get_supabase_client
+
+    client = get_supabase_client()
+    if not client:
+        raise Exception("Failed to connect to Supabase")
+
+    downloaded_models = {}
+
+    for filename, description in model_files.items():
+        try:
+            storage_path = f'ml_models/{filename}'
+            local_path = model_dir / filename
+
+            print(f"  Downloading {description} ({filename})...")
+            file_data = client.storage.from_(
+                'geotechnical-data').download(storage_path)
+
+            # Save to local cache
+            with open(local_path, 'wb') as f:
+                f.write(file_data)
+
+            downloaded_models[filename.replace('.pkl', '')] = local_path
+            print(f"  ✓ Saved: {local_path}")
+
+        except Exception as e:
+            print(f"  ✗ Error downloading {filename}: {e}")
+            raise Exception(f"Failed to download {filename}: {e}")
+
+    print(f"✓ All models downloaded and cached to: {model_dir}")
+    return {
+        'scaler': downloaded_models.get('scaler') or model_dir / 'scaler.pkl',
+        'liquefaction': downloaded_models.get('ann_liquefaction') or model_dir / 'ann_liquefaction.pkl',
+        'settlement': downloaded_models.get('ann_settlement') or model_dir / 'ann_settlement.pkl',
+        'bearing_capacity': downloaded_models.get('ann_bearing_capacity') or model_dir / 'ann_bearing_capacity.pkl'
+    }
+
+
+# Global cache for model metadata
+_model_metadata_cache = None
+
+
+def load_model_metadata():
+    """
+    Load model metadata (feature names, etc.) from Supabase Storage or local cache
+
+    Returns:
+        dict: Metadata containing feature_names, etc.
+    """
+    global _model_metadata_cache
+
+    # Return cached metadata if available
+    if _model_metadata_cache is not None:
+        return _model_metadata_cache
+
+    import json
+
+    model_dir = Path(__file__).parent.parent / 'ml_models'
+    metadata_path = model_dir / 'ann_metadata.json'
+
+    # Try to load from local cache first
+    if metadata_path.exists():
+        try:
+            with open(metadata_path, 'r') as f:
+                _model_metadata_cache = json.load(f)
+                print(f"✓ Loaded metadata from local cache: {metadata_path}")
+                return _model_metadata_cache
+        except Exception as e:
+            print(f"Warning: Could not load local metadata: {e}")
+
+    # Download from Supabase Storage
+    print("📥 Downloading model metadata from Supabase Storage...")
+    from supabase_client import get_supabase_client
+
+    client = get_supabase_client()
+    if not client:
+        raise Exception("Failed to connect to Supabase for metadata")
+
+    try:
+        storage_path = 'ml_models/ann_metadata.json'
+        file_data = client.storage.from_(
+            'geotechnical-data').download(storage_path)
+
+        # Parse JSON metadata
+        _model_metadata_cache = json.loads(file_data.decode('utf-8'))
+
+        # Cache locally for future use
+        model_dir.mkdir(exist_ok=True)
+        with open(metadata_path, 'w') as f:
+            json.dump(_model_metadata_cache, f, indent=2)
+
+        print(f"✓ Downloaded and cached metadata")
+        return _model_metadata_cache
+
+    except Exception as e:
+        print(f"✗ Error downloading metadata: {e}")
+        raise Exception(f"Failed to download model metadata: {e}")
 
 
 async def run_full_pipeline(config: PipelineConfig):
@@ -542,19 +715,372 @@ async def run_feature_engineering(background_tasks: BackgroundTasks, scripts_dir
     return {"status": "started", "step": "Feature Engineering"}
 
 
-@app.post("/train/step5-ann-training")
-async def run_ann_training(background_tasks: BackgroundTasks, scripts_directory: Optional[str] = None):
-    """Run only Step 5: ANN Training"""
-    if pipeline_status["is_running"]:
-        raise HTTPException(status_code=409, detail="Pipeline already running")
+# ============================================================================
+# PREDICTION ENDPOINT
+# ============================================================================
 
-    async def run_step():
-        pipeline_status["is_running"] = True
-        await run_script("04_model_training.py", "ANN Training", 100, scripts_directory)
-        pipeline_status["is_running"] = False
+class PredictionRequest(BaseModel):
+    """Request model for predictions"""
+    latitude: float
+    longitude: float
+    # Optional individual soil parameters (for manual input)
+    # If not provided, will fetch from database
+    features: Optional[Dict[str, float]] = None
 
-    background_tasks.add_task(run_step)
-    return {"status": "started", "step": "ANN Training"}
+
+@app.get("/nearest-borehole")
+async def get_nearest_borehole(latitude: float, longitude: float):
+    """
+    Find the nearest borehole to the given coordinates and return soil parameters
+
+    Returns soil data from the nearest borehole's soil layers (averaged or from shallowest layer)
+    """
+    try:
+        from supabase_client import get_supabase_client
+        client = get_supabase_client()
+        if not client:
+            raise HTTPException(
+                status_code=503, detail="Database connection failed")
+
+        # Get all boreholes with their coordinates
+        boreholes_response = client.table('boreholes').select(
+            'id, borehole_id, latitude, longitude'
+        ).execute()
+
+        if not boreholes_response.data:
+            raise HTTPException(
+                status_code=404, detail="No boreholes found in database")
+
+        # Calculate distances and find nearest
+        import math
+        min_distance = float('inf')
+        nearest_borehole = None
+
+        for borehole in boreholes_response.data:
+            if borehole['latitude'] is None or borehole['longitude'] is None:
+                continue
+
+            # Haversine distance formula (simplified)
+            lat_diff = float(borehole['latitude']) - latitude
+            lon_diff = float(borehole['longitude']) - longitude
+            distance = math.sqrt(lat_diff**2 + lon_diff**2)
+
+            if distance < min_distance:
+                min_distance = distance
+                nearest_borehole = borehole
+
+        if not nearest_borehole:
+            raise HTTPException(
+                status_code=404, detail="No valid boreholes found")
+
+        # Get soil layers for the nearest borehole (get shallowest layers first)
+        layers_response = client.table('soil_layers').select(
+            'spt_n60, unit_weight, csr, groundwater_depth_m, fines_content, layer_number'
+        ).eq('borehole_id', nearest_borehole['id']).order('layer_number', desc=False).execute()
+
+        if not layers_response.data:
+            raise HTTPException(
+                status_code=404, detail="No soil data for nearest borehole")
+
+        # Average soil parameters from all layers
+        soil_data = layers_response.data
+        avg_spt = np.nanmean([float(s['spt_n60'])
+                             for s in soil_data if s['spt_n60'] is not None])
+        avg_weight = np.nanmean([float(s['unit_weight'])
+                                for s in soil_data if s['unit_weight'] is not None])
+        avg_csr = np.nanmean([float(s['csr'])
+                             for s in soil_data if s['csr'] is not None])
+        avg_gwl = np.nanmean([float(s['groundwater_depth_m'])
+                             for s in soil_data if s['groundwater_depth_m'] is not None])
+        avg_fines = np.nanmean([float(s['fines_content'])
+                               for s in soil_data if s['fines_content'] is not None])
+
+        # CRR typically calculated from SPT N60, using simplified formula
+        # CRR = 0.1 + 0.0048 * SPT_N60 (simplified Idriss & Boulanger)
+        crr = round(0.1 + 0.0048 * avg_spt, 4)
+
+        return {
+            "success": True,
+            "nearest_borehole": {
+                "id": nearest_borehole['id'],
+                "borehole_id": nearest_borehole['borehole_id'],
+                # Rough conversion to km
+                "distance_km": round(min_distance * 111, 2),
+                "latitude": float(nearest_borehole['latitude']),
+                "longitude": float(nearest_borehole['longitude'])
+            },
+            "soil_parameters": {
+                "spt_n60": round(float(avg_spt), 2) if not np.isnan(avg_spt) else 8.0,
+                "unit_weight": round(float(avg_weight), 2) if not np.isnan(avg_weight) else 17.8,
+                "csr": round(float(avg_csr), 4) if not np.isnan(avg_csr) else 0.28,
+                "crr": crr,
+                "gwl": round(float(avg_gwl), 2) if not np.isnan(avg_gwl) else 3.0,
+                "fines_percent": round(float(avg_fines), 2) if not np.isnan(avg_fines) else 20.0
+            }
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Error finding nearest borehole: {str(e)}")
+
+
+@app.post("/predict")
+async def predict_liquefaction(request: PredictionRequest):
+    """
+    Predict liquefaction potential and impacts at a given location
+
+    Returns:
+    - Liquefaction risk level and probability
+    - Predicted settlement
+    - Bearing capacity (pre and post-liquefaction)
+    - Recommendations
+    """
+    try:
+        import joblib
+        import traceback
+
+        # Load model metadata to get feature names
+        try:
+            metadata = load_model_metadata()
+            feature_names = metadata.get('feature_names', [])
+            if not feature_names:
+                raise Exception("No feature names found in metadata")
+            print(f"✓ Loaded {len(feature_names)} feature names from metadata")
+        except Exception as e:
+            print(f"Error loading metadata: {e}")
+            traceback.print_exc()
+            raise HTTPException(
+                status_code=503, detail=f"Failed to load model metadata: {str(e)}")
+
+        # Download/use cached models from Supabase Storage
+        try:
+            model_paths = download_models_from_supabase()
+            scaler_path = model_paths['scaler']
+            liq_model_path = model_paths['liquefaction']
+            settlement_model_path = model_paths['settlement']
+            bearing_model_path = model_paths['bearing_capacity']
+        except Exception as e:
+            print(f"Error downloading models from Supabase: {e}")
+            traceback.print_exc()
+            raise HTTPException(
+                status_code=503, detail=f"Failed to load ML models from Supabase: {str(e)}")
+
+        # Load models from cache
+        scaler = joblib.load(scaler_path)
+        liq_model = joblib.load(liq_model_path)
+        settlement_model = joblib.load(settlement_model_path)
+        bearing_model = joblib.load(bearing_model_path)
+
+        # Fetch soil data for all required features from nearest borehole
+        from supabase_client import get_supabase_client
+        client = get_supabase_client()
+        if not client:
+            raise HTTPException(
+                status_code=503, detail="Database connection failed")
+
+        # Get all boreholes with their coordinates
+        boreholes_response = client.table('boreholes').select(
+            'id, borehole_id, latitude, longitude').execute()
+        if not boreholes_response.data:
+            raise HTTPException(
+                status_code=404, detail="No boreholes found in database")
+
+        # Find nearest borehole
+        import math
+        min_distance = float('inf')
+        nearest_borehole = None
+
+        for borehole in boreholes_response.data:
+            lat_diff = float(borehole['latitude']) - request.latitude
+            lon_diff = float(borehole['longitude']) - request.longitude
+            distance = math.sqrt(lat_diff**2 + lon_diff**2)
+            if distance < min_distance:
+                min_distance = distance
+                nearest_borehole = borehole
+
+        if not nearest_borehole:
+            raise HTTPException(
+                status_code=404, detail="No valid boreholes found")
+
+        # Get soil layers data
+        layers_response = client.table('soil_layers').select(
+            '*').eq('borehole_id', nearest_borehole['id']).order('layer_number', desc=False).execute()
+        if not layers_response.data:
+            raise HTTPException(
+                status_code=404, detail="No soil data for nearest borehole")
+
+        # Prepare feature array with all required features
+        # Fill with averaged data from soil layers
+        soil_data = layers_response.data
+        feature_vector = []
+
+        # Track key soil parameters for frontend display
+        soil_params_display = {
+            'spt_n60': 0, 'unit_weight': 0, 'csr': 0,
+            'crr': 0, 'gwl': 0, 'fines_percent': 0
+        }
+
+        for feature_name in feature_names:
+            # Try to get the feature value from soil data
+            values = []
+            for soil_layer in soil_data:
+                if feature_name in soil_layer and soil_layer[feature_name] is not None:
+                    try:
+                        values.append(float(soil_layer[feature_name]))
+                    except (ValueError, TypeError):
+                        pass
+
+            # Use average if available, otherwise use 0
+            if values:
+                feature_value = np.nanmean(values)
+            else:
+                # Try alternative column names
+                alt_names = {
+                    'spt_n60': 'spt_n60',
+                    'unit_weight': 'unit_weight',
+                    'gwl': 'groundwater_depth_m',
+                    'fines_percent': 'fines_content',
+                    'csr': 'csr'
+                }
+                alt_name = alt_names.get(feature_name, None)
+                if alt_name and alt_name != feature_name:
+                    values = [float(
+                        s[alt_name]) for s in soil_data if alt_name in s and s[alt_name] is not None]
+                    feature_value = np.nanmean(values) if values else 0.0
+                else:
+                    feature_value = 0.0
+
+            # Track display parameters
+            for key in soil_params_display.keys():
+                if key.lower() in feature_name.lower() or feature_name.lower() in key.lower():
+                    soil_params_display[key] = round(
+                        float(feature_value), 2 if key != 'csr' and key != 'crr' else 4)
+
+            feature_vector.append(feature_value)
+
+        # Calculate CRR if not in features
+        if 'crr' not in [f.lower() for f in feature_names]:
+            soil_params_display['crr'] = round(
+                0.1 + 0.0048 * soil_params_display['spt_n60'], 4)
+
+        # Convert to numpy array and reshape for prediction
+        input_features = np.array([feature_vector])
+        print(f"Input features shape: {input_features.shape}")
+        print(f"Expected features: {len(feature_names)}")
+
+        # Scale features
+        input_scaled = scaler.transform(input_features)
+
+        # Make predictions
+        liq_probability = liq_model.predict_proba(
+            input_scaled)[0][1]  # Probability of liquefaction
+        liq_prediction = liq_model.predict(input_scaled)[0]
+        settlement_pred = settlement_model.predict(input_scaled)[0]
+        bearing_post = bearing_model.predict(input_scaled)[0]
+
+        # Estimate pre-liquefaction bearing capacity (typically 2.5-3x post-liquefaction)
+        bearing_pre = bearing_post * 2.8
+        capacity_reduction = ((bearing_pre - bearing_post) / bearing_pre) * 100
+
+        # Determine risk level
+        if liq_probability >= 0.75:
+            risk_level = "HIGH"
+            severity = "Severe"
+        elif liq_probability >= 0.50:
+            risk_level = "MEDIUM"
+            severity = "Moderate"
+        else:
+            risk_level = "LOW"
+            severity = "Minor"
+
+        # Generate recommendations based on risk
+        recommendations = []
+        if risk_level == "HIGH":
+            recommendations = [
+                "Detailed geotechnical investigation",
+                "Deep foundation system implementation",
+                "Soil densification treatment",
+                "Post-liquefaction design considerations"
+            ]
+        elif risk_level == "MEDIUM":
+            recommendations = [
+                "Standard geotechnical investigation",
+                "Shallow to medium depth foundation design",
+                "Soil improvement methods",
+                "Regular monitoring plan"
+            ]
+        else:
+            recommendations = [
+                "Routine geotechnical survey",
+                "Standard foundation design",
+                "Annual monitoring"
+            ]
+
+        return {
+            "location": {
+                "latitude": request.latitude,
+                "longitude": request.longitude,
+                "nearest_borehole_distance_km": round(min_distance * 111, 2)
+            },
+            "risk_assessment": {
+                "risk_level": risk_level,
+                "probability": round(liq_probability * 100, 1),
+                "severity": severity
+            },
+            "soil_parameters": {
+                "spt_n60": soil_params_display['spt_n60'],
+                "unit_weight": soil_params_display['unit_weight'],
+                "csr": soil_params_display['csr'],
+                "crr": soil_params_display['crr'],
+                "gwl": soil_params_display['gwl'],
+                "fines_percent": soil_params_display['fines_percent'],
+                "source": "Averaged from nearest borehole soil layers"
+            },
+            "settlement": {
+                "predicted_cm": round(settlement_pred, 2),
+                "severity": "Severe" if settlement_pred > 10 else "Moderate" if settlement_pred > 5 else "Minor"
+            },
+            "bearing_capacity": {
+                "pre_liquefaction_kpa": round(bearing_pre, 2),
+                "post_liquefaction_kpa": round(bearing_post, 2),
+                "capacity_reduction_percent": round(capacity_reduction, 1)
+            },
+            "recommendations": recommendations
+        }
+
+    except ImportError:
+        raise HTTPException(status_code=500, detail="joblib not installed")
+    except Exception as e:
+        print("Prediction error:", e)
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500, detail=f"Prediction failed: {str(e)}")
+
+
+@app.get("/predict-by-location")
+async def predict_by_location(latitude: float, longitude: float):
+    """Predict using only latitude & longitude: fetch all features from nearest borehole and run prediction."""
+    try:
+        # Create prediction request with just coordinates
+        # The predict endpoint will fetch all required features from database
+        pred_req = PredictionRequest(
+            latitude=latitude,
+            longitude=longitude,
+            features=None  # Will fetch from database
+        )
+
+        return await predict_liquefaction(pred_req)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print("Predict-by-location error:", e)
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500, detail=f"Prediction by location failed: {str(e)}")
 
 
 # ============================================================================

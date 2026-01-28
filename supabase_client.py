@@ -5,9 +5,13 @@ Reusable connection module for all project files
 
 import os
 from dotenv import load_dotenv
+from pathlib import Path
 
-# Load environment variables
-load_dotenv()
+# Load environment variables from .env in the project root
+# Handle both direct execution and subprocess execution
+current_file = Path(__file__).resolve()
+env_path = current_file.parent / '.env'
+load_dotenv(env_path)
 
 try:
     from supabase import create_client, Client
