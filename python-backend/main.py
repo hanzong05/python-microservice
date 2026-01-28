@@ -1,161 +1,307 @@
 """
-Simplified Geotechnical Prediction Microservice
+Geotechnical ML Training Pipeline API - WITH DIAGNOSTICS
 FastAPI service for Tarlac Liquefaction Prediction System
-Simplified version without database - using in-memory storage
+
+This version includes diagnostics to find where scripts are located.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, Dict, List
 import uvicorn
 import os
-import numpy as np
+import sys
+import subprocess
+import asyncio
+from pathlib import Path
+from datetime import datetime
+import json
 
 app = FastAPI(
-    title="Geo-Predict API",
-    description="Geotechnical predictions for liquefaction, settlement, and bearing capacity",
+    title="Geo-ML Training API",
+    description="ML Training Pipeline for Liquefaction Prediction System",
     version="1.0.0"
 )
 
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",      # Local development
-        "https://*.vercel.app",        # Vercel deployments
-        "https://vercel.app",
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# In-memory storage for predictions
-predictions_db = []
-next_id = 1
+# Global pipeline status tracker
+pipeline_status = {
+    "is_running": False,
+    "current_step": None,
+    "progress": 0,
+    "start_time": None,
+    "end_time": None,
+    "error": None,
+    "steps_completed": [],
+    "logs": []
+}
 
 
 # ============================================================================
 # PYDANTIC MODELS
 # ============================================================================
 
-class SoilInput(BaseModel):
-    """Input data for geotechnical predictions"""
-    borehole_id: str
-    depth_m: float
-    spt_n_value: float
-    unit_weight: float
-    fines_content: Optional[float] = 0.0
-    friction_angle: Optional[float] = 30.0
-    cohesion_kpa: Optional[float] = 0.0
-    pga_g: float
-    groundwater_depth_m: Optional[float] = 2.0
-    effective_overburden_pressure: float
-    total_overburden_pressure: float
-    foundation_width_m: Optional[float] = 2.0
-    foundation_depth_m: Optional[float] = 1.5
+class PipelineConfig(BaseModel):
+    """Configuration for training pipeline"""
+    scripts_directory: Optional[str] = None  # NEW: Allow custom script path
+    run_data_cleaning: Optional[bool] = True
+    run_data_preparation: Optional[bool] = True
+    run_etl: Optional[bool] = True
+    run_feature_engineering: Optional[bool] = True
+    run_model_training: Optional[bool] = True
 
 
-class PredictionResult(BaseModel):
-    """Prediction output"""
-    id: int
-    borehole_id: str
-    depth_m: float
-    spt_n160: float
-    csr: float
-    cyclic_strength_ratio: float
-    liquefaction: bool
-    liquefaction_risk: str
-    settlement_cm: float
-    bearing_capacity_kpa: float
-    qa_allowable_kpa: float
+class StepStatus(BaseModel):
+    """Status of individual pipeline step"""
+    step_name: str
+    status: str
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    error: Optional[str] = None
 
 
 # ============================================================================
-# GEOTECHNICAL CALCULATIONS
+# HELPER FUNCTIONS
 # ============================================================================
 
-def calculate_n1_60(spt_n: float, sigma_prime: float, depth: float) -> float:
-    """Calculate corrected SPT N-value"""
-    Pa = 100  # kPa
-    CN = min(2.0, (Pa / sigma_prime) ** 0.5)
-
-    if depth < 3:
-        CR = 0.75
-    elif depth < 4:
-        CR = 0.80
-    elif depth < 6:
-        CR = 0.85
-    elif depth < 10:
-        CR = 0.95
-    else:
-        CR = 1.0
-
-    return max(0, spt_n * CN * CR)
+def log_message(step: str, message: str):
+    """Add log message to pipeline status"""
+    global pipeline_status
+    log_entry = {
+        "timestamp": datetime.now().isoformat(),
+        "step": step,
+        "message": message
+    }
+    pipeline_status["logs"].append(log_entry)
+    print(f"[{step}] {message}")
 
 
-def calculate_csr(pga_g: float, sigma_v: float, sigma_prime: float, depth: float) -> float:
-    """Calculate Cyclic Stress Ratio (Seed & Idriss 1971)"""
-    if depth <= 9.15:
-        rd = 1.0 - 0.00765 * depth
-    else:
-        rd = 1.174 - 0.0267 * depth
+def find_script(script_name: str, custom_dir: Optional[str] = None) -> Optional[Path]:
+    """
+    Search for script in multiple locations
 
-    rd = max(0.1, rd)
+    Search order:
+    1. Custom directory (if provided)
+    2. Parent directory (..)
+    3. Current directory (.)
+    4. Two levels up (../..)
+    5. Common subdirectories
+    """
+    api_file_location = Path(__file__).resolve()
 
-    return max(0, 0.65 * pga_g * (sigma_v / sigma_prime) * rd)
+    search_paths = []
+
+    # 1. Custom directory
+    if custom_dir:
+        search_paths.append(Path(custom_dir))
+
+    # 2. Parent directory
+    search_paths.append(api_file_location.parent.parent)
+
+    # 3. Current directory
+    search_paths.append(api_file_location.parent)
+
+    # 4. Two levels up
+    search_paths.append(api_file_location.parent.parent.parent)
+
+    # 5. Common subdirectories
+    search_paths.extend([
+        api_file_location.parent.parent / "scripts",
+        api_file_location.parent.parent / "ml_scripts",
+        api_file_location.parent.parent / "training_scripts",
+        api_file_location.parent / "scripts",
+    ])
+
+    log_message("SCRIPT_SEARCH", f"Searching for: {script_name}")
+    log_message("SCRIPT_SEARCH", f"API location: {api_file_location}")
+
+    for search_path in search_paths:
+        script_path = search_path / script_name
+        log_message("SCRIPT_SEARCH", f"Checking: {script_path}")
+        if script_path.exists():
+            log_message("SCRIPT_SEARCH",
+                        f"[FOUND] Script found at: {script_path}")
+            return script_path
+
+    log_message("SCRIPT_SEARCH",
+                f"[NOT FOUND] Script not found in any location")
+    return None
 
 
-def calculate_crr(n1_60: float, fines_content: float) -> float:
-    """Calculate Cyclic Resistance Ratio (Idriss & Boulanger 2008)"""
-    if n1_60 >= 30:
-        return 999.0  # Very high resistance
+async def run_script(script_name: str, step_name: str, progress: int,
+                     custom_script_dir: Optional[str] = None) -> tuple:
+    """
+    Run a Python training script asynchronously
 
-    crr_75 = np.exp(n1_60/14.1 + (n1_60/126)**2 -
-                    (n1_60/23.6)**3 + (n1_60/25.4)**4 - 2.8)
+    Args:
+        script_name: Name of the Python script to run
+        step_name: Display name for the step
+        progress: Progress percentage (0-100)
+        custom_script_dir: Optional custom directory where scripts are located
 
-    if fines_content <= 5:
-        delta_crr = 0
-    elif fines_content <= 35:
-        delta_crr = np.exp(1.76 - 190/fines_content**2)
-    else:
-        delta_crr = 0
+    Returns:
+        tuple: (success: bool, output: str)
+    """
+    global pipeline_status
 
-    return max(0, crr_75 + delta_crr)
+    # Update status
+    pipeline_status["current_step"] = step_name
+    pipeline_status["progress"] = progress
+    log_message(step_name, f"Starting {step_name}...")
+
+    # Find script
+    script_path = find_script(script_name, custom_script_dir)
+
+    if script_path is None:
+        error_msg = f"Script not found: {script_name}"
+        log_message(step_name, f"[ERROR] {error_msg}")
+        log_message(step_name, "Use GET /diagnostics to see search locations")
+        return False, error_msg
+
+    try:
+        log_message(step_name, f"Running script: {script_path}")
+
+        # Run the script
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            str(script_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(script_path.parent),
+            env=os.environ.copy()  # ← ADD THIS LINE!
+        )
+
+        # Wait for completion with 30-minute timeout
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(),
+            timeout=1800  # 30 minutes
+        )
+
+        if process.returncode == 0:
+            log_message(
+                step_name, f"[SUCCESS] {step_name} completed successfully")
+            pipeline_status["steps_completed"].append(step_name)
+            return True, stdout.decode()
+        else:
+            error_msg = stderr.decode() if stderr else "Unknown error"
+            log_message(step_name, f"[FAILED] {error_msg[:500]}")
+            pipeline_status["error"] = error_msg
+            return False, error_msg
+
+    except asyncio.TimeoutError:
+        error_msg = f"{step_name} timed out after 30 minutes"
+        log_message(step_name, f"[TIMEOUT] {error_msg}")
+        pipeline_status["error"] = error_msg
+        return False, error_msg
+
+    except Exception as e:
+        error_msg = str(e)
+        log_message(step_name, f"[ERROR] {error_msg}")
+        pipeline_status["error"] = error_msg
+        return False, error_msg
 
 
-def calculate_settlement(n1_60: float, csr: float, crr: float, thickness: float = 1.5) -> float:
-    """Calculate settlement (Tokimatsu & Seed 1987) in cm"""
-    fs = crr / (csr + 1e-10)
+async def run_full_pipeline(config: PipelineConfig):
+    """Run the complete ML training pipeline"""
+    global pipeline_status
 
-    if fs >= 1.0:
-        volumetric_strain = 0
-    else:
-        volumetric_strain = 0.01 * np.exp(-0.1 * n1_60) * (csr / 0.2)
+    # Reset status
+    pipeline_status = {
+        "is_running": True,
+        "current_step": None,
+        "progress": 0,
+        "start_time": datetime.now().isoformat(),
+        "end_time": None,
+        "error": None,
+        "steps_completed": [],
+        "logs": []
+    }
 
-    settlement_mm = volumetric_strain * thickness * 1000
-    return max(0, settlement_mm / 10)
+    log_message("PIPELINE", "[START] Starting ML Training Pipeline...")
 
+    try:
+        script_dir = config.scripts_directory
 
-def calculate_bearing_capacity(gamma: float, width: float, depth: float,
-                               phi: float, cohesion: float) -> float:
-    """Calculate bearing capacity (Terzaghi 1943) in kPa"""
-    phi_rad = np.radians(phi)
+        # Step 1: Data Cleaning (optional)
+        if config.run_data_cleaning:
+            success, output = await run_script(
+                "01_data_cleaning.py",
+                "Data Cleaning",
+                10,
+                script_dir
+            )
+            if not success:
+                raise Exception(f"Data Cleaning failed: {output}")
 
-    Nq = np.exp(np.pi * np.tan(phi_rad)) * (np.tan(np.pi/4 + phi_rad/2) ** 2)
+        # Step 2: Data Preparation
+        if config.run_data_preparation:
+            success, output = await run_script(
+                "01b_ml_data_preparation.py",
+                "Data Preparation",
+                30,
+                script_dir
+            )
+            if not success:
+                raise Exception(f"Data Preparation failed: {output}")
 
-    if phi < 0.001:
-        Nc = 5.7
-    else:
-        Nc = (Nq - 1) / np.tan(phi_rad)
+        # Step 3: ETL Pipeline
+        if config.run_etl:
+            success, output = await run_script(
+                "02_etl_to_supabase.py",
+                "ETL Pipeline",
+                50,
+                script_dir
+            )
+            if not success:
+                raise Exception(f"ETL Pipeline failed: {output}")
 
-    Ngamma = 2 * (Nq + 1) * np.tan(phi_rad)
+            log_message(
+                "ETL", "[REMINDER] Run PostGIS location update in Supabase SQL Editor:")
+            log_message(
+                "ETL", "UPDATE boreholes SET location = ST_SetSRID(ST_MakePoint(longitude, latitude), 4326)")
 
-    # Square footing shape factors
-    qult = 1.3 * cohesion * Nc + gamma * depth * Nq + 0.4 * gamma * width * Ngamma
+        # Step 4: Feature Engineering
+        if config.run_feature_engineering:
+            success, output = await run_script(
+                "03_feature_engineering.py",
+                "Feature Engineering",
+                70,
+                script_dir
+            )
+            if not success:
+                raise Exception(f"Feature Engineering failed: {output}")
 
-    return max(0, qult)
+        # Step 5: ANN Training
+        if config.run_model_training:
+            success, output = await run_script(
+                "04_model_training.py",
+                "ANN Training",
+                90,
+                script_dir
+            )
+            if not success:
+                raise Exception(f"ANN Training failed: {output}")
+
+        # Pipeline completed
+        pipeline_status["progress"] = 100
+        pipeline_status["end_time"] = datetime.now().isoformat()
+        pipeline_status["is_running"] = False
+        log_message("PIPELINE", "[SUCCESS] Pipeline completed successfully!")
+
+    except Exception as e:
+        pipeline_status["error"] = str(e)
+        pipeline_status["is_running"] = False
+        pipeline_status["end_time"] = datetime.now().isoformat()
+        log_message("PIPELINE", f"[FAILED] Pipeline failed: {str(e)}")
 
 
 # ============================================================================
@@ -164,225 +310,251 @@ def calculate_bearing_capacity(gamma: float, width: float, depth: float,
 
 @app.get("/")
 async def root():
+    """API root endpoint"""
     return {
-        "message": "✅ Geo-Predict API is running on Render!",
+        "message": "[OK] Geo-ML Training API is running!",
         "status": "operational",
         "version": "1.0.0",
         "endpoints": {
-            "GET /predictions": "Get all predictions",
-            "POST /predict": "Create geotechnical prediction",
-            "DELETE /predictions/{id}": "Delete a prediction",
+            "GET /diagnostics": "Show script locations and system info",
+            "POST /pipeline/start": "Start the ML training pipeline",
+            "GET /pipeline/status": "Check pipeline status",
+            "GET /pipeline/logs": "Get pipeline logs",
+            "POST /pipeline/stop": "Stop running pipeline",
         },
         "docs": "/docs"
     }
 
 
-@app.get("/predictions")
-async def get_predictions():
-    """Get all stored predictions"""
-    return {
-        "predictions": predictions_db,
-        "count": len(predictions_db)
+@app.get("/diagnostics")
+async def get_diagnostics():
+    """
+    Get diagnostic information about script locations
+    """
+    api_file = Path(__file__).resolve()
+
+    # List all Python files in various directories
+    def list_py_files(directory: Path) -> List[str]:
+        if not directory.exists():
+            return []
+        return [f.name for f in directory.glob("*.py")]
+
+    diagnostics = {
+        "api_file_location": str(api_file),
+        "current_directory": str(Path.cwd()),
+        "parent_directory": str(api_file.parent.parent),
+        "search_locations": {
+            "api_directory": {
+                "path": str(api_file.parent),
+                "exists": api_file.parent.exists(),
+                "python_files": list_py_files(api_file.parent)
+            },
+            "parent_directory": {
+                "path": str(api_file.parent.parent),
+                "exists": api_file.parent.parent.exists(),
+                "python_files": list_py_files(api_file.parent.parent)
+            },
+            "two_levels_up": {
+                "path": str(api_file.parent.parent.parent),
+                "exists": api_file.parent.parent.parent.exists(),
+                "python_files": list_py_files(api_file.parent.parent.parent)
+            }
+        },
+        "required_scripts": [
+            "01_data_cleaning.py",
+            "01b_ml_data_preparation.py",
+            "02_etl_to_supabase.py",
+            "03_feature_engineering.py",
+            "04_model_training.py"
+        ],
+        "found_scripts": {}
     }
 
-
-@app.post("/predict", response_model=PredictionResult)
-async def create_prediction(soil_data: SoilInput):
-    """
-    Create geotechnical prediction for soil liquefaction, 
-    settlement, and bearing capacity
-    """
-    global next_id
-
-    try:
-        # Calculate geotechnical parameters
-        spt_n160 = calculate_n1_60(
-            soil_data.spt_n_value,
-            soil_data.effective_overburden_pressure,
-            soil_data.depth_m
-        )
-
-        csr = calculate_csr(
-            soil_data.pga_g,
-            soil_data.total_overburden_pressure,
-            soil_data.effective_overburden_pressure,
-            soil_data.depth_m
-        )
-
-        cyclic_strength_ratio = calculate_crr(
-            spt_n160, soil_data.fines_content)
-
-        # Liquefaction assessment (DPWH BSDS 2013)
-        fs = cyclic_strength_ratio / (csr + 1e-10)
-        liquefaction = ((csr > 0.15) or (
-            soil_data.spt_n_value < 15)) and (fs < 1.0)
-
-        if fs >= 1.5:
-            risk_level = "Low"
-        elif fs >= 1.2:
-            risk_level = "Moderate"
-        elif fs >= 1.0:
-            risk_level = "High"
-        else:
-            risk_level = "Very High"
-
-        # Settlement calculation
-        settlement_cm = calculate_settlement(
-            spt_n160, csr, cyclic_strength_ratio)
-
-        # Bearing capacity
-        bearing_capacity_kpa = calculate_bearing_capacity(
-            soil_data.unit_weight,
-            soil_data.foundation_width_m,
-            soil_data.foundation_depth_m,
-            soil_data.friction_angle,
-            soil_data.cohesion_kpa
-        )
-
-        qa_allowable_kpa = bearing_capacity_kpa / 3.0
-
-        # Create prediction result
-        prediction = {
-            "id": next_id,
-            "borehole_id": soil_data.borehole_id,
-            "depth_m": soil_data.depth_m,
-            "spt_n160": round(spt_n160, 2),
-            "csr": round(csr, 4),
-            "cyclic_strength_ratio": round(cyclic_strength_ratio, 4),
-            "liquefaction": liquefaction,
-            "liquefaction_risk": risk_level,
-            "settlement_cm": round(settlement_cm, 2),
-            "bearing_capacity_kpa": round(bearing_capacity_kpa, 2),
-            "qa_allowable_kpa": round(qa_allowable_kpa, 2)
+    # Check if each required script can be found
+    for script_name in diagnostics["required_scripts"]:
+        found_path = find_script(script_name)
+        diagnostics["found_scripts"][script_name] = {
+            "found": found_path is not None,
+            "location": str(found_path) if found_path else None
         }
 
-        predictions_db.append(prediction)
-        next_id += 1
+    return diagnostics
 
-        return prediction
 
-    except Exception as e:
+@app.post("/pipeline/start")
+async def start_pipeline(
+    background_tasks: BackgroundTasks,
+    config: Optional[PipelineConfig] = None
+):
+    """
+    Start the complete ML training pipeline
+
+    You can optionally specify scripts_directory in the config:
+    {
+        "scripts_directory": "/full/path/to/scripts",
+        "run_data_cleaning": true,
+        ...
+    }
+    """
+    global pipeline_status
+
+    if pipeline_status["is_running"]:
         raise HTTPException(
-            status_code=500, detail=f"Prediction failed: {str(e)}")
-
-
-@app.delete("/predictions/{prediction_id}")
-async def delete_prediction(prediction_id: int):
-    """Delete a prediction by ID"""
-    global predictions_db
-
-    initial_length = len(predictions_db)
-    predictions_db = [p for p in predictions_db if p["id"] != prediction_id]
-
-    if len(predictions_db) == initial_length:
-        raise HTTPException(status_code=404, detail="Prediction not found")
-
-    return {
-        "predictions": predictions_db,
-        "message": "Prediction deleted successfully"
-    }
-
-
-@app.get("/stats")
-async def get_statistics():
-    """Get statistics from stored predictions"""
-    if not predictions_db:
-        return {
-            "total_predictions": 0,
-            "liquefiable_count": 0,
-            "avg_settlement_cm": 0,
-            "avg_bearing_capacity_kpa": 0
-        }
-
-    liquefiable = sum(1 for p in predictions_db if p["liquefaction"])
-    avg_settlement = sum(p["settlement_cm"]
-                         for p in predictions_db) / len(predictions_db)
-    avg_bearing = sum(p["bearing_capacity_kpa"]
-                      for p in predictions_db) / len(predictions_db)
-
-    return {
-        "total_predictions": len(predictions_db),
-        "liquefiable_count": liquefiable,
-        "avg_settlement_cm": round(avg_settlement, 2),
-        "avg_bearing_capacity_kpa": round(avg_bearing, 2)
-    }
-
-
-# ============================================================================
-# DATA UPLOAD TRIGGER
-# ============================================================================
-
-@app.post("/api/trigger-upload")
-async def trigger_upload():
-    """
-    Trigger the geotechnical data upload from Excel to Supabase
-
-    Returns:
-        - status: success/error
-        - message: Details about the upload
-        - records_uploaded: Number of records uploaded
-    """
-    import subprocess
-    import sys
-    from pathlib import Path
-
-    try:
-        # Get the project root directory (two levels up from python-backend)
-        project_root = Path(__file__).parent.parent
-        script_path = project_root / "process_geotechnical_data.py"
-
-        # Check if script exists
-        if not script_path.exists():
-            raise FileNotFoundError(f"Script not found: {script_path}")
-
-        # Run the script with auto-upload
-        result = subprocess.run(
-            [sys.executable, str(script_path)],
-            cwd=str(project_root),
-            capture_output=True,
-            text=True,
-            timeout=300  # 5 minute timeout
+            status_code=409,
+            detail="Pipeline is already running. Check /pipeline/status for progress."
         )
 
-        # Check if upload was successful
-        if result.returncode == 0:
-            return {
-                "status": "success",
-                "message": "Data upload completed successfully",
-                "records_uploaded": 232,
-                # Last 500 chars
-                "output": result.stdout[-500:] if result.stdout else ""
-            }
-        else:
-            return {
-                "status": "error",
-                "message": "Data upload failed",
-                "error": result.stderr[-500:] if result.stderr else "Unknown error"
-            }
+    if config is None:
+        config = PipelineConfig()
 
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=408, detail="Upload process timed out")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+    background_tasks.add_task(run_full_pipeline, config)
 
-
-@app.get("/api/upload-status")
-async def upload_status():
-    """
-    Check the status of data uploads
-
-    Returns:
-        - last_upload: Timestamp of last upload
-        - status: Current status
-    """
     return {
-        "status": "ready",
-        "message": "POST to /api/trigger-upload to start upload",
-        "endpoint": "/api/trigger-upload",
-        "method": "POST"
+        "status": "started",
+        "message": "ML training pipeline started in background",
+        "estimated_duration": "15-40 minutes",
+        "check_status": "/pipeline/status",
+        "scripts_directory": config.scripts_directory or "auto-detect"
     }
+
+
+@app.get("/pipeline/status")
+async def get_pipeline_status():
+    """Get current status of the training pipeline"""
+    global pipeline_status
+
+    return {
+        "is_running": pipeline_status["is_running"],
+        "current_step": pipeline_status["current_step"],
+        "progress": pipeline_status["progress"],
+        "start_time": pipeline_status["start_time"],
+        "end_time": pipeline_status["end_time"],
+        "steps_completed": pipeline_status["steps_completed"],
+        "error": pipeline_status["error"],
+        "total_logs": len(pipeline_status["logs"])
+    }
+
+
+@app.get("/pipeline/logs")
+async def get_pipeline_logs(limit: Optional[int] = 50):
+    """Get recent pipeline logs"""
+    global pipeline_status
+    logs = pipeline_status["logs"][-limit:]
+    return {
+        "logs": logs,
+        "total_logs": len(pipeline_status["logs"]),
+        "showing": len(logs)
+    }
+
+
+@app.post("/pipeline/stop")
+async def stop_pipeline():
+    """Stop the running pipeline (if any)"""
+    global pipeline_status
+
+    if not pipeline_status["is_running"]:
+        raise HTTPException(
+            status_code=400,
+            detail="No pipeline is currently running"
+        )
+
+    pipeline_status["is_running"] = False
+    pipeline_status["error"] = "Pipeline stopped by user"
+    pipeline_status["end_time"] = datetime.now().isoformat()
+    log_message("PIPELINE", "[STOP] Pipeline stopped by user")
+
+    return {
+        "status": "stopped",
+        "message": "Pipeline stop requested"
+    }
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for Render"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat()
+    }
+
+
+# ============================================================================
+# QUICK TRAINING ENDPOINTS (Individual Steps)
+# ============================================================================
+
+@app.post("/train/step1-data-cleaning")
+async def run_data_cleaning(background_tasks: BackgroundTasks, scripts_directory: Optional[str] = None):
+    """Run only Step 1: Data Cleaning"""
+    if pipeline_status["is_running"]:
+        raise HTTPException(status_code=409, detail="Pipeline already running")
+
+    async def run_step():
+        pipeline_status["is_running"] = True
+        await run_script("01_data_cleaning.py", "Data Cleaning", 100, scripts_directory)
+        pipeline_status["is_running"] = False
+
+    background_tasks.add_task(run_step)
+    return {"status": "started", "step": "Data Cleaning"}
+
+
+@app.post("/train/step2-data-prep")
+async def run_data_preparation(background_tasks: BackgroundTasks, scripts_directory: Optional[str] = None):
+    """Run only Step 2: Data Preparation"""
+    if pipeline_status["is_running"]:
+        raise HTTPException(status_code=409, detail="Pipeline already running")
+
+    async def run_step():
+        pipeline_status["is_running"] = True
+        await run_script("01b_ml_data_preparation.py", "Data Preparation", 100, scripts_directory)
+        pipeline_status["is_running"] = False
+
+    background_tasks.add_task(run_step)
+    return {"status": "started", "step": "Data Preparation"}
+
+
+@app.post("/train/step3-etl")
+async def run_etl(background_tasks: BackgroundTasks, scripts_directory: Optional[str] = None):
+    """Run only Step 3: ETL Pipeline"""
+    if pipeline_status["is_running"]:
+        raise HTTPException(status_code=409, detail="Pipeline already running")
+
+    async def run_step():
+        pipeline_status["is_running"] = True
+        await run_script("02_etl_to_supabase.py", "ETL Pipeline", 100, scripts_directory)
+        pipeline_status["is_running"] = False
+
+    background_tasks.add_task(run_step)
+    return {"status": "started", "step": "ETL Pipeline"}
+
+
+@app.post("/train/step4-feature-eng")
+async def run_feature_engineering(background_tasks: BackgroundTasks, scripts_directory: Optional[str] = None):
+    """Run only Step 4: Feature Engineering"""
+    if pipeline_status["is_running"]:
+        raise HTTPException(status_code=409, detail="Pipeline already running")
+
+    async def run_step():
+        pipeline_status["is_running"] = True
+        await run_script("03_feature_engineering.py", "Feature Engineering", 100, scripts_directory)
+        pipeline_status["is_running"] = False
+
+    background_tasks.add_task(run_step)
+    return {"status": "started", "step": "Feature Engineering"}
+
+
+@app.post("/train/step5-ann-training")
+async def run_ann_training(background_tasks: BackgroundTasks, scripts_directory: Optional[str] = None):
+    """Run only Step 5: ANN Training"""
+    if pipeline_status["is_running"]:
+        raise HTTPException(status_code=409, detail="Pipeline already running")
+
+    async def run_step():
+        pipeline_status["is_running"] = True
+        await run_script("04_model_training.py", "ANN Training", 100, scripts_directory)
+        pipeline_status["is_running"] = False
+
+    background_tasks.add_task(run_step)
+    return {"status": "started", "step": "ANN Training"}
 
 
 # ============================================================================
@@ -390,7 +562,6 @@ async def upload_status():
 # ============================================================================
 
 if __name__ == "__main__":
-    # Render provides PORT environment variable
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(
         app,
