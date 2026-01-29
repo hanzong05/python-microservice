@@ -3,6 +3,7 @@ Geotechnical ML Training Pipeline API - PRODUCTION VERSION
 FastAPI service for Tarlac Liquefaction Prediction System
 
 UPDATED: Models loaded directly from Supabase Storage into memory (no local files)
+UPGRADED: Integration with upgraded ANN model architecture (256-128-64)
 """
 
 # ============================================================================
@@ -32,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 app = FastAPI(
     title="Geo-ML Training API",
     description="ML Training Pipeline for Liquefaction Prediction System",
-    version="2.0.0-PRODUCTION"
+    version="3.0.0-UPGRADED"
 )
 
 # Configure CORS
@@ -225,8 +226,10 @@ async def run_script(script_name: str, step_name: str, progress: int,
 
 def load_models_from_supabase_direct():
     """
-    Load trained models DIRECTLY from Supabase Storage into memory
+    Load UPGRADED trained models DIRECTLY from Supabase Storage into memory
     NO local file system required - uses BytesIO for in-memory loading
+
+    UPGRADED: Now loads models trained with 256-128-64 architecture
 
     Returns:
         dict: Loaded model objects (NOT file paths)
@@ -238,10 +241,10 @@ def load_models_from_supabase_direct():
         if _model_cache['last_loaded'] and \
            datetime.now() - _model_cache['last_loaded'] < timedelta(hours=1):
             print(
-                f"✓ Using cached models (loaded at {_model_cache['last_loaded'].strftime('%H:%M:%S')})")
+                f"✓ Using cached UPGRADED models (loaded at {_model_cache['last_loaded'].strftime('%H:%M:%S')})")
             return _model_cache
 
-    print("📥 Loading models directly from Supabase Storage into memory...")
+    print("📥 Loading UPGRADED models directly from Supabase Storage into memory...")
     from supabase_client import get_supabase_client
 
     client = get_supabase_client()
@@ -268,13 +271,20 @@ def load_models_from_supabase_direct():
 
             if model_name == 'metadata':
                 # JSON metadata - decode and parse
-                loaded_models[model_name] = json.loads(
-                    file_data.decode('utf-8'))
+                metadata = json.loads(file_data.decode('utf-8'))
+                loaded_models[model_name] = metadata
+
+                # Display model version info
+                version = metadata.get('version', 'unknown')
+                architecture = metadata.get('model_architecture', {})
+                print(f"  ✓ Loaded {model_name} (version: {version})")
+                if architecture:
+                    hidden_layers = architecture.get('hidden_layers', [])
+                    print(f"    Architecture: {hidden_layers}")
             else:
                 # Pickle files - load directly from bytes using BytesIO
                 loaded_models[model_name] = joblib.load(io.BytesIO(file_data))
-
-            print(f"  ✓ Loaded {model_name} into memory")
+                print(f"  ✓ Loaded {model_name} into memory")
 
         except Exception as e:
             print(f"  ✗ Error loading {model_name}: {e}")
@@ -284,7 +294,18 @@ def load_models_from_supabase_direct():
     _model_cache = loaded_models
     _model_cache['last_loaded'] = datetime.now()
 
-    print(f"✓ All models loaded successfully into memory!")
+    # Display loaded model information
+    metadata = loaded_models.get('metadata', {})
+    num_features = metadata.get('num_features', 'unknown')
+    enhancements = metadata.get('enhancements', [])
+
+    print(f"✓ All UPGRADED models loaded successfully into memory!")
+    print(f"  Features: {num_features}")
+    if enhancements:
+        print(f"  Enhancements: {len(enhancements)} improvements")
+        for enhancement in enhancements[:3]:  # Show first 3
+            print(f"    - {enhancement}")
+
     return _model_cache
 
 
@@ -299,7 +320,7 @@ def clear_model_cache():
         'metadata': None,
         'last_loaded': None
     }
-    print("✓ Model cache cleared - will reload on next prediction")
+    print("✓ Model cache cleared - will reload UPGRADED models on next prediction")
     return {"status": "success", "message": "Model cache cleared"}
 
 
@@ -322,7 +343,8 @@ async def run_full_pipeline(config: PipelineConfig):
         "logs": []
     }
 
-    log_message("PIPELINE", "[START] Starting ML Training Pipeline...")
+    log_message(
+        "PIPELINE", "[START] Starting UPGRADED ML Training Pipeline...")
 
     try:
         script_dir = config.scripts_directory
@@ -352,19 +374,20 @@ async def run_full_pipeline(config: PipelineConfig):
                 raise Exception(f"Feature Engineering failed: {output}")
 
         if config.run_model_training:
-            success, output = await run_script("04_model_training.py", "ANN Training", 90, script_dir)
+            success, output = await run_script("04_model_training.py", "UPGRADED ANN Training", 90, script_dir)
             if not success:
-                raise Exception(f"ANN Training failed: {output}")
+                raise Exception(f"UPGRADED ANN Training failed: {output}")
 
             # Clear model cache after training to load new models
             clear_model_cache()
             log_message(
-                "PIPELINE", "[INFO] Model cache cleared - new models will be loaded on next prediction")
+                "PIPELINE", "[INFO] Model cache cleared - UPGRADED models will be loaded on next prediction")
 
         pipeline_status["progress"] = 100
         pipeline_status["end_time"] = datetime.now().isoformat()
         pipeline_status["is_running"] = False
-        log_message("PIPELINE", "[SUCCESS] Pipeline completed successfully!")
+        log_message(
+            "PIPELINE", "[SUCCESS] UPGRADED Pipeline completed successfully!")
 
     except Exception as e:
         pipeline_status["error"] = str(e)
@@ -383,11 +406,23 @@ async def root():
     return {
         "message": "[OK] Geo-ML Training API is running!",
         "status": "operational",
-        "version": "2.0.0-PRODUCTION",
+        "version": "3.0.0-UPGRADED",
+        "model_info": {
+            "architecture": "UPGRADED ANN (256-128-64 neurons)",
+            "version": "upgraded",
+            "enhancements": [
+                "Spatial features from PostGIS",
+                "Class weight balancing",
+                "Cross-validation",
+                "ROC-AUC metrics",
+                "Feature importance analysis"
+            ]
+        },
         "features": {
             "direct_memory_loading": "Models loaded from Supabase Storage into memory",
             "no_local_files": "No file system dependencies",
-            "model_caching": "1-hour in-memory cache for fast predictions"
+            "model_caching": "1-hour in-memory cache for fast predictions",
+            "upgraded_architecture": "Enhanced 256-128-64 neural network"
         },
         "endpoints": {
             "GET /diagnostics": "Show script locations and system info",
@@ -399,7 +434,8 @@ async def root():
             "GET /predict-by-location": "Predict by lat/lon",
             "GET /nearest-borehole": "Find nearest borehole data",
             "POST /models/clear-cache": "Clear model cache (after retraining)",
-            "GET /models/cache-status": "Check model cache status"
+            "GET /models/cache-status": "Check model cache status",
+            "GET /models/info": "Get UPGRADED model information"
         },
         "docs": "/docs"
     }
@@ -410,7 +446,8 @@ async def health_check():
     """Health check endpoint for Render"""
     return {
         "status": "healthy",
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now().isoformat(),
+        "model_version": "3.0.0-UPGRADED"
     }
 
 
@@ -490,10 +527,11 @@ async def start_pipeline(
 
     return {
         "status": "started",
-        "message": "ML training pipeline started in background",
+        "message": "UPGRADED ML training pipeline started in background",
         "estimated_duration": "15-40 minutes",
         "check_status": "/pipeline/status",
-        "scripts_directory": config.scripts_directory or "auto-detect"
+        "scripts_directory": config.scripts_directory or "auto-detect",
+        "model_version": "upgraded"
     }
 
 
@@ -614,18 +652,18 @@ async def run_feature_engineering(background_tasks: BackgroundTasks, scripts_dir
 
 @app.post("/train/step5-model-training")
 async def run_model_training(background_tasks: BackgroundTasks, scripts_directory: Optional[str] = None):
-    """Run only Step 5: Model Training"""
+    """Run only Step 5: UPGRADED Model Training"""
     if pipeline_status["is_running"]:
         raise HTTPException(status_code=409, detail="Pipeline already running")
 
     async def run_step():
         pipeline_status["is_running"] = True
-        await run_script("04_model_training.py", "Model Training", 100, scripts_directory)
+        await run_script("04_model_training.py", "UPGRADED Model Training", 100, scripts_directory)
         pipeline_status["is_running"] = False
         clear_model_cache()  # Clear cache after training
 
     background_tasks.add_task(run_step)
-    return {"status": "started", "step": "Model Training"}
+    return {"status": "started", "step": "UPGRADED Model Training"}
 
 
 # ============================================================================
@@ -653,8 +691,34 @@ async def get_cache_status():
     return {
         "cached": is_cached,
         "last_loaded": last_loaded,
-        "models_in_cache": [k for k in _model_cache.keys() if k != 'last_loaded' and _model_cache[k] is not None]
+        "models_in_cache": [k for k in _model_cache.keys() if k != 'last_loaded' and _model_cache[k] is not None],
+        "model_version": "upgraded" if is_cached else "unknown"
     }
+
+
+@app.get("/models/info")
+async def get_model_info():
+    """Get information about the UPGRADED models"""
+    try:
+        # Load models to get metadata
+        models = load_models_from_supabase_direct()
+        metadata = models.get('metadata', {})
+
+        return {
+            "version": metadata.get('version', 'unknown'),
+            "architecture": metadata.get('model_architecture', {}),
+            "num_features": metadata.get('num_features', 0),
+            "training_samples": metadata.get('training_samples', 0),
+            "enhancements": metadata.get('enhancements', []),
+            "results": metadata.get('results', {}),
+            "timestamp": metadata.get('timestamp', None),
+            "feature_importance_available": bool(metadata.get('feature_importance', {}))
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to load model information: {str(e)}"
+        )
 
 
 # ============================================================================
@@ -708,17 +772,18 @@ async def get_nearest_borehole(latitude: float, longitude: float):
                 status_code=404, detail="No soil data for nearest borehole")
 
         soil_data = layers_response.data
-        avg_spt = np.nanmean([float(s['spt_n60'])
-                             for s in soil_data if s['spt_n60'] is not None])
-        avg_weight = np.nanmean([float(s['unit_weight'])
-                                for s in soil_data if s['unit_weight'] is not None])
-        avg_csr = np.nanmean([float(s['csr'])
-                             for s in soil_data if s['csr'] is not None])
-        avg_gwl = np.nanmean([float(s['groundwater_depth_m'])
-                             for s in soil_data if s['groundwater_depth_m'] is not None])
-        avg_fines = np.nanmean([float(s['fines_content'])
-                               for s in soil_data if s['fines_content'] is not None])
 
+        # Helper function to safely extract and average values
+        def safe_avg(key, default):
+            values = [float(s[key])
+                      for s in soil_data if s.get(key) is not None]
+            return round(np.nanmean(values), 2) if values else default
+
+        avg_spt = safe_avg('spt_n60', 8.0)
+        avg_weight = safe_avg('unit_weight', 17.8)
+        avg_csr = round(safe_avg('csr', 0.28), 4)
+        avg_gwl = safe_avg('groundwater_depth_m', 3.0)
+        avg_fines = safe_avg('fines_content', 20.0)
         crr = round(0.1 + 0.0048 * avg_spt, 4)
 
         return {
@@ -731,12 +796,20 @@ async def get_nearest_borehole(latitude: float, longitude: float):
                 "longitude": float(nearest_borehole['longitude'])
             },
             "soil_parameters": {
-                "spt_n60": round(float(avg_spt), 2) if not np.isnan(avg_spt) else 8.0,
-                "unit_weight": round(float(avg_weight), 2) if not np.isnan(avg_weight) else 17.8,
-                "csr": round(float(avg_csr), 4) if not np.isnan(avg_csr) else 0.28,
+                "spt_n60": avg_spt,
+                "unit_weight": avg_weight,
+                "csr": avg_csr,
                 "crr": crr,
-                "gwl": round(float(avg_gwl), 2) if not np.isnan(avg_gwl) else 3.0,
-                "fines_percent": round(float(avg_fines), 2) if not np.isnan(avg_fines) else 20.0
+                "gwl": avg_gwl,
+                "fines_percent": avg_fines
+            },
+            "data_quality": {
+                "total_layers": len(soil_data),
+                "layers_with_spt": sum(1 for s in soil_data if s.get('spt_n60') is not None),
+                "layers_with_unit_weight": sum(1 for s in soil_data if s.get('unit_weight') is not None),
+                "layers_with_csr": sum(1 for s in soil_data if s.get('csr') is not None),
+                "layers_with_gwl": sum(1 for s in soil_data if s.get('groundwater_depth_m') is not None),
+                "layers_with_fines": sum(1 for s in soil_data if s.get('fines_content') is not None)
             }
         }
 
@@ -747,17 +820,84 @@ async def get_nearest_borehole(latitude: float, longitude: float):
             status_code=500, detail=f"Error finding nearest borehole: {str(e)}")
 
 
+@app.get("/debug/borehole/{borehole_id}")
+async def debug_borehole_data(borehole_id: str):
+    """
+    Debug endpoint to check what data exists for a specific borehole
+    Example: /debug/borehole/BH-001
+    """
+    try:
+        from supabase_client import get_supabase_client
+        client = get_supabase_client()
+        if not client:
+            raise HTTPException(
+                status_code=503, detail="Database connection failed")
+
+        # Find the borehole
+        borehole_response = client.table('boreholes').select(
+            '*').eq('borehole_id', borehole_id).execute()
+
+        if not borehole_response.data:
+            raise HTTPException(
+                status_code=404, detail=f"Borehole {borehole_id} not found")
+
+        borehole = borehole_response.data[0]
+
+        # Get all soil layers
+        layers_response = client.table('soil_layers').select(
+            '*').eq('borehole_id', borehole['id']).execute()
+
+        if not layers_response.data:
+            return {
+                "borehole": borehole,
+                "message": "No soil layers found for this borehole"
+            }
+
+        # Analyze data availability
+        layers = layers_response.data
+        analysis = {
+            "borehole_info": {
+                "id": borehole['id'],
+                "borehole_id": borehole['borehole_id'],
+                "latitude": borehole.get('latitude'),
+                "longitude": borehole.get('longitude'),
+                "total_depth": borehole.get('depth_total_m')
+            },
+            "layers_count": len(layers),
+            "data_availability": {
+                "spt_n60": sum(1 for l in layers if l.get('spt_n60') is not None),
+                "unit_weight": sum(1 for l in layers if l.get('unit_weight') is not None),
+                "csr": sum(1 for l in layers if l.get('csr') is not None),
+                "groundwater_depth_m": sum(1 for l in layers if l.get('groundwater_depth_m') is not None),
+                "fines_content": sum(1 for l in layers if l.get('fines_content') is not None),
+                "liquefaction": sum(1 for l in layers if l.get('liquefaction') is not None),
+                "settlement_cm": sum(1 for l in layers if l.get('settlement_cm') is not None),
+                "bearing_capacity_kpa": sum(1 for l in layers if l.get('bearing_capacity_kpa') is not None)
+            },
+            "sample_layer": layers[0] if layers else None,
+            "all_column_names": list(layers[0].keys()) if layers else []
+        }
+
+        return analysis
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Debug error: {str(e)}")
+
+
 @app.post("/predict")
 async def predict_liquefaction(request: PredictionRequest):
     """
     Predict liquefaction potential and impacts at a given location
 
-    UPDATED: Loads models directly from Supabase Storage into memory (no local files)
+    UPDATED: Loads UPGRADED models directly from Supabase Storage into memory (no local files)
+    UPGRADED: Uses enhanced ANN architecture (256-128-64) with improved features
     """
     try:
         import traceback
 
-        # Load models directly from Supabase Storage into memory
+        # Load UPGRADED models directly from Supabase Storage into memory
         try:
             models = load_models_from_supabase_direct()
 
@@ -771,14 +911,15 @@ async def predict_liquefaction(request: PredictionRequest):
             feature_names = metadata.get('feature_names', [])
             if not feature_names:
                 raise Exception("No feature names found in metadata")
-            print(f"✓ Using {len(feature_names)} features for prediction")
+            print(
+                f"✓ Using {len(feature_names)} features for prediction (UPGRADED model)")
 
         except Exception as e:
-            print(f"Error loading models from Supabase: {e}")
+            print(f"Error loading UPGRADED models from Supabase: {e}")
             traceback.print_exc()
             raise HTTPException(
                 status_code=503,
-                detail=f"Failed to load ML models from Supabase Storage: {str(e)}"
+                detail=f"Failed to load UPGRADED ML models from Supabase Storage: {str(e)}"
             )
 
         # Fetch soil data from nearest borehole
@@ -826,15 +967,87 @@ async def predict_liquefaction(request: PredictionRequest):
             raise HTTPException(
                 status_code=404, detail="No soil data for nearest borehole")
 
+        print(
+            f"Found {len(layers_response.data)} soil layers for borehole {nearest_borehole['borehole_id']}")
+
+        # Debug: Show first layer's available columns and sample data
+        if layers_response.data:
+            first_layer = layers_response.data[0]
+            available_columns = list(first_layer.keys())
+            print(
+                f"Available columns in soil_layers: {', '.join(available_columns[:15])}...")
+            print(f"Sample data from first layer:")
+            print(f"  spt_n60: {first_layer.get('spt_n60')}")
+            print(f"  unit_weight: {first_layer.get('unit_weight')}")
+            print(f"  csr: {first_layer.get('csr')}")
+            print(
+                f"  groundwater_depth_m: {first_layer.get('groundwater_depth_m')}")
+            print(f"  fines_content: {first_layer.get('fines_content')}")
+
         # Prepare feature vector
         soil_data = layers_response.data
         feature_vector = []
 
-        soil_params_display = {
-            'spt_n60': 0, 'unit_weight': 0, 'csr': 0,
-            'crr': 0, 'gwl': 0, 'fines_percent': 0
-        }
+        # FIRST: Extract actual soil parameters for display (from soil_layers table)
+        soil_params_display = {}
 
+        # Helper function to safely extract numeric values
+        def extract_values(key):
+            values = []
+            for s in soil_data:
+                val = s.get(key)
+                if val is not None:
+                    try:
+                        values.append(float(val))
+                    except (ValueError, TypeError):
+                        pass
+            return values
+
+        # Extract SPT N60
+        spt_values = extract_values('spt_n60')
+        soil_params_display['spt_n60'] = round(
+            np.nanmean(spt_values), 2) if spt_values else 8.0
+
+        # Extract Unit Weight
+        weight_values = extract_values('unit_weight')
+        soil_params_display['unit_weight'] = round(
+            np.nanmean(weight_values), 2) if weight_values else 17.8
+
+        # Extract CSR (Cyclic Stress Ratio)
+        csr_values = extract_values('csr')
+        soil_params_display['csr'] = round(
+            np.nanmean(csr_values), 4) if csr_values else 0.28
+
+        # Extract Groundwater Depth
+        gwl_values = extract_values('groundwater_depth_m')
+        soil_params_display['gwl'] = round(
+            np.nanmean(gwl_values), 2) if gwl_values else 3.0
+
+        # Extract Fines Content
+        fines_values = extract_values('fines_content')
+        soil_params_display['fines_percent'] = round(
+            np.nanmean(fines_values), 2) if fines_values else 20.0
+
+        # Calculate CRR from SPT
+        soil_params_display['crr'] = round(
+            0.1 + 0.0048 * soil_params_display['spt_n60'], 4)
+
+        # Debug output
+        print(f"\n=== Extracted Soil Parameters ===")
+        print(
+            f"  SPT N60: {soil_params_display['spt_n60']} (from {len(spt_values)} values)")
+        print(
+            f"  Unit Weight: {soil_params_display['unit_weight']} kN/m³ (from {len(weight_values)} values)")
+        print(
+            f"  CSR: {soil_params_display['csr']} (from {len(csr_values)} values)")
+        print(f"  CRR: {soil_params_display['crr']}")
+        print(
+            f"  GWL: {soil_params_display['gwl']} m (from {len(gwl_values)} values)")
+        print(
+            f"  Fines: {soil_params_display['fines_percent']}% (from {len(fines_values)} values)")
+        print(f"================================\n")
+
+        # SECOND: Build feature vector for model prediction
         for feature_name in feature_names:
             values = []
             for soil_layer in soil_data:
@@ -847,35 +1060,20 @@ async def predict_liquefaction(request: PredictionRequest):
             if values:
                 feature_value = np.nanmean(values)
             else:
+                # Try alternative column names
                 alt_names = {
-                    'spt_n60': 'spt_n60',
-                    'unit_weight': 'unit_weight',
                     'gwl': 'groundwater_depth_m',
-                    'fines_percent': 'fines_content',
-                    'csr': 'csr'
+                    'fines_percent': 'fines_content'
                 }
-                alt_name = alt_names.get(feature_name, None)
-                if alt_name and alt_name != feature_name:
+                alt_name = alt_names.get(feature_name, feature_name)
+                if alt_name in soil_data[0] if soil_data else {}:
                     values = [float(s[alt_name]) for s in soil_data
                               if alt_name in s and s[alt_name] is not None]
                     feature_value = np.nanmean(values) if values else 0.0
                 else:
                     feature_value = 0.0
 
-            # Track display parameters
-            for key in soil_params_display.keys():
-                if key.lower() in feature_name.lower() or feature_name.lower() in key.lower():
-                    soil_params_display[key] = round(
-                        float(
-                            feature_value), 2 if key != 'csr' and key != 'crr' else 4
-                    )
-
             feature_vector.append(feature_value)
-
-        # Calculate CRR if not in features
-        if 'crr' not in [f.lower() for f in feature_names]:
-            soil_params_display['crr'] = round(
-                0.1 + 0.0048 * soil_params_display['spt_n60'], 4)
 
         # Convert to numpy array
         input_features = np.array([feature_vector])
@@ -884,7 +1082,7 @@ async def predict_liquefaction(request: PredictionRequest):
         # Scale features using the loaded scaler
         input_scaled = scaler.transform(input_features)
 
-        # Make predictions using loaded models
+        # Make predictions using UPGRADED loaded models
         liq_probability = liq_model.predict_proba(input_scaled)[0][1]
         liq_prediction = liq_model.predict(input_scaled)[0]
         settlement_pred = settlement_model.predict(input_scaled)[0]
@@ -909,26 +1107,31 @@ async def predict_liquefaction(request: PredictionRequest):
         recommendations = []
         if risk_level == "HIGH":
             recommendations = [
-                "Detailed geotechnical investigation",
-                "Deep foundation system implementation",
-                "Soil densification treatment",
-                "Post-liquefaction design considerations"
+                "Detailed geotechnical investigation required",
+                "Deep foundation system implementation recommended",
+                "Soil densification treatment strongly advised",
+                "Post-liquefaction design considerations essential"
             ]
         elif risk_level == "MEDIUM":
             recommendations = [
-                "Standard geotechnical investigation",
+                "Standard geotechnical investigation recommended",
                 "Shallow to medium depth foundation design",
-                "Soil improvement methods",
-                "Regular monitoring plan"
+                "Soil improvement methods advisable",
+                "Regular monitoring plan implementation"
             ]
         else:
             recommendations = [
-                "Routine geotechnical survey",
-                "Standard foundation design",
-                "Annual monitoring"
+                "Routine geotechnical survey sufficient",
+                "Standard foundation design applicable",
+                "Annual monitoring recommended"
             ]
 
         return {
+            "model_info": {
+                "version": "upgraded",
+                "architecture": "ANN (256-128-64)",
+                "features_used": len(feature_names)
+            },
             "location": {
                 "latitude": request.latitude,
                 "longitude": request.longitude,
@@ -937,7 +1140,8 @@ async def predict_liquefaction(request: PredictionRequest):
             "risk_assessment": {
                 "risk_level": risk_level,
                 "probability": round(liq_probability * 100, 1),
-                "severity": severity
+                "severity": severity,
+                "confidence": "High" if metadata.get('results', {}).get('liquefaction', {}).get('test', {}).get('roc_auc', 0) > 0.8 else "Medium"
             },
             "soil_parameters": {
                 "spt_n60": soil_params_display['spt_n60'],
@@ -971,7 +1175,7 @@ async def predict_liquefaction(request: PredictionRequest):
 
 @app.get("/predict-by-location")
 async def predict_by_location(latitude: float, longitude: float):
-    """Predict using only latitude & longitude"""
+    """Predict using only latitude & longitude (UPGRADED model)"""
     try:
         pred_req = PredictionRequest(
             latitude=latitude,
