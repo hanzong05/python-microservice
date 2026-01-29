@@ -19,7 +19,6 @@ from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 import os
-from dotenv import load_dotenv
 from pathlib import Path
 import numpy as np
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -29,7 +28,6 @@ parent_dir = Path(__file__).parent.parent
 env_path = parent_dir / '.env'
 
 # Load .env from parent directory
-load_dotenv(env_path)
 print(f"Loading .env from: {env_path}")
 print(f".env exists: {env_path.exists()}")
 
