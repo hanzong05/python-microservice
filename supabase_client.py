@@ -1,17 +1,12 @@
 """
 Supabase Client Configuration
 Reusable connection module for all project files
+
+PRODUCTION VERSION: Works on Render without dotenv
+Environment variables are provided directly by the hosting platform
 """
 
 import os
-from dotenv import load_dotenv
-from pathlib import Path
-
-# Load environment variables from .env in the project root
-# Handle both direct execution and subprocess execution
-current_file = Path(__file__).resolve()
-env_path = current_file.parent / '.env'
-load_dotenv(env_path)
 
 try:
     from supabase import create_client, Client
@@ -40,6 +35,8 @@ def get_supabase_client():
 
     if not SUPABASE_URL or not SUPABASE_KEY:
         print("X Missing environment variables: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
+        print(f"  SUPABASE_URL present: {bool(SUPABASE_URL)}")
+        print(f"  SUPABASE_SERVICE_ROLE_KEY present: {bool(SUPABASE_KEY)}")
         return None
 
     try:
