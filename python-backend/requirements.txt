@@ -1,7 +1,10 @@
-numpy==2.4.1
-scikit-learn==1.8.0
-pandas==2.2.1
+# Core scientific packages compatible with Python 3.13
+numpy>=2.1.0
+scikit-learn>=1.6.0
+pandas>=2.3.0
 joblib==1.4.2
+
+# Web / API packages (same versions)
 fastapi==0.109.2
 uvicorn==0.27.1
 python-multipart==0.0.9
