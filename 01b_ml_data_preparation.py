@@ -1,12 +1,13 @@
 """
-Data Preparation for Machine Learning - SUPABASE STORAGE VERSION
+Data Preparation for Machine Learning - IN-MEMORY VERSION
 Liquefaction, Settlement, and Bearing Capacity Prediction
 Tarlac Province, Philippines
 
 - Downloads Cleaned_Data.xlsx from Supabase Storage
-- Processes data for ML
+- Processes data for ML IN MEMORY
 - Archives existing ML_Ready_Data.xlsx to old_ml_data/<timestamp>
-- Uploads new ML_Ready_Data.xlsx back to Supabase Storage
+- Uploads new ML_Ready_Data.xlsx back to Supabase Storage ONLY
+- NO LOCAL FILES CREATED
 """
 
 import pandas as pd
@@ -45,11 +46,11 @@ def download_file_from_storage(bucket_name, file_path):
 
 
 # -----------------------------
-# Upload & Archive File
+# Upload Directly from Memory
 # -----------------------------
 
-def upload_to_supabase_storage(local_file_path, bucket_name, storage_path):
-    """Upload file to Supabase Storage and archive existing file"""
+def upload_to_supabase_storage(excel_bytes, bucket_name, storage_path):
+    """Upload file to Supabase Storage directly from memory and archive existing file"""
     print(f"\n Uploading to Supabase Storage...")
     client = get_supabase_client()
     if not client:
@@ -70,19 +71,17 @@ def upload_to_supabase_storage(local_file_path, bucket_name, storage_path):
             # File may not exist, which is fine
             pass
 
-        # Upload new file
-        with open(local_file_path, 'rb') as f:
-            file_data = f.read()
-
+        # Upload from memory
         client.storage.from_(bucket_name).upload(
             storage_path,
-            file_data,
+            excel_bytes,
             file_options={
                 "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 "upsert": "true"
             }
         )
         print(f"✓ File uploaded successfully to {storage_path}")
+        print(f"✓ File size: {len(excel_bytes) / 1024:.2f} KB")
         return True
 
     except Exception as e:
@@ -523,13 +522,16 @@ class GeotechnicalDataPrep:
 
         return available_features, target_variables
 
-    def export_ml_ready_data(self, output_file='ML_Ready_Data.xlsx'):
-        """Export prepared data to Excel"""
+    def export_ml_ready_data_to_memory(self):
+        """Export prepared data to Excel IN MEMORY - returns bytes"""
         print("\n" + "=" * 70)
-        print("STEP 10: EXPORTING ML-READY DATA")
+        print("STEP 10: EXPORTING ML-READY DATA (IN MEMORY)")
         print("=" * 70)
 
-        with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+        # Create Excel file in memory
+        excel_buffer = io.BytesIO()
+
+        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
             # 1. Full dataset
             self.df.to_excel(writer, sheet_name='Full_Dataset', index=False)
             print("✓ Exported: Full_Dataset")
@@ -598,8 +600,13 @@ class GeotechnicalDataPrep:
             stats_df.to_excel(writer, sheet_name='Summary_Statistics')
             print("✓ Exported: Summary_Statistics")
 
-        print(f"\n✓ All data exported to: {output_file}")
-        return output_file
+        # Get bytes from buffer
+        excel_buffer.seek(0)
+        excel_bytes = excel_buffer.read()
+
+        print(f"\n✓ Excel file created in memory (not saved locally)")
+        print(f"✓ File size: {len(excel_bytes) / 1024:.2f} KB")
+        return excel_bytes
 
     def generate_data_report(self):
         """Generate final data preparation report"""
@@ -660,7 +667,7 @@ class GeotechnicalDataPrep:
 def main():
     """Main execution function"""
     print("\n" + "=" * 70)
-    print("GEOTECHNICAL DATA PREPARATION FOR MACHINE LEARNING")
+    print("GEOTECHNICAL DATA PREPARATION FOR MACHINE LEARNING (IN-MEMORY)")
     print("Liquefaction, Settlement, and Bearing Capacity Prediction")
     print("Tarlac Province, Philippines")
     print("=" * 70 + "\n")
@@ -668,7 +675,6 @@ def main():
     # Configuration
     BUCKET_NAME = 'geotechnical-data'
     INPUT_FILE_PATH = 'cleaned/Cleaned_Data.xlsx'  # Source in storage
-    OUTPUT_FILE_NAME = 'ML_Ready_Data.xlsx'
     OUTPUT_STORAGE_PATH = 'ml_ready/ML_Ready_Data.xlsx'  # Destination in storage
 
     # Step 1: Download cleaned data from Supabase
@@ -691,14 +697,17 @@ def main():
     prep.calculate_settlement_target()
     prep.calculate_bearing_capacity_target()
     prep.handle_missing_values()
-    prep.export_ml_ready_data(OUTPUT_FILE_NAME)
+
+    # Export to memory (returns bytes)
+    excel_bytes = prep.export_ml_ready_data_to_memory()
+
     prep.generate_data_report()
 
-    # Step 3: Upload ML-ready data to Supabase
-    upload_to_supabase_storage(
-        OUTPUT_FILE_NAME, BUCKET_NAME, OUTPUT_STORAGE_PATH)
+    # Step 3: Upload ML-ready data to Supabase (from memory)
+    upload_to_supabase_storage(excel_bytes, BUCKET_NAME, OUTPUT_STORAGE_PATH)
 
     print("\n PROCESSING COMPLETED SUCCESSFULLY!")
+    print("✓ No local files created - all processing in memory")
     print("="*70)
 
     return prep

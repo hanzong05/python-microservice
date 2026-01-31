@@ -1,9 +1,9 @@
 """
-Geotechnical Data Extraction and Cleaning
+Geotechnical Data Extraction and Cleaning - IN-MEMORY VERSION
 - Downloads Raw_Data.xlsx from Supabase Storage
-- Processes all depth layers into Cleaned_Data.xlsx
+- Processes all depth layers IN MEMORY (no local files)
 - Archives existing cleaned files to old_cleaned_data/<timestamp>
-- Uploads new cleaned file back to Supabase Storage
+- Uploads new cleaned file back to Supabase Storage ONLY
 """
 
 from openpyxl import load_workbook, Workbook
@@ -37,11 +37,11 @@ def download_file_from_storage(bucket_name, file_path):
         return None
 
 # -----------------------------
-# Process Excel Data
+# Process Excel Data IN MEMORY
 # -----------------------------
 
 
-def process_geotechnical_data(file_bytes, output_filename='Cleaned_Data.xlsx'):
+def process_geotechnical_data(file_bytes):
     print(f"\n Processing geotechnical data...")
     wb = load_workbook(io.BytesIO(file_bytes))
 
@@ -74,7 +74,7 @@ def process_geotechnical_data(file_bytes, output_filename='Cleaned_Data.xlsx'):
         f"\n✓ Extracted {len(combined_df)} records from {len(sheet_names)} depth layers")
 
     # -----------------------------
-    # Create Cleaned Workbook
+    # Create Cleaned Workbook IN MEMORY
     # -----------------------------
     new_wb = Workbook()
     sheet = new_wb.active
@@ -129,16 +129,15 @@ def process_geotechnical_data(file_bytes, output_filename='Cleaned_Data.xlsx'):
     summary_sheet.column_dimensions['A'].width = 30
     summary_sheet.column_dimensions['B'].width = 20
 
-    new_wb.save(output_filename)
-    print(f"\n✓ Output file saved: {output_filename}")
-    return combined_df
+    print(f"\n✓ Workbook created in memory (not saved locally)")
+    return combined_df, new_wb
 
 # -----------------------------
-# Upload & Archive Existing File
+# Upload Directly from Memory
 # -----------------------------
 
 
-def upload_to_supabase_storage(local_file_path, bucket_name, storage_path):
+def upload_to_supabase_storage(workbook, bucket_name, storage_path):
     print(f"\n Uploading to Supabase Storage...")
     client = get_supabase_client()
     if not client:
@@ -159,16 +158,23 @@ def upload_to_supabase_storage(local_file_path, bucket_name, storage_path):
             # File may not exist
             pass
 
-        # Upload new file
-        with open(local_file_path, 'rb') as f:
-            file_data = f.read()
+        # Save workbook to bytes buffer (IN MEMORY)
+        excel_buffer = io.BytesIO()
+        workbook.save(excel_buffer)
+        excel_buffer.seek(0)
+        file_data = excel_buffer.read()
+
+        # Upload from memory
         client.storage.from_(bucket_name).upload(
             storage_path,
             file_data,
             file_options={
-                "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
+                "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "upsert": "true"
+            }
         )
         print(f"✓ File uploaded successfully to {storage_path}")
+        print(f"✓ File size: {len(file_data) / 1024:.2f} KB")
         return True
 
     except Exception as e:
@@ -182,12 +188,11 @@ def upload_to_supabase_storage(local_file_path, bucket_name, storage_path):
 
 def main():
     print("="*70)
-    print("GEOTECHNICAL DATA EXTRACTION & CLEANING")
+    print("GEOTECHNICAL DATA EXTRACTION & CLEANING (IN-MEMORY)")
     print("="*70)
 
     BUCKET_NAME = 'geotechnical-data'
     INPUT_FILE_PATH = 'raw/Raw_Data.xlsx'           # Source in storage
-    OUTPUT_FILE_NAME = 'Cleaned_Data.xlsx'
     OUTPUT_STORAGE_PATH = 'cleaned/Cleaned_Data.xlsx'  # Destination in storage
 
     # Download
@@ -196,14 +201,15 @@ def main():
         print("\n Failed to download file")
         return
 
-    # Process
-    combined_df = process_geotechnical_data(file_bytes, OUTPUT_FILE_NAME)
+    # Process (IN MEMORY - no local file saved)
+    combined_df, cleaned_workbook = process_geotechnical_data(file_bytes)
     print(f"\n✓ Total Records Processed: {len(combined_df)}")
 
-    # Upload
+    # Upload directly from memory
     upload_to_supabase_storage(
-        OUTPUT_FILE_NAME, BUCKET_NAME, OUTPUT_STORAGE_PATH)
+        cleaned_workbook, BUCKET_NAME, OUTPUT_STORAGE_PATH)
     print("\n✓ PROCESSING COMPLETED SUCCESSFULLY!")
+    print("✓ No local files created - all processing in memory")
     print("="*70)
 
 
