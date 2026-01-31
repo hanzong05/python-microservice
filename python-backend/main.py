@@ -1193,7 +1193,16 @@ async def predict_by_location(latitude: float, longitude: float):
         raise HTTPException(
             status_code=500, detail=f"Prediction by location failed: {str(e)}")
 
-
+@app.get("/debug/env")
+async def debug_environment():
+    """Debug endpoint to check environment variables (DO NOT USE IN PRODUCTION WITH REAL KEYS)"""
+    return {
+        "supabase_url_present": bool(os.getenv("SUPABASE_URL")),
+        "supabase_url_value": os.getenv("SUPABASE_URL", "NOT SET")[:50] + "..." if os.getenv("SUPABASE_URL") else "NOT SET",
+        "supabase_key_present": bool(os.getenv("SUPABASE_SERVICE_ROLE_KEY")),
+        "supabase_key_length": len(os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")) if os.getenv("SUPABASE_SERVICE_ROLE_KEY") else 0,
+        "all_env_vars": list(os.environ.keys())
+    }
 # ============================================================================
 # RUN SERVER
 # ============================================================================
