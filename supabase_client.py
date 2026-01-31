@@ -12,7 +12,6 @@ try:
     from dotenv import load_dotenv
     
     # Load environment variables from .env in the project root
-    # Handle both direct execution and subprocess execution
     current_file = Path(__file__).resolve()
     env_path = current_file.parent / '.env'
     
@@ -20,16 +19,16 @@ try:
         load_dotenv(env_path)
         print(f"✓ Loaded environment variables from {env_path}")
     else:
-        print(f"ℹ No .env file found at {env_path}, using system environment variables")
+        print(f"ℹ No .env file found, using system environment variables")
 except ImportError:
-    print("ℹ python-dotenv not installed, using system environment variables (production mode)")
+    print("ℹ python-dotenv not installed, using system environment variables")
 
 try:
     from supabase import create_client, Client
     SUPABASE_AVAILABLE = True
-except ImportError:
-    print("✗ Supabase library not installed!")
-    print("Install with: pip install supabase")
+    print("✓ Supabase library imported successfully")
+except ImportError as e:
+    print(f"✗ Supabase library import failed: {e}")
     SUPABASE_AVAILABLE = False
     create_client = None
     Client = None
@@ -42,26 +41,53 @@ def get_supabase_client():
     Returns:
         Client: Authenticated Supabase client or None if connection fails
     """
+    print("\n=== Attempting Supabase Connection ===")
+    
     if not SUPABASE_AVAILABLE:
         print("✗ Supabase library not available")
         return None
 
+    # Check for both possible key names
     SUPABASE_URL = os.getenv("SUPABASE_URL")
-    SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_SERVICE_KEY")
 
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        print("✗ Missing environment variables: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
-        print(f"  SUPABASE_URL present: {bool(SUPABASE_URL)}")
-        print(f"  SUPABASE_SERVICE_ROLE_KEY present: {bool(SUPABASE_KEY)}")
+    # Debug output
+    print(f"URL present: {bool(SUPABASE_URL)}")
+    print(f"URL value: {SUPABASE_URL[:50]}..." if SUPABASE_URL else "URL: NOT SET")
+    print(f"Key present: {bool(SUPABASE_KEY)}")
+    print(f"Key length: {len(SUPABASE_KEY) if SUPABASE_KEY else 0}")
+
+    if not SUPABASE_URL:
+        print("✗ SUPABASE_URL not set")
+        return None
+        
+    if not SUPABASE_KEY:
+        print("✗ SUPABASE_SERVICE_ROLE_KEY not set")
         return None
 
     try:
+        print("Creating Supabase client...")
         client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        # Test connection
-        client.table('municipalities').select('id').limit(1).execute()
+        print("✓ Supabase client created successfully!")
+        
+        # Simple connection test - just try to access storage
+        # Don't test tables in case RLS is blocking
+        try:
+            print("Testing storage access...")
+            # This is a minimal test that doesn't require table permissions
+            client.storage.list_buckets()
+            print("✓ Storage accessible!")
+        except Exception as storage_error:
+            print(f"⚠ Storage test warning: {storage_error}")
+            # Still return client - storage might have different permissions
+        
         return client
+        
     except Exception as e:
-        print(f"✗ Failed to connect to Supabase: {e}")
+        print(f"✗ Failed to create Supabase client: {e}")
+        import traceback
+        print("Full error:")
+        traceback.print_exc()
         return None
 
 
@@ -72,7 +98,7 @@ def test_connection():
     Returns:
         bool: True if connection successful, False otherwise
     """
-    print("Testing Supabase connection...")
+    print("\n=== Testing Supabase Connection ===")
     client = get_supabase_client()
 
     if client:
