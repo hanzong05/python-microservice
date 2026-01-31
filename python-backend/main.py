@@ -1203,6 +1203,46 @@ async def debug_environment():
         "supabase_key_length": len(os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")) if os.getenv("SUPABASE_SERVICE_ROLE_KEY") else 0,
         "all_env_vars": list(os.environ.keys())
     }
+
+@app.get("/debug/supabase-test")
+async def test_supabase_connection():
+    """Test if Supabase connection works"""
+    try:
+        from supabase_client import get_supabase_client
+        client = get_supabase_client()
+        
+        if not client:
+            return {
+                "success": False,
+                "error": "Client is None - check supabase_client.py logs"
+            }
+        
+        # Try to access the storage bucket
+        try:
+            # Test storage access
+            files = client.storage.from_('geotechnical-data').list('ml_models')
+            
+            return {
+                "success": True,
+                "message": "Supabase connection successful",
+                "storage_accessible": True,
+                "files_in_ml_models": [f['name'] for f in files] if files else []
+            }
+        except Exception as storage_error:
+            return {
+                "success": True,
+                "message": "Database connected but storage error",
+                "storage_accessible": False,
+                "storage_error": str(storage_error)
+            }
+            
+    except Exception as e:
+        import traceback
+        return {
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
 # ============================================================================
 # RUN SERVER
 # ============================================================================
