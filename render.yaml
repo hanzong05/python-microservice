@@ -6,7 +6,7 @@ services:
     plan: free
     runtimeVersion: python-3.11
     buildCommand: pip install -r requirements.txt
-    startCommand: cd uvicorn api:app --host 0.0.0.0 --port $PORT
+    startCommand: cd uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: SUPABASE_URL
         fromEnv: SUPABASE_URL
