@@ -2,7 +2,7 @@
 # Build script for Render deployment
 
 # Install dependencies
-pip install -r python-backend/requirements.txt
+pip install -r requirements.txt
 
 # Create required directories
 mkdir -p data/input data/output data/backups logs
