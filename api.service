@@ -1,0 +1,15 @@
+[Unit]
+Description=Geotechnical Prediction API
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/path/to/your/project
+Environment="PATH=/path/to/your/venv/bin"
+ExecStart=/path/to/your/venv/bin/uvicorn api:app --host 0.0.0.0 --port 8000 --workers 4
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

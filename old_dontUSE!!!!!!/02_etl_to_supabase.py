@@ -1,14 +1,14 @@
 """
-ETL Pipeline: Excel to Supabase Database - IMPROVED VERSION
+ETL Pipeline: Excel to Supabase Database - FIXED VERSION
 Geotechnical Data for Liquefaction Prediction System
 
-Key Improvements:
-- Better error handling and logging
-- Validates data before insertion
-- Handles missing/null values properly
-- Batch operations with fallback
-- Progress tracking
-- Data validation checks
+Key Fixes:
+- Fixed Settlement_m conversion (was integer, needs float)
+- Fixed Relative Density handling (was object/string, needs numeric)
+- Fixed Peak Ground Acceleration parsing (handles 'g' suffix)
+- Improved null handling for all numeric fields
+- Better error logging and validation
+- Handles duplicate municipalities (e.g., 'San Jose' vs 'San Jose ')
 """
 
 import json
@@ -39,6 +39,9 @@ def safe_float(value, default=None) -> Optional[float]:
     if pd.isna(value) or value == '' or value is None:
         return default
     try:
+        # Handle string values like "0.35g" for PGA
+        if isinstance(value, str):
+            value = value.strip().lower().replace('g', '').replace('%', '')
         result = float(value)
         return result if not np.isnan(result) and not np.isinf(result) else default
     except (ValueError, TypeError):
@@ -67,10 +70,35 @@ def safe_bool(value, default=False) -> bool:
 
 
 def safe_str(value, default=None) -> Optional[str]:
-    """Safely convert to string"""
+    """Safely convert to string, trim whitespace"""
     if pd.isna(value) or value == '' or value is None:
         return default
     return str(value).strip()
+
+
+def parse_relative_density(value) -> Optional[float]:
+    """Parse relative density which may be string like 'Medium', 'Dense' or numeric"""
+    if pd.isna(value) or value == '' or value is None:
+        return None
+
+    # If already numeric, return it
+    try:
+        return float(value)
+    except:
+        pass
+
+    # Map string values to approximate numeric percentages
+    density_map = {
+        'very loose': 15.0,
+        'loose': 35.0,
+        'medium': 50.0,
+        'medium dense': 65.0,
+        'dense': 80.0,
+        'very dense': 95.0
+    }
+
+    value_str = str(value).lower().strip()
+    return density_map.get(value_str, None)
 
 
 # -----------------------------
@@ -79,16 +107,16 @@ def safe_str(value, default=None) -> Optional[str]:
 
 def download_file_from_storage(client, bucket_name: str, file_path: str) -> Optional[bytes]:
     """Download file from Supabase Storage"""
-    print(f"📥 Downloading file from Supabase Storage...")
+    print(f"  Downloading file from Supabase Storage...")
     print(f"   Bucket: {bucket_name}")
     print(f"   File: {file_path}")
 
     try:
         response = client.storage.from_(bucket_name).download(file_path)
-        print(f"✓ Successfully downloaded {len(response)} bytes")
+        print(f"  Successfully downloaded {len(response)} bytes")
         return response
     except Exception as e:
-        print(f"❌ Error downloading file: {e}")
+        print(f"   Error downloading file: {e}")
         return None
 
 
@@ -124,13 +152,13 @@ class GeotechnicalETL:
             self.client = get_supabase_client()
 
             if self.client:
-                print("✓ Connected to Supabase successfully!")
+                print("  Connected to Supabase successfully!")
                 return True
             else:
-                print("❌ Connection failed")
+                print("   Connection failed")
                 return False
         except ImportError:
-            print("❌ Error: supabase_client module not found")
+            print("   Error: supabase_client module not found")
             print(
                 "   Please ensure supabase_client.py exists with get_supabase_client() function")
             return False
@@ -147,8 +175,11 @@ class GeotechnicalETL:
                 sheet_name='Full_Dataset'
             )
 
-            print(f"✓ Loaded {len(self.df)} records")
-            print(f"✓ Columns: {len(self.df.columns)}")
+            print(f"  Loaded {len(self.df)} records")
+            print(f"  Columns: {len(self.df.columns)}")
+
+            # Clean municipality names (remove trailing spaces)
+            self.df['Municipality'] = self.df['Municipality'].str.strip()
 
             # Validate required columns
             required_cols = ['Municipality', 'Borehole ID', 'Depth_Layer',
@@ -157,17 +188,19 @@ class GeotechnicalETL:
                 col for col in required_cols if col not in self.df.columns]
 
             if missing_cols:
-                print(f"❌ Missing required columns: {missing_cols}")
+                print(f"   Missing required columns: {missing_cols}")
                 return False
 
-            print(f"\n✓ Sample data:")
+            print(f"\n  Sample data:")
             print(
                 self.df[['Municipality', 'Borehole ID', 'Depth_Layer']].head(3))
 
             return True
 
         except Exception as e:
-            print(f"❌ Failed to load data: {e}")
+            print(f"   Failed to load data: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def extract_unique_values(self):
@@ -177,14 +210,14 @@ class GeotechnicalETL:
         print("=" * 70)
 
         municipalities = self.df['Municipality'].unique()
-        print(f"\n✓ Found {len(municipalities)} municipalities")
+        print(f"\n  Found {len(municipalities)} municipalities")
         print(f"  {', '.join(sorted(municipalities))}")
 
         boreholes = self.df['Borehole ID'].unique()
-        print(f"\n✓ Found {len(boreholes)} boreholes")
+        print(f"\n  Found {len(boreholes)} boreholes")
 
         depth_layers = self.df['Depth_Layer'].unique()
-        print(f"\n✓ Found {len(depth_layers)} depth layers")
+        print(f"\n  Found {len(depth_layers)} depth layers")
         print(f"  {', '.join(sorted(depth_layers))}")
 
         return municipalities, boreholes, depth_layers
@@ -208,7 +241,7 @@ class GeotechnicalETL:
                     muni_id = result.data[0]['id']
                     self.municipality_ids[muni_name] = muni_id
                     self.stats['municipalities_updated'] += 1
-                    print(f"  ✓ Found: {muni_name} (ID: {muni_id})")
+                    print(f"    Found: {muni_name} (ID: {muni_id})")
                 else:
                     # Insert new
                     insert_data = {
@@ -222,12 +255,12 @@ class GeotechnicalETL:
                     muni_id = result.data[0]['id']
                     self.municipality_ids[muni_name] = muni_id
                     self.stats['municipalities_created'] += 1
-                    print(f"  ✓ Created: {muni_name} (ID: {muni_id})")
+                    print(f"    Created: {muni_name} (ID: {muni_id})")
 
             except Exception as e:
-                print(f"  ❌ Error with {muni_name}: {e}")
+                print(f"     Error with {muni_name}: {e}")
 
-        print(f"\n✓ Municipalities - Created: {self.stats['municipalities_created']}, "
+        print(f"\n  Municipalities - Created: {self.stats['municipalities_created']}, "
               f"Found: {self.stats['municipalities_updated']}")
 
     def upsert_barangays(self):
@@ -265,9 +298,9 @@ class GeotechnicalETL:
                     self.stats['barangays_created'] += 1
 
             except Exception as e:
-                print(f"  ❌ Error with {barangay_name}: {e}")
+                print(f"     Error with {barangay_name}: {e}")
 
-        print(f"✓ Barangays - Created: {self.stats['barangays_created']}, "
+        print(f"  Barangays - Created: {self.stats['barangays_created']}, "
               f"Found: {self.stats['barangays_updated']}")
 
     def upsert_boreholes(self):
@@ -286,7 +319,7 @@ class GeotechnicalETL:
             barangay_id = self.barangay_ids.get(barangay_key)
 
             if not barangay_id:
-                print(f"  ⚠️  No barangay found for {borehole_id}, skipping")
+                print(f"      No barangay found for {borehole_id}, skipping")
                 continue
 
             try:
@@ -296,7 +329,7 @@ class GeotechnicalETL:
 
                 if not latitude or not longitude:
                     print(
-                        f"  ⚠️  Missing coordinates for {borehole_id}, skipping")
+                        f"      Missing coordinates for {borehole_id}, skipping")
                     continue
 
                 # Check if exists
@@ -325,7 +358,7 @@ class GeotechnicalETL:
 
                     self.borehole_ids[borehole_id] = db_id
                     self.stats['boreholes_updated'] += 1
-                    print(f"  ✓ Updated: {borehole_id} (ID: {db_id})")
+                    print(f"    Updated: {borehole_id} (ID: {db_id})")
                 else:
                     # Insert new
                     result = self.client.table('boreholes').insert(
@@ -335,12 +368,14 @@ class GeotechnicalETL:
                     db_id = result.data[0]['id']
                     self.borehole_ids[borehole_id] = db_id
                     self.stats['boreholes_created'] += 1
-                    print(f"  ✓ Created: {borehole_id} (ID: {db_id})")
+                    print(f"    Created: {borehole_id} (ID: {db_id})")
 
             except Exception as e:
-                print(f"  ❌ Error with {borehole_id}: {e}")
+                print(f"     Error with {borehole_id}: {e}")
+                import traceback
+                traceback.print_exc()
 
-        print(f"\n✓ Boreholes - Created: {self.stats['boreholes_created']}, "
+        print(f"\n  Boreholes - Created: {self.stats['boreholes_created']}, "
               f"Updated: {self.stats['boreholes_updated']}")
 
     def map_depth_layer_to_number(self, depth_layer: str) -> int:
@@ -375,11 +410,20 @@ class GeotechnicalETL:
         depth_from, depth_to = self.extract_depth_range(depth_layer)
 
         # Handle PGA which might be string or float
-        pga_value = row.get('Peak Ground Acceleration')
-        if isinstance(pga_value, str):
-            pga_value = safe_float(pga_value.replace('g', '').strip())
-        else:
-            pga_value = safe_float(pga_value)
+        pga_value = row.get(
+            'Peak Ground Acceleration') if 'Peak Ground Acceleration' in row.index else row.get('pga_g')
+        pga_float = safe_float(pga_value)
+
+        # Handle Settlement_m - convert from meters to centimeters if present
+        settlement_m = row.get('Settlement_m')
+        settlement_cm = None
+        if settlement_m is not None and not pd.isna(settlement_m):
+            settlement_cm = safe_float(
+                settlement_m) * 100 if settlement_m != 0 else 0.0
+
+        # Handle Relative Density
+        relative_density = parse_relative_density(row.get(
+            'Relative Density') if 'Relative Density' in row.index else row.get('relative_density_percent'))
 
         soil_data = {
             'borehole_id': borehole_db_id,
@@ -390,28 +434,31 @@ class GeotechnicalETL:
             'soil_type': safe_str(row.get('Soil/Rock Description')),
             'uscs_symbol': safe_str(row.get('USCS Symbol')),
             'soil_description': safe_str(row.get('Soil/Rock Description')),
-            'spt_n_value': safe_float(row.get('SPT N-Value')),
-            'spt_n60': safe_float(row.get('SPT N-Value')),
-            'spt_n160': safe_float(row.get('Corrected SPT-N Value (N1(60))')),
+            'spt_n_value': safe_float(row.get('SPT N-Value') if 'SPT N-Value' in row.index else row.get('spt_n_value')),
+            # Prefer corrected SPT (N1(60)) for spt_n60 to avoid duplicating raw N
+            'spt_n60': safe_float(row.get('Corrected SPT-N Value (N1(60))') if 'Corrected SPT-N Value (N1(60))' in row.index else row.get('spt_n60') if 'spt_n60' in row.index else row.get('SPT N-Value')),
+            # Keep spt_n160 for compatibility; if not present, fallback to spt_n60
+            'spt_n160': safe_float(row.get('spt_n160') if 'spt_n160' in row.index else row.get('spt_n60') if 'spt_n60' in row.index else row.get('Corrected SPT-N Value (N1(60))')),
             'unit_weight': safe_float(row.get('Unit Weight (γ)')),
-            'moisture_content': safe_float(row.get('Natural Water Content (ω)')),
-            'plasticity_index': safe_float(row.get('Plasticity Index (PI)')),
-            'fines_content': safe_float(row.get('Fines Content')),
-            'mean_particle_size_d50': safe_float(row.get('Mean Particle Size (D50) (mm)')),
+            'moisture_content': safe_float(row.get('Natural Water Content (ω)') if 'Natural Water Content (ω)' in row.index else row.get('moisture_content')),
+            'plasticity_index': safe_float(row.get('Plasticity Index (PI)') if 'Plasticity Index (PI)' in row.index else row.get('plasticity_index')),
+            'fines_content': safe_float(row.get('Fines Content') if 'Fines Content' in row.index else row.get('fines_content')),
+            'mean_particle_size_d50': safe_float(row.get('Mean Particle Size (D50) (mm)') if 'Mean Particle Size (D50) (mm)' in row.index else row.get('mean_particle_size_d50')),
             'groundwater_depth_m': safe_float(row.get('Groundwater Level (m)')),
             'friction_angle': safe_float(row.get('Internal Friction Angle')),
             'cohesion_kpa': safe_float(row.get('Cohesion_kPa')),
-            'pga_g': pga_value,
+            'pga_g': pga_float,
             'csr': safe_float(row.get('Cyclic Stress Ratio (CSR)')),
             'cyclic_strength_ratio': safe_float(row.get('CRR')),
-            'liquefaction': safe_bool(row.get('Liquefaction_Potential', 0) == 1),
-            'liquefaction_risk_level': 'High' if row.get('Liquefaction_Potential', 0) == 1 else 'Low',
-            'settlement_cm': safe_float(row.get('Settlement_m')) * 100 if pd.notna(row.get('Settlement_m')) else None,
+            # Coerce liquefaction flag to boolean reliably (accepts 1, '1', True)
+            'liquefaction': bool(row.get('Liquefaction_Potential') in [1, '1', True]) if ('Liquefaction_Potential' in row.index) else safe_bool(row.get('liquefaction', False)),
+            'liquefaction_risk_level': 'High' if (row.get('Liquefaction_Potential') in [1, '1', True]) else ('High' if row.get('liquefaction') else 'Low'),
+            'settlement_cm': settlement_cm,
             'bearing_capacity_kpa': safe_float(row.get('Ultimate_Bearing_Capacity_kPa')),
             'qa_allowable_kpa': safe_float(row.get('Allowable_Bearing_Capacity_kPa')),
             'effective_overburden_pressure': safe_float(row.get('Effective_Overburden_Stress_kPa')),
             'total_overburden_pressure': safe_float(row.get('Total_Overburden_Stress_kPa')),
-            'relative_density_percent': safe_float(row.get('Relative Density')),
+            'relative_density_percent': relative_density,
             'foundation_width_m': safe_float(row.get('Foundation Width (B)')),
             'foundation_depth_m': safe_float(row.get('Foundation Depth (D)')),
             'elastic_modulus_es': safe_float(row.get('Elastic Modulus (Es) (MN/m²)')),
@@ -419,6 +466,13 @@ class GeotechnicalETL:
 
         # Remove None values to avoid database errors
         soil_data = {k: v for k, v in soil_data.items() if v is not None}
+
+        # NOTE: The DB schema contains additional optional fields such as
+        # 'color', 'blow_count_int', 'unit_weight_saturated', 'liquid_limit',
+        # 'plastic_limit', 'water_table_at_depth', 'shear_modulus_mpa',
+        # 'youngs_modulus_mpa', 'poisson_ratio', 'test_laboratory', 'observer_name'
+        # These are intentionally omitted when source Excel does not provide them.
+        # If your source includes these columns, add them to the mapping above.
 
         return soil_data
 
@@ -452,13 +506,15 @@ class GeotechnicalETL:
                         self.stats['soil_layers_created'] += len(batch_data)
                         progress = (processed / total_records) * 100
                         print(
-                            f"  ✓ Progress: {processed}/{total_records} ({progress:.1f}%)")
+                            f"    Progress: {processed}/{total_records} ({progress:.1f}%)")
                     batch_data = []
 
             except Exception as e:
                 self.stats['soil_layers_failed'] += 1
                 if self.stats['soil_layers_failed'] <= 5:
-                    print(f"  ⚠️  Error at row {idx}: {e}")
+                    print(f"      Error at row {idx}: {e}")
+                    import traceback
+                    traceback.print_exc()
 
         # Insert remaining batch
         if batch_data:
@@ -467,7 +523,7 @@ class GeotechnicalETL:
                 processed += len(batch_data)
                 self.stats['soil_layers_created'] += len(batch_data)
 
-        print(f"\n✓ Completed!")
+        print(f"\n  Completed!")
         print(
             f"  Successfully created: {self.stats['soil_layers_created']}/{total_records}")
         print(f"  Failed: {self.stats['soil_layers_failed']}")
@@ -478,15 +534,20 @@ class GeotechnicalETL:
             self.client.table('soil_layers').insert(batch_data).execute()
             return True
         except Exception as batch_error:
-            print(f"  ⚠️  Batch insert failed, trying individual inserts...")
+            print(f"      Batch insert failed: {batch_error}")
+            print(f"     Trying individual inserts...")
             success_count = 0
-            for item in batch_data:
+            for idx, item in enumerate(batch_data):
                 try:
                     self.client.table('soil_layers').insert(item).execute()
                     success_count += 1
                 except Exception as e:
                     self.stats['soil_layers_failed'] += 1
-            self.stats['soil_layers_created'] += success_count
+                    if self.stats['soil_layers_failed'] <= 10:
+                        print(f"        Failed item {idx}: {e}")
+
+            if success_count > 0:
+                self.stats['soil_layers_created'] += success_count
             return success_count > 0
 
     def verify_data(self):
@@ -512,7 +573,7 @@ class GeotechnicalETL:
                 'id', count='exact'
             ).execute()
 
-            print(f"\n✓ Database Summary:")
+            print(f"\n  Database Summary:")
             print(f"  Municipalities: {municipalities.count}")
             print(f"  Barangays: {barangays.count}")
             print(f"  Boreholes: {boreholes.count}")
@@ -521,17 +582,17 @@ class GeotechnicalETL:
             return True
 
         except Exception as e:
-            print(f"❌ Verification failed: {e}")
+            print(f"   Verification failed: {e}")
             return False
 
     def print_postgis_instructions(self):
         """Print instructions for updating PostGIS locations"""
         print("\n" + "=" * 70)
-        print("⚠️  IMPORTANT: UPDATE POSTGIS LOCATIONS")
+        print("    IMPORTANT: UPDATE POSTGIS LOCATIONS")
         print("=" * 70)
         print(
             "\nYour boreholes were inserted, but PostGIS 'location' field needs updating.")
-        print("\n📝 Run this SQL in Supabase SQL Editor:")
+        print("\n   Run this SQL in Supabase SQL Editor:")
         print("-" * 70)
         print("""
 UPDATE boreholes 
@@ -547,7 +608,7 @@ WHERE location IS NULL
     def print_summary(self):
         """Print final summary statistics"""
         print("\n" + "=" * 70)
-        print("📊 ETL PIPELINE SUMMARY")
+        print("   ETL PIPELINE SUMMARY")
         print("=" * 70)
         print(f"\nMunicipalities:")
         print(f"  Created: {self.stats['municipalities_created']}")
@@ -566,7 +627,7 @@ WHERE location IS NULL
 def main():
     """Main ETL execution"""
     print("\n" + "=" * 70)
-    print("🚀 ETL PIPELINE: SUPABASE STORAGE TO DATABASE")
+    print("   ETL PIPELINE: SUPABASE STORAGE TO DATABASE")
     print("   Geotechnical Data for Liquefaction Prediction")
     print("=" * 70 + "\n")
 
@@ -575,7 +636,7 @@ def main():
 
     # Step 1: Connect
     if not etl.connect():
-        print("\n❌ Cannot proceed without database connection")
+        print("\n   Cannot proceed without database connection")
         return None
 
     # Step 2: Download file
@@ -586,14 +647,14 @@ def main():
     )
 
     if not file_bytes:
-        print("\n❌ Failed to download file from storage")
+        print("\n Failed to download file from storage")
         return None
 
     etl.file_bytes = file_bytes
 
     # Step 3: Load data
     if not etl.load_data():
-        print("\n❌ Failed to load data from Excel")
+        print("\n   Failed to load data from Excel")
         return None
 
     # Step 4: Analyze data
@@ -615,7 +676,7 @@ def main():
     etl.print_summary()
 
     print("\n" + "=" * 70)
-    print("✅ ETL PIPELINE COMPLETED!")
+    print(" ETL PIPELINE COMPLETED!")
     print("=" * 70 + "\n")
 
     return etl

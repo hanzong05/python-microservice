@@ -1,13 +1,12 @@
 """
-Data Preparation for Machine Learning - IN-MEMORY VERSION
+Data Preparation for Machine Learning - IN-MEMORY VERSION (FIXED)
 Liquefaction, Settlement, and Bearing Capacity Prediction
 Tarlac Province, Philippines
 
-- Downloads Cleaned_Data.xlsx from Supabase Storage
-- Processes data for ML IN MEMORY
-- Archives existing ML_Ready_Data.xlsx to old_ml_data/<timestamp>
-- Uploads new ML_Ready_Data.xlsx back to Supabase Storage ONLY
-- NO LOCAL FILES CREATED
+FIXES:
+- Handles string values in numeric columns before processing
+- Converts mixed-type columns to numeric safely
+- Improved error handling for data type issues
 """
 
 import pandas as pd
@@ -27,21 +26,21 @@ warnings.filterwarnings('ignore')
 
 def download_file_from_storage(bucket_name, file_path):
     """Download file from Supabase Storage"""
-    print(f" Downloading file from Supabase Storage...")
+    print(f"Downloading file from Supabase Storage...")
     print(f"   Bucket: {bucket_name}")
     print(f"   File: {file_path}")
 
     client = get_supabase_client()
     if not client:
-        print(" Failed to connect to Supabase")
+        print("Failed to connect to Supabase")
         return None
 
     try:
         response = client.storage.from_(bucket_name).download(file_path)
-        print(f"✓ Successfully downloaded {len(response)} bytes")
+        print(f"[OK] Successfully downloaded {len(response)} bytes")
         return response
     except Exception as e:
-        print(f" Error downloading file: {e}")
+        print(f"Error downloading file: {e}")
         return None
 
 
@@ -51,7 +50,7 @@ def download_file_from_storage(bucket_name, file_path):
 
 def upload_to_supabase_storage(excel_bytes, bucket_name, storage_path):
     """Upload file to Supabase Storage directly from memory and archive existing file"""
-    print(f"\n Uploading to Supabase Storage...")
+    print(f"\nUploading to Supabase Storage...")
     client = get_supabase_client()
     if not client:
         return False
@@ -66,7 +65,7 @@ def upload_to_supabase_storage(excel_bytes, bucket_name, storage_path):
                 archive_path = f"old_ml_data/old_ml_ready_data_{timestamp}.xlsx"
                 client.storage.from_(bucket_name).move(
                     storage_path, archive_path)
-                print(f"✓ Existing file archived as {archive_path}")
+                print(f"[OK] Existing file archived as {archive_path}")
         except Exception:
             # File may not exist, which is fine
             pass
@@ -80,12 +79,12 @@ def upload_to_supabase_storage(excel_bytes, bucket_name, storage_path):
                 "upsert": "true"
             }
         )
-        print(f"✓ File uploaded successfully to {storage_path}")
-        print(f"✓ File size: {len(excel_bytes) / 1024:.2f} KB")
+        print(f"[OK] File uploaded successfully to {storage_path}")
+        print(f"[OK] File size: {len(excel_bytes) / 1024:.2f} KB")
         return True
 
     except Exception as e:
-        print(f" Error uploading file: {e}")
+        print(f"Error uploading file: {e}")
         return False
 
 
@@ -110,15 +109,60 @@ class GeotechnicalDataPrep:
             # Read Excel from bytes
             self.df = pd.read_excel(io.BytesIO(
                 self.file_bytes), sheet_name='Cleaned_Data')
-            print(f"✓ Successfully loaded {len(self.df)} records")
-            print(f"✓ Number of columns: {len(self.df.columns)}")
+            # Create canonical (snake_case) columns in addition to original Excel names
+            # This keeps backward compatibility while ensuring downstream steps
+            # can use consistent column names expected by feature engineering.
+            self._add_canonical_columns()
+            print(f"[OK] Successfully loaded {len(self.df)} records")
+            print(f"[OK] Number of columns: {len(self.df.columns)}")
             print(f"\nColumn names:")
             for i, col in enumerate(self.df.columns, 1):
                 print(f"  {i:2d}. {col}")
             return True
         except Exception as e:
-            print(f"✗ Error loading data: {e}")
+            print(f"[ERROR] Error loading data: {e}")
             return False
+
+    def clean_numeric_columns(self):
+        """Convert string values to numeric in columns that should be numeric"""
+        print("\n" + "=" * 70)
+        print("STEP 1.5: CLEANING NUMERIC COLUMNS")
+        print("=" * 70)
+
+        # List of columns that should be numeric
+        numeric_columns = [
+            'Fines Content', 'Plasticity Index (PI)', 'Natural Water Content (ω)',
+            'Mean Particle Size (D50) (mm)', 'SPT N-Value', 'Corrected SPT-N Value (N1(60))',
+            'Unit Weight (γ)', 'Groundwater Level (m)', 'Internal Friction Angle',
+            'Foundation Width (B)', 'Foundation Depth (D)', 'Length-to-width ratio (L/B)',
+            'Cyclic Stress Ratio (CSR)', 'Effective Overburden Pressure',
+            'Total Overburden Pressure', 'Relative Density', 'Elastic Modulus (Es) (MN/m²)',
+            'Latitude', 'Longitude', 'Elevation', 'Fault Distance (km)', 'Ground Water Table'
+        ]
+
+        cleaned_count = 0
+        for col in numeric_columns:
+            if col in self.df.columns:
+                # Check if column has mixed types
+                if self.df[col].dtype == 'object':
+                    print(f"  Converting '{col}' to numeric...")
+                    # Convert to numeric, coercing errors to NaN
+                    original_nulls = self.df[col].isnull().sum()
+                    self.df[col] = pd.to_numeric(self.df[col], errors='coerce')
+                    new_nulls = self.df[col].isnull().sum()
+                    converted = new_nulls - original_nulls
+                    if converted > 0:
+                        print(
+                            f"    [WARNING] Converted {converted} non-numeric values to NaN")
+                    cleaned_count += 1
+
+        if cleaned_count > 0:
+            print(
+                f"\n[OK] Cleaned {cleaned_count} columns with mixed data types")
+        else:
+            print("[OK] No mixed data types found - all numeric columns are clean")
+
+        return True
 
     def analyze_data_quality(self):
         """Analyze data completeness and quality"""
@@ -146,10 +190,10 @@ class GeotechnicalDataPrep:
 
         if len(missing_with_nulls) > 0:
             print(
-                f"\n⚠ Found {len(missing_with_nulls)} columns with missing values:")
+                f"\n[WARNING] Found {len(missing_with_nulls)} columns with missing values:")
             print(missing_with_nulls.to_string(index=False))
         else:
-            print("✓ No missing values detected!")
+            print("[OK] No missing values detected!")
 
         # Data types
         print("\n--- Data Types ---")
@@ -174,7 +218,7 @@ class GeotechnicalDataPrep:
         print("=" * 70)
 
         if 'Depth_Layer' not in self.df.columns:
-            print("⚠ Warning: 'Depth_Layer' column not found")
+            print("[WARNING] Warning: 'Depth_Layer' column not found")
             return
 
         depth_mapping = {
@@ -191,9 +235,97 @@ class GeotechnicalDataPrep:
         }
 
         self.df['Depth_Midpoint_m'] = self.df['Depth_Layer'].map(depth_mapping)
-        print("✓ Created 'Depth_Midpoint_m' column")
+        print("[OK] Created 'Depth_Midpoint_m' column")
         print(f"\nDepth distribution:")
         print(self.df['Depth_Layer'].value_counts().sort_index())
+
+    def _add_canonical_columns(self):
+        """Add canonical snake_case columns derived from Excel column names.
+
+        This does not remove original columns — it creates normalized copies
+        to avoid downstream name mismatches between scripts.
+        """
+        df = self.df
+
+        def _first_available(*names):
+            for n in names:
+                if n in df.columns:
+                    return df[n]
+            return None
+
+        # SPT fields
+        if _first_available('SPT N-Value') is not None:
+            df['spt_n_value'] = pd.to_numeric(
+                _first_available('SPT N-Value'), errors='coerce')
+
+        # Prefer corrected SPT N1(60) as spt_n60
+        corrected_n1_60 = _first_available(
+            'Corrected SPT-N Value (N1(60))', 'Corrected SPT-N Value')
+        if corrected_n1_60 is not None:
+            df['spt_n60'] = pd.to_numeric(corrected_n1_60, errors='coerce')
+            # keep spt_n160 for compatibility (duplicate of corrected if no better source)
+            df['spt_n160'] = df['spt_n60']
+        else:
+            # fallback to raw SPT value
+            if 'spt_n_value' in df.columns:
+                df['spt_n60'] = df['spt_n_value']
+                df['spt_n160'] = df['spt_n_value']
+
+        # Unit weight
+        uw = _first_available(
+            'Unit Weight (γ)', 'Unit Weight', 'Unit_Weight', 'unit_weight')
+        if uw is not None:
+            df['unit_weight'] = pd.to_numeric(uw, errors='coerce')
+
+        # Fines, moisture, plasticity, particle size
+        if _first_available('Fines Content') is not None:
+            df['fines_content'] = pd.to_numeric(
+                _first_available('Fines Content'), errors='coerce')
+        if _first_available('Natural Water Content (ω)', 'Natural Water Content', 'moisture_content') is not None:
+            df['moisture_content'] = pd.to_numeric(_first_available(
+                'Natural Water Content (ω)', 'Natural Water Content', 'moisture_content'), errors='coerce')
+        if _first_available('Plasticity Index (PI)', 'Plasticity Index') is not None:
+            df['plasticity_index'] = pd.to_numeric(_first_available(
+                'Plasticity Index (PI)', 'Plasticity Index'), errors='coerce')
+        if _first_available('Mean Particle Size (D50) (mm)', 'Mean Particle Size (D50)', 'D50') is not None:
+            df['mean_particle_size_d50'] = pd.to_numeric(_first_available(
+                'Mean Particle Size (D50) (mm)', 'Mean Particle Size (D50)', 'D50'), errors='coerce')
+
+        # Groundwater / PGA / CSR
+        if _first_available('Groundwater Level (m)', 'Ground Water Table', 'Ground Water Table (m)') is not None:
+            df['groundwater_depth_m'] = pd.to_numeric(_first_available(
+                'Groundwater Level (m)', 'Ground Water Table', 'Ground Water Table (m)'), errors='coerce')
+        if _first_available('Peak Ground Acceleration', 'PGA', 'pga_g') is not None:
+            df['pga_g'] = pd.to_numeric(_first_available(
+                'Peak Ground Acceleration', 'PGA', 'pga_g'), errors='coerce')
+        if _first_available('Cyclic Stress Ratio (CSR)', 'CSR') is not None:
+            df['csr'] = pd.to_numeric(_first_available(
+                'Cyclic Stress Ratio (CSR)', 'CSR'), errors='coerce')
+
+        # Bearing capacity targets
+        if _first_available('Allowable_Bearing_Capacity_kPa', 'Allowable_Bearing_Capacity_kPa', 'Allowable_Bearing_Capacity') is not None:
+            df['qa_allowable_kpa'] = pd.to_numeric(_first_available(
+                'Allowable_Bearing_Capacity_kPa', 'Allowable_Bearing_Capacity_kPa', 'Allowable_Bearing_Capacity'), errors='coerce')
+        if _first_available('Ultimate_Bearing_Capacity_kPa', 'Ultimate_Bearing_Capacity_kPa') is not None:
+            df['bearing_capacity_kpa'] = pd.to_numeric(_first_available(
+                'Ultimate_Bearing_Capacity_kPa', 'Ultimate_Bearing_Capacity_kPa'), errors='coerce')
+
+        # Friction angle / cohesion
+        if _first_available('Internal Friction Angle', 'Friction Angle') is not None:
+            df['friction_angle'] = pd.to_numeric(_first_available(
+                'Internal Friction Angle', 'Friction Angle'), errors='coerce')
+        if _first_available('Cohesion_kPa', 'Cohesion (kPa)', 'Cohesion') is not None:
+            df['cohesion_kpa'] = pd.to_numeric(_first_available(
+                'Cohesion_kPa', 'Cohesion (kPa)', 'Cohesion'), errors='coerce')
+
+        # Location keys - keep originals but also ensure numeric latitude/longitude exist
+        if 'Latitude' in df.columns:
+            df['latitude'] = pd.to_numeric(df['Latitude'], errors='coerce')
+        if 'Longitude' in df.columns:
+            df['longitude'] = pd.to_numeric(df['Longitude'], errors='coerce')
+
+        # Leave original columns intact for traceability
+        self.df = df
 
     def engineer_soil_features(self):
         """Create engineered features from existing soil properties"""
@@ -205,23 +337,33 @@ class GeotechnicalDataPrep:
 
         # 1. Soil Classification (based on fines content)
         if 'Fines Content' in self.df.columns:
+            # Ensure column is numeric
+            self.df['Fines Content'] = pd.to_numeric(
+                self.df['Fines Content'], errors='coerce')
+
+            # Only categorize non-null values
             self.df['Soil_Type_Category'] = pd.cut(
                 self.df['Fines Content'],
                 bins=[0, 5, 12, 100],
                 labels=['Clean_Sand', 'Sandy_Soil', 'Fine_Grained']
             )
             features_created.append('Soil_Type_Category')
-            print("✓ Created Soil_Type_Category based on fines content")
+            print("[OK] Created Soil_Type_Category based on fines content")
 
         # 2. Relative Density Classification
         if 'Corrected SPT-N Value (N1(60))' in self.df.columns:
+            # Ensure column is numeric
+            self.df['Corrected SPT-N Value (N1(60))'] = pd.to_numeric(
+                self.df['Corrected SPT-N Value (N1(60))'], errors='coerce'
+            )
+
             self.df['Relative_Density_Class'] = pd.cut(
                 self.df['Corrected SPT-N Value (N1(60))'],
                 bins=[0, 4, 10, 30, 50, 100],
                 labels=['Very_Loose', 'Loose', 'Medium', 'Dense', 'Very_Dense']
             )
             features_created.append('Relative_Density_Class')
-            print("✓ Created Relative_Density_Class from N1(60)")
+            print("[OK] Created Relative_Density_Class from N1(60)")
 
         # 3. Total Overburden Stress
         if 'Unit Weight (γ)' in self.df.columns and 'Depth_Midpoint_m' in self.df.columns:
@@ -229,7 +371,7 @@ class GeotechnicalDataPrep:
                 self.df['Unit Weight (γ)'] * self.df['Depth_Midpoint_m']
             )
             features_created.append('Total_Overburden_Stress_kPa')
-            print("✓ Created Total_Overburden_Stress_kPa")
+            print("[OK] Created Total_Overburden_Stress_kPa")
 
         # 4. Effective Overburden Stress
         if 'Groundwater Level (m)' in self.df.columns and 'Depth_Midpoint_m' in self.df.columns:
@@ -245,12 +387,12 @@ class GeotechnicalDataPrep:
                     (gamma_water * depth_below_wt)
                 )
                 features_created.append('Effective_Overburden_Stress_kPa')
-                print("✓ Created Effective_Overburden_Stress_kPa")
+                print("[OK] Created Effective_Overburden_Stress_kPa")
 
         if features_created:
-            print(f"\n✓ Total features created: {len(features_created)}")
+            print(f"\n[OK] Total features created: {len(features_created)}")
         else:
-            print("⚠ No features could be created (missing base columns)")
+            print("[WARNING] No features could be created (missing base columns)")
 
         return features_created
 
@@ -267,12 +409,12 @@ class GeotechnicalDataPrep:
 
         if N1_60_col not in self.df.columns:
             print(
-                f"⚠ Cannot calculate liquefaction parameters. Missing: {N1_60_col}")
+                f"[WARNING] Cannot calculate liquefaction parameters. Missing: {N1_60_col}")
             return parameters_created
 
         if CSR_col not in self.df.columns:
             print(
-                f"⚠ Cannot calculate liquefaction parameters. Missing: {CSR_col}")
+                f"[WARNING] Cannot calculate liquefaction parameters. Missing: {CSR_col}")
             return parameters_created
 
         # 1. Calculate CRR (Cyclic Resistance Ratio)
@@ -286,20 +428,20 @@ class GeotechnicalDataPrep:
             self.df['CRR'] = self.df['CRR'] * fc_factor
 
         parameters_created.append('CRR')
-        print("✓ Created CRR (Cyclic Resistance Ratio)")
+        print("[OK] Created CRR (Cyclic Resistance Ratio)")
 
         # 2. Factor of Safety against Liquefaction
         CSR = self.df[CSR_col]
         self.df['FS_Liquefaction'] = self.df['CRR'] / (CSR + 0.0001)
         parameters_created.append('FS_Liquefaction')
-        print("✓ Created FS_Liquefaction (Factor of Safety)")
+        print("[OK] Created FS_Liquefaction (Factor of Safety)")
 
         # 3. Liquefaction Potential Classification
         self.df['Liquefaction_Potential'] = np.where(
             self.df['FS_Liquefaction'] < 1.0, 1, 0
         )
         parameters_created.append('Liquefaction_Potential')
-        print("✓ Created Liquefaction_Potential (Binary: 0=No, 1=Yes)")
+        print("[OK] Created Liquefaction_Potential (Binary: 0=No, 1=Yes)")
 
         # Show distribution
         liq_counts = self.df['Liquefaction_Potential'].value_counts()
@@ -309,7 +451,7 @@ class GeotechnicalDataPrep:
         print(
             f"    Liquefiable (1): {liq_counts.get(1, 0)} ({liq_counts.get(1, 0)/len(self.df)*100:.1f}%)")
 
-        print(f"\n✓ Total parameters created: {len(parameters_created)}")
+        print(f"\n[OK] Total parameters created: {len(parameters_created)}")
         return parameters_created
 
     def calculate_settlement_target(self):
@@ -325,7 +467,8 @@ class GeotechnicalDataPrep:
         missing = [col for col in required if col not in self.df.columns]
 
         if missing:
-            print(f"⚠ Cannot calculate settlement. Missing columns: {missing}")
+            print(
+                f"[WARNING] Cannot calculate settlement. Missing columns: {missing}")
             return False
 
         liquefiable_mask = self.df['Liquefaction_Potential'] == 1
@@ -335,7 +478,8 @@ class GeotechnicalDataPrep:
             f"\nCalculating settlement for {n_liquefiable} liquefiable soil layers...")
 
         if n_liquefiable == 0:
-            print("⚠ No liquefiable soils found. Settlement = 0 for all layers.")
+            print(
+                "[WARNING] No liquefiable soils found. Settlement = 0 for all layers.")
             self.df['Settlement_m'] = 0.0
             return True
 
@@ -365,7 +509,7 @@ class GeotechnicalDataPrep:
         layer_thickness = 1.5
         self.df['Settlement_m'] = self.df['Volumetric_Strain'] * layer_thickness
 
-        print("✓ Created Settlement_m (target variable for ML)")
+        print("[OK] Created Settlement_m (target variable for ML)")
 
         settlement_stats = self.df[self.df['Settlement_m']
                                    > 0]['Settlement_m'].describe()
@@ -392,21 +536,21 @@ class GeotechnicalDataPrep:
         if friction_angle_col not in self.df.columns:
             if N1_60_col in self.df.columns:
                 self.df[friction_angle_col] = 27.5 + 0.3 * self.df[N1_60_col]
-                print(f"✓ Estimated {friction_angle_col} from N1(60)")
+                print(f"[OK] Estimated {friction_angle_col} from N1(60)")
             else:
-                print(f"⚠ Cannot estimate friction angle - missing N1(60)")
+                print(f"[WARNING] Cannot estimate friction angle - missing N1(60)")
                 return False
 
         self.df['Cohesion_kPa'] = 0.0
-        print("✓ Set Cohesion = 0 kPa (sandy soils)")
+        print("[OK] Set Cohesion = 0 kPa (sandy soils)")
 
         if footing_width_col not in self.df.columns:
             self.df[footing_width_col] = 1.5
-            print(f"✓ Assumed {footing_width_col} = 1.5 m")
+            print(f"[OK] Assumed {footing_width_col} = 1.5 m")
 
         if footing_depth_col not in self.df.columns:
             self.df[footing_depth_col] = 1.5
-            print(f"✓ Assumed {footing_depth_col} = 1.5 m")
+            print(f"[OK] Assumed {footing_depth_col} = 1.5 m")
 
         print("\nCalculating bearing capacity using Terzaghi (1943)...")
 
@@ -438,8 +582,8 @@ class GeotechnicalDataPrep:
             self.df['Ultimate_Bearing_Capacity_kPa'] / FS_bearing
         )
 
-        print("✓ Created Ultimate_Bearing_Capacity_kPa")
-        print("✓ Created Allowable_Bearing_Capacity_kPa (FS = 3.0)")
+        print("[OK] Created Ultimate_Bearing_Capacity_kPa")
+        print("[OK] Created Allowable_Bearing_Capacity_kPa (FS = 3.0)")
 
         bc_stats = self.df['Allowable_Bearing_Capacity_kPa'].describe()
         print(f"\nBearing Capacity Statistics:")
@@ -460,7 +604,7 @@ class GeotechnicalDataPrep:
         missing_numerical = missing_numerical[missing_numerical > 0]
 
         if len(missing_numerical) == 0:
-            print("✓ No missing values in numerical columns!")
+            print("[OK] No missing values in numerical columns!")
             return True
 
         print(
@@ -472,9 +616,9 @@ class GeotechnicalDataPrep:
         for col in missing_numerical.index:
             median_value = self.df[col].median()
             self.df[col].fillna(median_value, inplace=True)
-            print(f"  ✓ {col}: filled with {median_value:.4f}")
+            print(f"  [OK] {col}: filled with {median_value:.4f}")
 
-        print("\n✓ All missing values handled!")
+        print("\n[OK] All missing values handled!")
         return True
 
     def create_ml_ready_features(self):
@@ -498,14 +642,14 @@ class GeotechnicalDataPrep:
         missing_features = [
             f for f in input_features if f not in self.df.columns]
 
-        print(f"\n✓ Available Features ({len(available_features)}):")
+        print(f"\n[OK] Available Features ({len(available_features)}):")
         for f in available_features:
-            print(f"  • {f}")
+            print(f"  - {f}")
 
         if missing_features:
-            print(f"\n⚠ Missing Features ({len(missing_features)}):")
+            print(f"\n[WARNING] Missing Features ({len(missing_features)}):")
             for f in missing_features:
-                print(f"  • {f}")
+                print(f"  - {f}")
 
         target_variables = {
             'Liquefaction': 'Liquefaction_Potential',
@@ -513,12 +657,12 @@ class GeotechnicalDataPrep:
             'Bearing_Capacity': 'Allowable_Bearing_Capacity_kPa'
         }
 
-        print(f"\n✓ Target Variables:")
+        print(f"\n[OK] Target Variables:")
         for name, col in target_variables.items():
             if col in self.df.columns:
-                print(f"  • {name}: {col}")
+                print(f"  - {name}: {col}")
             else:
-                print(f"  ⚠ {name}: {col} (NOT FOUND)")
+                print(f"  [WARNING] {name}: {col} (NOT FOUND)")
 
         return available_features, target_variables
 
@@ -534,7 +678,7 @@ class GeotechnicalDataPrep:
         with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
             # 1. Full dataset
             self.df.to_excel(writer, sheet_name='Full_Dataset', index=False)
-            print("✓ Exported: Full_Dataset")
+            print("[OK] Exported: Full_Dataset")
 
             # 2. Feature list
             feature_cols, target_vars = self.create_ml_ready_features()
@@ -559,7 +703,7 @@ class GeotechnicalDataPrep:
                 'Std': [safe_std(f) for f in feature_cols]
             })
             feature_df.to_excel(writer, sheet_name='Feature_List', index=False)
-            print("✓ Exported: Feature_List")
+            print("[OK] Exported: Feature_List")
 
             # 3. Data quality report
             quality_df = pd.DataFrame({
@@ -583,7 +727,7 @@ class GeotechnicalDataPrep:
             })
             quality_df.to_excel(
                 writer, sheet_name='Data_Quality_Report', index=False)
-            print("✓ Exported: Data_Quality_Report")
+            print("[OK] Exported: Data_Quality_Report")
 
             # 4. Liquefiable soils only
             if 'Liquefaction_Potential' in self.df.columns:
@@ -592,20 +736,20 @@ class GeotechnicalDataPrep:
                     liq_df.to_excel(
                         writer, sheet_name='Liquefiable_Soils_Only', index=False)
                     print(
-                        f"✓ Exported: Liquefiable_Soils_Only ({len(liq_df)} records)")
+                        f"[OK] Exported: Liquefiable_Soils_Only ({len(liq_df)} records)")
 
             # 5. Summary statistics
             numeric_cols = self.df.select_dtypes(include=[np.number]).columns
             stats_df = self.df[numeric_cols].describe().T
             stats_df.to_excel(writer, sheet_name='Summary_Statistics')
-            print("✓ Exported: Summary_Statistics")
+            print("[OK] Exported: Summary_Statistics")
 
         # Get bytes from buffer
         excel_buffer.seek(0)
         excel_bytes = excel_buffer.read()
 
-        print(f"\n✓ Excel file created in memory (not saved locally)")
-        print(f"✓ File size: {len(excel_bytes) / 1024:.2f} KB")
+        print(f"\n[OK] Excel file created in memory (not saved locally)")
+        print(f"[OK] File size: {len(excel_bytes) / 1024:.2f} KB")
         return excel_bytes
 
     def generate_data_report(self):
@@ -643,12 +787,12 @@ class GeotechnicalDataPrep:
             report['Mean Bearing Capacity'] = f"{self.df['Allowable_Bearing_Capacity_kPa'].mean():.2f} kPa"
             report['Max Bearing Capacity'] = f"{self.df['Allowable_Bearing_Capacity_kPa'].max():.2f} kPa"
 
-        print("\n FINAL STATISTICS:")
+        print("\n   FINAL STATISTICS:")
         for key, value in report.items():
             print(f"  {key}: {value}")
 
         print("\n" + "=" * 70)
-        print(" DATA IS NOW READY FOR MACHINE LEARNING!")
+        print("[SUCCESS] DATA IS NOW READY FOR MACHINE LEARNING!")
         print("=" * 70)
         print("\nNext Steps:")
         print("  1. Review 'ML_Ready_Data.xlsx' (uploaded to Supabase)")
@@ -680,15 +824,18 @@ def main():
     # Step 1: Download cleaned data from Supabase
     file_bytes = download_file_from_storage(BUCKET_NAME, INPUT_FILE_PATH)
     if not file_bytes:
-        print(" Failed to download file from storage. Exiting.")
+        print("Failed to download file from storage. Exiting.")
         return None
 
     # Step 2: Process data
     prep = GeotechnicalDataPrep(file_bytes)
 
     if not prep.load_data():
-        print(" Failed to load data. Exiting.")
+        print("Failed to load data. Exiting.")
         return None
+
+    # NEW: Clean numeric columns before processing
+    prep.clean_numeric_columns()
 
     prep.analyze_data_quality()
     prep.convert_depth_to_numeric()
@@ -706,8 +853,8 @@ def main():
     # Step 3: Upload ML-ready data to Supabase (from memory)
     upload_to_supabase_storage(excel_bytes, BUCKET_NAME, OUTPUT_STORAGE_PATH)
 
-    print("\n PROCESSING COMPLETED SUCCESSFULLY!")
-    print("✓ No local files created - all processing in memory")
+    print("\n[SUCCESS] PROCESSING COMPLETED SUCCESSFULLY!")
+    print("[OK] No local files created - all processing in memory")
     print("="*70)
 
     return prep

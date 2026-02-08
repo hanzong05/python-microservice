@@ -1,0 +1,33 @@
+barangays id bigint 
+NOT NULL DEFAULT nextval('barangays_id_seq'::regclass), municipality_id bigint NOT NULL, name character varying NOT NULL, location USER-DEFINED, area_sq_km numeric, description text, created_at timestamp without time zone DEFAULT now(), updated_at timestamp without time zone DEFAULT now()
+
+boreholes
+ id bigint NOT NULL DEFAULT nextval('boreholes_id_seq'::regclass), barangay_id bigint NOT NULL, borehole_id character varying NOT NULL, location USER-DEFINED, latitude numeric, longitude numeric, elevation numeric, depth_total_m numeric, drilling_date date, drilling_contractor character varying, remarks text, created_at timestamp without time zone DEFAULT now(), updated_at timestamp without time zone DEFAULT now()
+
+geography_columns 
+f_table_catalog name, f_table_schema name, f_table_name name, f_geography_column name, coord_dimension integer, srid integer, type text
+
+geometry_columns
+ f_table_catalog character varying, f_table_schema name, f_table_name name, f_geometry_column name, coord_dimension integer, srid integer, type character varying
+
+municipalities 
+id bigint NOT NULL DEFAULT nextval('municipalities_id_seq'::regclass), name character varying NOT NULL, center_point USER-DEFINED, description text, created_at timestamp without time zone DEFAULT now(), updated_at timestamp without time zone DEFAULT now()
+
+soil_layers 
+id bigint NOT NULL DEFAULT nextval('soil_layers_id_seq'::regclass), borehole_id bigint NOT NULL, layer_number integer NOT NULL, depth_from_m numeric NOT NULL, depth_to_m numeric NOT NULL, depth_range character varying, soil_type character varying, uscs_symbol character varying, soil_description text, color character varying, spt_n_value numeric, spt_n60 numeric, spt_n160 numeric, blow_count_int integer, unit_weight numeric, unit_weight_saturated numeric, moisture_content numeric, plasticity_index numeric, liquid_limit numeric, plastic_limit numeric, fines_content numeric, mean_particle_size_d50 numeric, groundwater_depth_m numeric, water_table_at_depth boolean DEFAULT false, friction_angle numeric, cohesion_kpa numeric, shear_modulus_mpa numeric, youngs_modulus_mpa numeric, poisson_ratio numeric, pga_g numeric, csr numeric, cyclic_strength_ratio numeric, liquefaction boolean DEFAULT false, liquefaction_risk_level character varying, settlement_cm numeric, elastic_modulus_es numeric, foundation_width_m numeric, foundation_depth_m numeric, bearing_capacity_kpa numeric, qa_allowable_kpa numeric, effective_overburden_pressure numeric, total_overburden_pressure numeric, relative_density_percent numeric, test_laboratory character varying, observer_name character varying, remarks text, created_at timestamp without time zone DEFAULT now(), updated_at timestamp without time zone DEFAULT now()
+
+spatial_ref_sys 
+srid integer NOT NULL, auth_name character varying, auth_srid integer, srtext character varying, proj4text character varying
+
+v_bearing_capacity_by_layer 
+layer_number integer, depth_from_m numeric, depth_to_m numeric, depth_range character varying, sample_count bigint, min_bc_kpa numeric, avg_bc_kpa numeric, max_bc_kpa numeric, stddev_bc_kpa numeric 
+
+v_complete_soil_data 
+municipality_id bigint, municipality character varying, barangay_id bigint, barangay character varying, borehole_record_id bigint, borehole_id character varying, elevation numeric, latitude numeric, longitude numeric, layer_id bigint, layer_number integer, depth_from_m numeric, depth_to_m numeric, depth_range character varying, spt_n_value numeric, spt_n60 numeric, unit_weight numeric, fines_content numeric, groundwater_depth_m numeric, pga_g numeric, csr numeric, liquefaction boolean, settlement_cm numeric, bearing_capacity_kpa numeric, friction_angle numeric, cohesion_kpa numeric, elastic_modulus_es numeric, created_at timestamp without time zone, updated_at timestamp without time zone
+
+v_liquefaction_risk_zones
+
+lat_cell numeric, lon_cell numeric, sample_count bigint, avg_spt_n numeric, liquefaction_count bigint, liquefaction_risk_percent numeric
+
+v_municipality_statistics
+municipality character varying, borehole_count bigint, total_samples bigint, avg_spt_n numeric, avg_unit_weight numeric, avg_bearing_capacity_kpa numeric, liquefaction_zones bigint, liquefaction_percentage numeric
