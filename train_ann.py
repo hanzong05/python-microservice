@@ -65,6 +65,13 @@ except ImportError:
     PLOTTING_AVAILABLE = False
     print("[INFO] Matplotlib not available - plots will be skipped")
 
+try:
+    import openpyxl
+    EXCEL_AVAILABLE = True
+except ImportError:
+    EXCEL_AVAILABLE = False
+    print("[INFO] openpyxl not installed - Excel export will use CSV fallback")
+
 
 class MultiOutputANNTraining:
     """
@@ -91,6 +98,8 @@ class MultiOutputANNTraining:
         self.settle_model = None
         self.bearing_model = None
         self.feature_names = []
+        self.df_raw = None        # Original raw dataframe (all columns)
+        self.df_validation = None  # 20% validation set in raw format
         
     def connect_database(self) -> bool:
         """Connect to PostGIS database"""
@@ -140,6 +149,7 @@ class MultiOutputANNTraining:
                 return False
             
             self.df = pd.DataFrame(result.data)
+            self.df_raw = self.df.copy()  # Preserve raw data for validation export
             print(f"  [OK] Retrieved {len(self.df)} records")
             print(f"  Columns: {len(self.df.columns)}")
             return True
@@ -401,8 +411,8 @@ class MultiOutputANNTraining:
         print(f"  Target 2 (Settlement): Mean={y_settle.mean():.2f} cm, Range=[{y_settle.min():.2f}, {y_settle.max():.2f}] cm")
         print(f"  Target 3 (Bearing Capacity): Mean={y_bearing.mean():.1f} kPa, Range=[{y_bearing.min():.1f}, {y_bearing.max():.1f}] kPa")
         
-        # Split data: 80% train, 20% test (per project requirements)
-        print("\n  Splitting data (80% train, 20% test)...")
+        # Split data: 80% train, 20% validation (per project requirements)
+        print("\n  Splitting data (80% train, 20% validation)...")
         self.X_train, self.X_test, self.y_liq_train, self.y_liq_test = train_test_split(
             X, y_liq, test_size=0.2, random_state=42, stratify=y_liq
         )
@@ -412,9 +422,18 @@ class MultiOutputANNTraining:
         _, _, self.y_bearing_train, self.y_bearing_test = train_test_split(
             X, y_bearing, test_size=0.2, random_state=42
         )
-        
-        print(f"  Training set: {len(self.X_train)} samples")
-        print(f"  Test set: {len(self.X_test)} samples")
+
+        # Build validation dataframe in raw data format using test indices
+        val_indices = self.X_test.index
+        val_raw = self.df_raw.loc[val_indices].copy().reset_index(drop=True)
+        # Append computed targets so the Excel reflects what the model is predicting
+        val_raw['_target_liquefaction'] = self.y_liq_test.values
+        val_raw['_target_settlement_cm'] = self.y_settle_test.values
+        val_raw['_target_bearing_capacity_kpa'] = self.y_bearing_test.values
+        self.df_validation = val_raw
+
+        print(f"  Training set: {len(self.X_train)} samples (80%)")
+        print(f"  Validation set: {len(self.X_test)} samples (20%)")
         
         return True
     
@@ -773,6 +792,41 @@ class MultiOutputANNTraining:
             traceback.print_exc()
             return False
     
+    def export_validation_excel(self) -> str:
+        """Export 20% validation set as Excel file in the same format as raw data"""
+        print("\n" + "="*80)
+        print("EXPORTING VALIDATION DATA (20%)")
+        print("="*80)
+
+        if self.df_validation is None:
+            print("  [ERROR] Validation dataframe not available")
+            return ""
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"validation_data_20pct_{timestamp}.xlsx"
+
+        try:
+            if EXCEL_AVAILABLE:
+                self.df_validation.to_excel(filename, index=False, engine='openpyxl')
+                print(f"  [OK] Excel file saved: {filename}")
+            else:
+                # Fallback to CSV if openpyxl not installed
+                csv_filename = filename.replace('.xlsx', '.csv')
+                self.df_validation.to_csv(csv_filename, index=False)
+                filename = csv_filename
+                print(f"  [INFO] openpyxl not available, saved as CSV: {filename}")
+
+            print(f"  Rows: {len(self.df_validation)} (20% validation set)")
+            print(f"  Columns: {len(self.df_validation.columns)}")
+            print(f"  Columns include: raw data + _target_liquefaction, "
+                  f"_target_settlement_cm, _target_bearing_capacity_kpa")
+            return filename
+        except Exception as e:
+            print(f"  [ERROR] Export failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return ""
+
     def run(self) -> bool:
         """Run complete training pipeline"""
         print("\n" + "="*80)
@@ -795,7 +849,9 @@ class MultiOutputANNTraining:
         
         if not self.evaluate_models():
             return False
-        
+
+        validation_file = self.export_validation_excel()
+
         if not self.save_models():
             return False
         
@@ -808,8 +864,10 @@ class MultiOutputANNTraining:
         print(f"    HIDDEN 2: 15 neurons (tanh)")
         print(f"    OUTPUT: 3 neurons (linear)")
         print(f"  Training samples: {len(self.X_train)} (80%)")
-        print(f"  Test samples: {len(self.X_test)} (20%)")
+        print(f"  Validation samples: {len(self.X_test)} (20%)")
         print(f"  Features: {len(self.feature_names)}")
+        if validation_file:
+            print(f"\n  Validation Excel: {validation_file}")
         print(f"\n  Models saved:")
         print(f"    - models/scaler.pkl")
         print(f"    - models/ann_multi_output.pkl (Primary: 3 outputs)")
