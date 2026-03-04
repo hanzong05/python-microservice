@@ -117,6 +117,36 @@ class GeotechnicalPipeline:
             traceback.print_exc()
             return False
     
+    def upload_raw_file_to_bucket(self) -> bool:
+        """Upload the local raw Excel file to Supabase Storage (raw/ folder)"""
+        if not self.excel_path or not self.excel_path.exists():
+            return True  # Nothing to upload
+
+        if not self.client:
+            print("  [INFO] No database connection - skipping raw file upload")
+            return True
+
+        try:
+            bucket_name = os.getenv('SUPABASE_STORAGE_BUCKET', 'geotechnical-data')
+            dest_path = f"raw/{self.excel_path.name}"
+
+            with open(self.excel_path, 'rb') as f:
+                file_bytes = f.read()
+
+            self.client.storage.from_(bucket_name).upload(
+                dest_path,
+                file_bytes,
+                file_options={
+                    'content-type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                    'upsert': 'true'
+                }
+            )
+            print(f"  [OK] Raw file uploaded to bucket: {dest_path}")
+            return True
+        except Exception as e:
+            print(f"  [WARNING] Raw file upload failed: {e}")
+            return True  # Non-fatal
+
     def load_excel(self) -> bool:
         """Load Excel file from local path or memory bytes"""
         print("\n" + "="*80)
@@ -438,6 +468,9 @@ class GeotechnicalPipeline:
             df['depth_to_m'] = depths.apply(lambda x: x[1])
             df['depth_mid_m'] = (df['depth_from_m'] + df['depth_to_m']) / 2
             
+            # STEP 9: Compute missing raw columns from empirical formulas
+            df = self.compute_missing_raw_columns(df)
+
             all_dfs.append(df)
             print(f"    [OK] Processed {len(df)} rows")
         
@@ -457,68 +490,281 @@ class GeotechnicalPipeline:
             return True
         return False
     
+    def compute_missing_raw_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Fill in NULL cells in the raw data columns during data cleaning.
+
+        Computes (only for rows where the value is currently missing):
+          - Total Overburden Pressure  (σ_v  = γ × z_mid)
+          - Effective Overburden Pressure (σ'_v = σ_v − u, min 1 kPa)
+          - Relative Density (Dr % = √(N1_60/60) × 100, Skempton 1986)
+          - Cyclic Stress Ratio (CSR = 0.65 × σ_v/σ'_v × PGA × rd)
+
+        Formulas from the "Empirical Formula" sheet of RAW_DATA_OF_THESIS.xlsx.
+        """
+        GAMMA_WATER   = 9.81   # kN/m³
+        COHESIVE_USCS = {"CL", "CH", "ML", "MH", "OL", "OH", "Pt", "CL-ML"}
+
+        df  = df.copy()
+        z   = df['depth_mid_m']
+        γ   = df['unit_weight']
+        gwl = df['groundwater_depth_m']
+
+        # ── Overburden pressures ──────────────────────────────────────────────
+        sigma_v   = γ * z
+        u         = np.maximum(0.0, z - gwl) * GAMMA_WATER
+        sigma_eff = np.maximum(1.0, sigma_v - u)
+
+        # ── Stress reduction coefficient rd (Seed & Idriss 1971) ─────────────
+        rd = np.where(z <= 9.15,
+                      1.0 - 0.00765 * z,
+                      np.where(z <= 23.0,
+                               1.174 - 0.0267 * z,
+                               0.0))
+        rd = np.clip(rd, 0.0, 1.0)
+
+        # ── 1. Total Overburden Pressure ─────────────────────────────────────
+        tot_col = 'Total Overburden Pressure'
+        if tot_col in df.columns:
+            missing = pd.to_numeric(df[tot_col], errors='coerce').isna()
+            df.loc[missing, tot_col] = sigma_v[missing].round(2)
+            filled = missing.sum()
+            if filled:
+                print(f"      [FILL] Total Overburden Pressure: {filled} rows computed")
+
+        # ── 2. Effective Overburden Pressure ──────────────────────────────────
+        # Raw Excel has a typo: "Effective Overburden Presssure" (3 s's)
+        for eff_col in ('Effective Overburden Presssure', 'Effective Overburden Pressure'):
+            if eff_col in df.columns:
+                missing = pd.to_numeric(df[eff_col], errors='coerce').isna()
+                df.loc[missing, eff_col] = sigma_eff[missing].round(2)
+                filled = missing.sum()
+                if filled:
+                    print(f"      [FILL] Effective Overburden Pressure: {filled} rows computed")
+                break
+
+        # ── 3. Relative Density (Dr %) ────────────────────────────────────────
+        rd_col   = 'Relative Density'
+        n160_col = 'Corrected SPT-N Value (N1(60))'
+        uscs_col = 'USCS Symbol'
+        if rd_col in df.columns and n160_col in df.columns:
+            n1_60 = pd.to_numeric(df[n160_col], errors='coerce')
+            uscs  = (df[uscs_col].astype(str).str.strip().str.upper()
+                     if uscs_col in df.columns
+                     else pd.Series([''] * len(df), index=df.index))
+            missing = (
+                pd.to_numeric(df[rd_col], errors='coerce').isna()
+                & n1_60.notna()
+                & (n1_60 > 0)
+                & ~uscs.isin(COHESIVE_USCS)      # N/A for cohesive soils
+            )
+            df.loc[missing, rd_col] = (
+                np.sqrt(n1_60[missing] / 60.0) * 100.0
+            ).round(2)
+            filled = missing.sum()
+            if filled:
+                print(f"      [FILL] Relative Density: {filled} rows computed (Skempton 1986)")
+
+        # ── 4. Cyclic Stress Ratio (CSR) ──────────────────────────────────────
+        csr_col = 'Cyclic Stress Ratio (CSR)'
+        if csr_col in df.columns:
+            csr_vals = 0.65 * (sigma_v / sigma_eff) * df['pga_g'] * rd
+            missing  = (
+                pd.to_numeric(df[csr_col], errors='coerce').isna()
+                & (df['pga_g'] > 0)
+            )
+            df.loc[missing, csr_col] = csr_vals[missing].round(6)
+            filled = missing.sum()
+            if filled:
+                print(f"      [FILL] CSR: {filled} rows computed (Seed & Idriss 1971)")
+
+        return df
+
     def calculate_csr_crr(self) -> bool:
         """
-        Calculate CSR and CRR using Seed & Idriss (1971) method
+        Calculate CSR, CRR, MSF, FS, and LPI components per thesis methodology:
+        - CSR: Seed & Idriss (1971) with correct rd formula
+        - (N1)60cs: NCEER fines correction (Youd et al. 2001)
+        - CRR(7.5): Robertson-Wride / Idriss-Boulanger formula
+        - MSF: Magnitude Scaling Factor (Idriss 1999)
+        - LPI: Liquefaction Potential Index components (Iwasaki et al. 1978)
+        - q_actual: Default building contact pressure 50 kPa (Bowles 1988)
         """
         print("\n" + "="*80)
-        print("STEP 3: CALCULATING CSR/CRR (Seed & Idriss 1971)")
+        print("STEP 3: CSR/CRR ANALYSIS (Thesis Methodology)")
         print("="*80)
-        
+
         df = self.processed_data.copy()
-        
-        # Normalize SPT values
-        print("  Normalizing SPT values...")
-        df['spt_n60'] = df['spt_n_value'] * 1.0  # N60 = N (can be adjusted with correction factors)
-        df['spt_n160'] = df['spt_n_value'] * 1.1  # Rough correction to N160
-        
-        # Calculate total overburden pressure
-        df['total_overburden_pressure'] = df['unit_weight'] * df['depth_mid_m']
-        
-        # Calculate effective overburden pressure
         gamma_water = 9.81  # kN/m³
+
+        # ── Magnitude (Mw) ────────────────────────────────────────────────────
+        # Fixed at 6.5 for Tarlac region (same as thesis)
+        MAGNITUDE_MW = 6.5
+        df['magnitude_mw'] = MAGNITUDE_MW
+        print(f"  Magnitude (Mw): {MAGNITUDE_MW} (Tarlac seismic zone)")
+
+        # ── Magnitude Scaling Factor (MSF) ────────────────────────────────────
+        # Idriss (1999): MSF = 10^2.24 / Mw^2.56
+        MSF = (10 ** 2.24) / (MAGNITUDE_MW ** 2.56)
+        df['msf'] = MSF
+        print(f"  MSF: {MSF:.6f}")
+
+        # ── q_actual (building contact pressure) ──────────────────────────────
+        Q_ACTUAL = 50.0  # kPa — default from thesis (Without Liq sheet)
+        df['q_actual_kpa'] = Q_ACTUAL
+        print(f"  q_actual: {Q_ACTUAL} kPa (default building contact pressure)")
+
+        # ── SPT N-values ──────────────────────────────────────────────────────
+        df['spt_n60']  = df['spt_n_value'] * 1.0   # N60 (field N value)
+        n1_60 = pd.to_numeric(df.get('Corrected SPT-N Value (N1(60))', df['spt_n_value']),
+                              errors='coerce').fillna(df['spt_n_value'])
+        df['spt_n160'] = n1_60                       # N1(60) — overburden-corrected
+
+        # ── Overburden pressures ──────────────────────────────────────────────
+        df['total_overburden_pressure'] = df['unit_weight'] * df['depth_mid_m']
         depth_below_wt = np.maximum(0, df['depth_mid_m'] - df['groundwater_depth_m'])
-        df['effective_overburden_pressure'] = df['total_overburden_pressure'] - (gamma_water * depth_below_wt)
-        
-        # Calculate CSR (Cyclic Stress Ratio) - Seed & Idriss (1971)
-        print("  Calculating CSR...")
-        # Stress reduction coefficient (rd)
-        rd = 1.0 - 0.00765 * df['depth_mid_m']
-        rd = rd.clip(0.0, 1.0)
-        
-        # CSR = 0.65 * (amax/g) * (σv/σ'v) * rd
-        # where amax/g = PGA
-        df['csr'] = 0.65 * (df['pga_g'] / 9.81) * (df['total_overburden_pressure'] / df['effective_overburden_pressure'].clip(lower=1.0)) * rd
-        
-        # Calculate CRR (Cyclic Resistance Ratio) from SPT
-        print("  Calculating CRR from SPT...")
-        # Simplified CRR based on SPT N160
-        df['crr'] = np.where(
-            df['spt_n160'] <= 30,
-            1.0 / (34.0 - df['spt_n160'] + 0.001),
-            0.5
+        df['effective_overburden_pressure'] = (
+            df['total_overburden_pressure'] - gamma_water * depth_below_wt
+        ).clip(lower=1.0)
+
+        # ── rd: Stress reduction coefficient (Seed & Idriss 1971) ─────────────
+        z = df['depth_mid_m']
+        rd = np.where(z <= 9.15,
+                      1.0 - 0.00765 * z,
+                      np.where(z <= 23.0,
+                               1.174 - 0.0267 * z,
+                               0.0))
+        rd = np.clip(rd, 0.0, 1.0)
+
+        # ── CSR (Cyclic Stress Ratio) — thesis formula ────────────────────────
+        # CSR = 0.65 × (σv/σ'v) × (amax/g) × rd   (pga_g already in g units)
+        print("  Calculating CSR (Seed & Idriss 1971)...")
+        df['csr'] = (0.65
+                     * df['pga_g']
+                     * (df['total_overburden_pressure'] / df['effective_overburden_pressure'])
+                     * rd)
+
+        # ── (N1)60cs: Fines-corrected SPT (NCEER, Youd et al. 2001) ──────────
+        print("  Computing (N1)60cs with fines correction (NCEER)...")
+        FC = df['fines_content'].clip(lower=0.1)
+        # Coefficients α, β
+        alpha = np.where(FC < 5.0,  0.0,
+                np.where(FC <= 35.0,
+                         np.exp(1.76 - 190.0 / FC**2),
+                         5.0))
+        beta  = np.where(FC < 5.0,  1.0,
+                np.where(FC <= 35.0,
+                         0.99 + FC**1.5 / 1000.0,
+                         1.2))
+        df['n1_60cs'] = alpha + beta * df['spt_n160']
+
+        # ── CRR(7.5): Robertson-Wride / Idriss-Boulanger (capped at 0.6) ─────
+        print("  Calculating CRR(7.5) (Robertson-Wride formula)...")
+        N = df['n1_60cs'].clip(upper=30.0)          # cap before exp to avoid overflow
+        crr_raw = np.exp(
+            N / 14.1
+            + (N / 126.0) ** 2
+            - (N / 23.6)  ** 3
+            + (N / 25.4)  ** 4
+            - 2.67
         )
-        df['crr'] = df['crr'].clip(0.0, 1.0)
-        
-        # Factor of safety
-        df['factor_of_safety'] = df['crr'] / (df['csr'] + 0.001)
-        
-        # Liquefaction probability (0-100%)
+        # Cap at 0.6 for (N1)60cs ≥ 30 (NCEER / Idriss-Boulanger guideline)
+        df['crr'] = np.where(df['n1_60cs'] >= 30.0, 0.6,
+                             crr_raw.clip(0.0, 0.6))
+
+        # ── Factor of Safety (magnitude-adjusted) ────────────────────────────
+        df['factor_of_safety'] = (df['crr'] * MSF) / (df['csr'] + 1e-9)
+
+        # ── LPI components (Iwasaki et al. 1978) ─────────────────────────────
+        df['lpi_weighing_factor'] = np.maximum(0.0, 10.0 - 0.5 * df['depth_mid_m'])
+        df['lpi_severity_factor'] = np.maximum(0.0, 1.0 - df['factor_of_safety'])
+
+        # ── Liquefaction probability ──────────────────────────────────────────
         df['liquefaction_probability'] = np.where(
             df['factor_of_safety'] < 1.0,
             (1.0 - df['factor_of_safety']) * 100,
             np.where(df['factor_of_safety'] < 1.5, 30.0, 10.0)
-        )
-        df['liquefaction_probability'] = df['liquefaction_probability'].clip(0.0, 100.0)
-        
+        ).clip(0.0, 100.0)
+
         self.processed_data = df
-        print(f"  [OK] Calculated CSR/CRR for {len(df)} records")
-        print(f"    CSR range: {df['csr'].min():.3f} - {df['csr'].max():.3f}")
-        print(f"    CRR range: {df['crr'].min():.3f} - {df['crr'].max():.3f}")
-        print(f"    Factor of Safety range: {df['factor_of_safety'].min():.2f} - {df['factor_of_safety'].max():.2f}")
-        
+        print(f"  [OK] Calculated for {len(df)} records")
+        print(f"    CSR  range : {df['csr'].min():.4f} – {df['csr'].max():.4f}")
+        print(f"    CRR  range : {df['crr'].min():.4f} – {df['crr'].max():.4f}")
+        print(f"    FS   range : {df['factor_of_safety'].min():.2f} – {df['factor_of_safety'].max():.2f}")
+        print(f"    (N1)60cs   : {df['n1_60cs'].min():.2f} – {df['n1_60cs'].max():.2f}")
         return True
     
+    def calculate_bearing_bowles(self) -> bool:
+        """
+        Bearing capacity and settlement per Bowles (1988) / Meyerhof (1956) SPT method.
+
+        Foundation defaults (matching thesis 'Without Liq' sheet):
+          B = 2.0 m  (width)
+          D = 1.5 m  (embedment depth)
+          q_actual = 50 kPa  (building contact pressure)
+          Si_allow = 25 mm   (allowable settlement)
+
+        Formulas:
+          Kd        = 1 + 0.33 × (D/B)
+          φ (deg)   = 27.1 + 0.3×N – 0.00054×N²  (Peck 1974 via SPT)
+          Nq, Nγ    = Meyerhof bearing capacity factors
+          Qu (kPa)  = q×Nq×Fqs + 0.5×γ×B×Nγ×Fγs  (no depth factors)
+          Qa (kPa)  = Qu / 3  (design FS = 3)
+          Settlement= (q_actual / Qa) × Si_allow
+        """
+        print("\n" + "="*80)
+        print("STEP 3b: BEARING CAPACITY & SETTLEMENT (Bowles 1988)")
+        print("="*80)
+
+        df = self.processed_data.copy()
+
+        B = 2.0        # Foundation width (m)
+        D = 1.5        # Embedment depth (m)
+        SI_ALLOW = 25.0  # Allowable settlement (mm)
+        FS_DESIGN = 3.0  # Design factor of safety
+
+        # Depth factor per Bowles
+        Kd = 1.0 + 0.33 * (D / B)
+        df['foundation_kd'] = Kd
+
+        # N-value for bearing (use N1(60) column if available)
+        N = df['spt_n160'].clip(lower=1.0)
+
+        # Friction angle from SPT – Peck (1974)
+        phi_deg = (27.1 + 0.3 * N - 0.00054 * N ** 2).clip(lower=25.0, upper=45.0)
+        phi_rad = np.radians(phi_deg)
+
+        # Meyerhof bearing capacity factors
+        Nq = np.exp(np.pi * np.tan(phi_rad)) * np.tan(np.radians(45) + phi_rad / 2) ** 2
+        Ng = 2.0 * (Nq + 1.0) * np.tan(phi_rad)
+
+        # Shape factors for square footing (B = L)
+        Fqs = 1.0 + np.tan(phi_rad)          # = 1 + tan(φ)
+        Fgs = 0.6                              # = 1 – 0.4 for square
+
+        # Overburden at foundation level q = γ × D
+        q_overburden = df['unit_weight'] * D
+
+        # Ultimate bearing capacity (no separate depth factors — thesis pattern)
+        Qu = q_overburden * Nq * Fqs + 0.5 * df['unit_weight'] * B * Ng * Fgs
+        df['bearing_qu_kpa'] = Qu.clip(lower=0.0)
+
+        # Allowable bearing capacity (FS_design = 3)
+        Qa = Qu / FS_DESIGN
+        df['bearing_qa_kpa'] = Qa.clip(lower=1.0)
+
+        # Settlement = (q_actual / Qa) × Si_allow  [mm]
+        df['settlement_mm'] = (df['q_actual_kpa'] / df['bearing_qa_kpa']) * SI_ALLOW
+
+        print(f"  Foundation: B={B}m, D={D}m, Kd={Kd:.4f}, FS_design={FS_DESIGN}")
+        print(f"  Qu  range : {df['bearing_qu_kpa'].min():.1f} – {df['bearing_qu_kpa'].max():.1f} kPa")
+        print(f"  Qa  range : {df['bearing_qa_kpa'].min():.1f} – {df['bearing_qa_kpa'].max():.1f} kPa")
+        print(f"  Settlement: {df['settlement_mm'].min():.2f} – {df['settlement_mm'].max():.2f} mm")
+        print(f"  [OK] Bearing capacity computed for {len(df)} records")
+
+        self.processed_data = df
+        return True
+
     def classify_liquefaction_dpwh_bsds(self) -> bool:
         """
         Classify liquefaction potential per DPWH BSDS (2013)
@@ -949,36 +1195,93 @@ class GeotechnicalPipeline:
                 'effective_overburden_pressure': self.safe_float(row['effective_overburden_pressure']),
                 'total_overburden_pressure': self.safe_float(row['total_overburden_pressure']),
                 'relative_density_percent': self.safe_float(row.get('relative_density_percent')),
+                # ── Thesis analysis fields ────────────────────────────────────
+                'magnitude_mw': self.safe_float(row.get('magnitude_mw')),
+                'msf': self.safe_float(row.get('msf')),
+                'n1_60cs': self.safe_float(row.get('n1_60cs')),
+                'q_actual_kpa': self.safe_float(row.get('q_actual_kpa')),
+                'foundation_kd': self.safe_float(row.get('foundation_kd')),
+                'bearing_qu_kpa': self.safe_float(row.get('bearing_qu_kpa')),
+                'bearing_qa_kpa': self.safe_float(row.get('bearing_qa_kpa')),
+                'settlement_mm': self.safe_float(row.get('settlement_mm')),
+                'lpi_weighing_factor': self.safe_float(row.get('lpi_weighing_factor')),
+                'lpi_severity_factor': self.safe_float(row.get('lpi_severity_factor')),
             }
-            
+
             # Add optional fields if available
             if 'moisture_content' in row and pd.notna(row['moisture_content']):
                 record['moisture_content'] = self.safe_float(row['moisture_content'])
-            
+
             if 'friction_angle' in row and pd.notna(row['friction_angle']):
                 record['friction_angle'] = self.safe_float(row['friction_angle'])
-            
+
             if 'cohesion_kpa' in row and pd.notna(row['cohesion_kpa']):
                 record['cohesion_kpa'] = self.safe_float(row['cohesion_kpa'])
-            
+
             # Elastic Modulus
             if 'Elastic Modulus (Es) (MN/m²)' in row and pd.notna(row['Elastic Modulus (Es) (MN/m²)']):
                 record['elastic_modulus_es'] = self.safe_float(row['Elastic Modulus (Es) (MN/m²)'])
             
             records.append(record)
         
+        # New thesis analysis columns (may not exist if migration hasn't been run)
+        THESIS_COLUMNS = {
+            'magnitude_mw', 'msf', 'n1_60cs', 'q_actual_kpa', 'foundation_kd',
+            'bearing_qu_kpa', 'bearing_qa_kpa', 'settlement_mm',
+            'lpi_weighing_factor', 'lpi_severity_factor',
+        }
+
+        def strip_thesis_columns(batch):
+            return [{k: v for k, v in r.items() if k not in THESIS_COLUMNS} for r in batch]
+
         # Insert in batches
         batch_size = 25
         total_inserted = 0
-        
+        schema_fallback = False  # once triggered, all remaining batches skip new cols
+
         for i in range(0, len(records), batch_size):
             batch = records[i:i+batch_size]
+            batch_num = i // batch_size + 1
             try:
-                self.client.table('soil_layers').insert(batch).execute()
+                insert_batch = strip_thesis_columns(batch) if schema_fallback else batch
+                self.client.table('soil_layers').insert(insert_batch).execute()
                 total_inserted += len(batch)
-                print(f"    Inserted batch {i//batch_size + 1}: {len(batch)} records")
+                if not schema_fallback:
+                    print(f"    Inserted batch {batch_num}: {len(batch)} records")
+                else:
+                    print(f"    Inserted batch {batch_num}: {len(batch)} records (without thesis cols — run SQL migration)")
             except Exception as e:
-                print(f"    [WARNING] Batch {i//batch_size + 1} failed: {e}")
+                err_str = str(e)
+                # PGRST204: column not found — schema migration not yet applied
+                if 'PGRST204' in err_str or 'schema cache' in err_str:
+                    if not schema_fallback:
+                        print(f"    [WARNING] Thesis columns missing in DB schema — falling back to base columns.")
+                        print(f"    [INFO] Run the SQL migration in Supabase to persist thesis analysis fields.")
+                        schema_fallback = True
+                    try:
+                        self.client.table('soil_layers').insert(strip_thesis_columns(batch)).execute()
+                        total_inserted += len(batch)
+                        print(f"    Inserted batch {batch_num}: {len(batch)} records (fallback)")
+                    except Exception as e2:
+                        print(f"    [WARNING] Batch {batch_num} failed even on fallback: {e2}")
+                else:
+                    print(f"    [WARNING] Batch {batch_num} failed: {e}")
+
+        if schema_fallback:
+            print("\n" + "="*60)
+            print("  ACTION REQUIRED — Run this SQL in Supabase SQL Editor:")
+            print("  ALTER TABLE soil_layers")
+            print("    ADD COLUMN IF NOT EXISTS magnitude_mw        FLOAT,")
+            print("    ADD COLUMN IF NOT EXISTS msf                 FLOAT,")
+            print("    ADD COLUMN IF NOT EXISTS n1_60cs             FLOAT,")
+            print("    ADD COLUMN IF NOT EXISTS q_actual_kpa        FLOAT,")
+            print("    ADD COLUMN IF NOT EXISTS foundation_kd       FLOAT,")
+            print("    ADD COLUMN IF NOT EXISTS bearing_qu_kpa      FLOAT,")
+            print("    ADD COLUMN IF NOT EXISTS bearing_qa_kpa      FLOAT,")
+            print("    ADD COLUMN IF NOT EXISTS settlement_mm       FLOAT,")
+            print("    ADD COLUMN IF NOT EXISTS lpi_weighing_factor FLOAT,")
+            print("    ADD COLUMN IF NOT EXISTS lpi_severity_factor FLOAT;")
+            print("="*60)
         
         if skipped_count > 0:
             print(f"    [INFO] Skipped {skipped_count} soil layer records (borehole not found)")
@@ -1063,16 +1366,24 @@ class GeotechnicalPipeline:
         print(f"Output: Supabase Storage (cleaned/ folder)")
         print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         
-        # Step 0: Download from storage if needed
+        # Step 0: Connect database early so upload_raw_file_to_bucket can use it
+        if not self.client:
+            self.connect_database()
+
+        # Step 0a: Download from storage if needed
         if not self.excel_path and self.use_storage:
             if not self.download_from_supabase_storage():
                 print("\n[ERROR] Failed to download from Supabase Storage")
                 return False
-        
+
+        # Step 0b: Upload local raw file to bucket (raw/ folder)
+        self.upload_raw_file_to_bucket()
+
         steps = [
             ("Load Excel", self.load_excel),
             ("Process and Validate", self.process_and_validate),
-            ("Calculate CSR/CRR", self.calculate_csr_crr),
+            ("Calculate CSR/CRR + Magnitude", self.calculate_csr_crr),
+            ("Bearing Capacity & Settlement (Bowles 1988)", self.calculate_bearing_bowles),
             ("Classify Liquefaction (DPWH BSDS)", self.classify_liquefaction_dpwh_bsds),
             ("Engineer Features", self.engineer_features),
             ("Export CSV", self.export_csv),

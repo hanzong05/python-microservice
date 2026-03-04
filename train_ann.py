@@ -5,10 +5,10 @@ Per Project Requirements (Alejandrino et al.)
 
 Features:
 - Direct database query from PostGIS
-- Multi-output ANN: Liquefaction (classification) + Settlement (regression) + Bearing Capacity (regression)
-- 3-layer MLP architecture (64-32-16 neurons)
-- Validation against: DPWH BSDS (2013), Tokimatsu & Seed (1987), Bray & Macedo (2017), Terzaghi (1943), Olsen & Stark (2002)
-- Performance metrics: Confusion Matrix, R², MAE, RMSE, Performance Index (PI)
+- Multi-output ANN: Foundation Width B (m) + Foundation Depth D (m) + L/B Ratio
+- Architecture: 17 inputs -> 30 (tanh) -> 15 (tanh) -> 3 (linear) outputs
+- Validation against: Meyerhof (1974), Bowles (1988), DPWH BSDS (2013)
+- Performance metrics: R², MAE, RMSE, Performance Index (PI)
 """
 
 import numpy as np
@@ -76,9 +76,9 @@ except ImportError:
 class MultiOutputANNTraining:
     """
     Multi-Output ANN Training per Project Requirements
-    - Liquefaction Classification
-    - Settlement Regression
-    - Bearing Capacity Regression
+    - Foundation Width B (m)     [Meyerhof/Bowles — FS_bearing >= 3]
+    - Foundation Depth D (m)     [1.5 m standard / 3.0 m liquefiable]
+    - L/B Ratio (-)              [1.0 square footing — thesis standard]
     """
     
     def __init__(self):
@@ -159,6 +159,69 @@ class MultiOutputANNTraining:
             traceback.print_exc()
             return False
     
+    def compute_foundation_targets(self, row) -> dict:
+        """
+        Compute the three ANN output targets for a soil layer row:
+          - Foundation Width  B   (m)
+          - Foundation Depth  D   (m)
+          - Length-to-Width   L/B (dimensionless)
+
+        Rules derived from Bowles (1988) / Meyerhof (1974) empirical formula sheet:
+          B is chosen so that FS_bearing ≥ 3 for q_actual = 50 kPa.
+          D follows standard practice; deeper for liquefiable soils.
+          L/B = 1.0 (square footing) as used throughout the thesis.
+
+        Priority: use raw-data column values when available; compute otherwise.
+        """
+        Q_ACTUAL = 50.0  # kPa (default building contact pressure)
+        D_STD    = 1.5   # m   (standard embedment depth)
+        D_DEEP   = 3.0   # m   (deeper embedment for liquefiable soils)
+
+        N = max(1.0, float(
+            row.get('spt_n160') or row.get('spt_n60') or row.get('spt_n_value') or 15
+        ))
+        FS = float(row.get('factor_of_safety') or 2.0)
+
+        # ── Foundation Width B ───────────────────────────────────────────────
+        # Meyerhof bearing capacity at D=D_STD, small B (Kd capped at 1.33):
+        #   Qu ≈ (N/2.5) × 47.88 × 1.33  →  Qa = Qu/3 ≈ N × 8.49 kPa
+        # For Qa ≥ Q_ACTUAL = 50 kPa:  N_min ≈ 5.9
+        #   N ≥ 6  → B = 2.0 m (standard)
+        #   N < 6  → wider footing needed: B = round_0.5(7.83 / N), cap [2.5, 5.0]
+        B_raw = row.get('Foundation Width (B)') or row.get('foundation_width_m')
+        try:
+            B = float(B_raw)
+            if B <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            if N >= 6.0:
+                B = 2.0
+            else:
+                # Increase width for weaker soils; round to nearest 0.5 m
+                B_calc = Q_ACTUAL / (N * 8.49)      # approximate from Qa = N×8.49
+                B = max(2.5, round(B_calc * 2) / 2)  # round to 0.5 m steps
+                B = min(5.0, B)
+
+        # ── Foundation Depth D ───────────────────────────────────────────────
+        D_raw = row.get('Foundation Depth (D)') or row.get('foundation_depth_m')
+        try:
+            D = float(D_raw)
+            if D <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            D = D_DEEP if FS < 1.0 else D_STD
+
+        # ── L/B Ratio ────────────────────────────────────────────────────────
+        lb_raw = row.get('Length-to-width ratio (L/B)') or row.get('lb_ratio')
+        try:
+            lb = float(lb_raw)
+            if lb <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            lb = 1.0   # square footing (thesis standard)
+
+        return {'B': round(B, 2), 'D': round(D, 2), 'lb_ratio': round(lb, 2)}
+
     def calculate_settlement_tokimatsu_seed(self, row) -> float:
         """Calculate settlement using Tokimatsu & Seed (1987) method"""
         try:
@@ -371,70 +434,55 @@ class MultiOutputANNTraining:
             if X[col].dtype == 'bool':
                 X[col] = X[col].astype(int)
         
-        # TARGET 1: Liquefaction (Binary Classification)
-        print("\n  Preparing TARGET 1: Liquefaction (Binary Classification)...")
-        if 'liquefaction' in df.columns:
-            y_liq = df['liquefaction'].astype(int)
-        elif 'liquefaction_probability' in df.columns:
-            y_liq = (df['liquefaction_probability'] > 50).astype(int)
-        elif 'factor_of_safety' in df.columns:
-            y_liq = (df['factor_of_safety'] < 1.0).astype(int)
-        elif 'csr' in df.columns and 'cyclic_strength_ratio' in df.columns:
-            fs = df['cyclic_strength_ratio'] / (df['csr'] + 0.001)
-            y_liq = (fs < 1.0).astype(int)
-        else:
-            print("  [ERROR] Cannot determine liquefaction target")
-            return False
-        
-        # TARGET 2: Settlement (Regression) - Average of Tokimatsu & Seed and Bray & Macedo
-        print("\n  Preparing TARGET 2: Settlement (Regression)...")
-        print("    Calculating using Tokimatsu & Seed (1987)...")
-        settle_ts = df.apply(self.calculate_settlement_tokimatsu_seed, axis=1)
-        print("    Calculating using Bray & Macedo (2017)...")
-        settle_bm = df.apply(self.calculate_settlement_bray_macedo, axis=1)
-        y_settle = (settle_ts + settle_bm) / 2.0  # Average of both methods
-        
-        # TARGET 3: Bearing Capacity (Regression) - Post-liquefaction from Olsen & Stark
-        print("\n  Preparing TARGET 3: Bearing Capacity (Regression)...")
-        print("    Calculating using Olsen & Stark (2002)...")
-        y_bearing = df.apply(self.calculate_bearing_capacity_olsen_stark, axis=1)
-        
-        # Remove rows with missing targets
-        valid_mask = ~(y_liq.isna() | y_settle.isna() | y_bearing.isna())
-        X = X[valid_mask]
-        y_liq = y_liq[valid_mask]
-        y_settle = y_settle[valid_mask]
-        y_bearing = y_bearing[valid_mask]
-        
+        # ── Compute foundation design targets ────────────────────────────────
+        # TARGET 1: Foundation Width  B   (m)   — Bowles/Meyerhof-driven
+        # TARGET 2: Foundation Depth  D   (m)   — 1.5 m standard / 3.0 m liquefiable
+        # TARGET 3: L/B Ratio              (-)   — 1.0 for square footing (thesis)
+        print("\n  Preparing TARGET 1: Foundation Width B (m) ...")
+        print("  Preparing TARGET 2: Foundation Depth D (m) ...")
+        print("  Preparing TARGET 3: L/B Ratio (-) ...")
+
+        foundation_targets = df.apply(self.compute_foundation_targets, axis=1)
+        y_B  = foundation_targets.apply(lambda r: r['B'])
+        y_D  = foundation_targets.apply(lambda r: r['D'])
+        y_lb = foundation_targets.apply(lambda r: r['lb_ratio'])
+
+        # Remove rows with missing targets (all computed so should be none)
+        valid_mask = ~(y_B.isna() | y_D.isna() | y_lb.isna())
+        X    = X[valid_mask]
+        y_B  = y_B[valid_mask]
+        y_D  = y_D[valid_mask]
+        y_lb = y_lb[valid_mask]
+
         print(f"\n  Features shape: {X.shape}")
-        print(f"  Target 1 (Liquefaction): {(y_liq == 1).sum()} positive, {(y_liq == 0).sum()} negative")
-        print(f"  Target 2 (Settlement): Mean={y_settle.mean():.2f} cm, Range=[{y_settle.min():.2f}, {y_settle.max():.2f}] cm")
-        print(f"  Target 3 (Bearing Capacity): Mean={y_bearing.mean():.1f} kPa, Range=[{y_bearing.min():.1f}, {y_bearing.max():.1f}] kPa")
-        
+        print(f"  Target 1 (B):   Mean={y_B.mean():.2f} m,  Range=[{y_B.min():.2f}, {y_B.max():.2f}] m")
+        print(f"  Target 2 (D):   Mean={y_D.mean():.2f} m,  Range=[{y_D.min():.2f}, {y_D.max():.2f}] m")
+        print(f"  Target 3 (L/B): Mean={y_lb.mean():.2f},   Range=[{y_lb.min():.2f}, {y_lb.max():.2f}]")
+
+        # ── Store for model training and evaluation ───────────────────────────
+        self.y_liq_train = self.y_liq_test = None          # no longer used
+        self.y_settle_train = self.y_settle_test = None
+        self.y_bearing_train = self.y_bearing_test = None
+
         # Split data: 80% train, 20% validation (per project requirements)
         print("\n  Splitting data (80% train, 20% validation)...")
-        self.X_train, self.X_test, self.y_liq_train, self.y_liq_test = train_test_split(
-            X, y_liq, test_size=0.2, random_state=42, stratify=y_liq
+        self.X_train, self.X_test, self.y_B_train, self.y_B_test = train_test_split(
+            X, y_B, test_size=0.2, random_state=42
         )
-        _, _, self.y_settle_train, self.y_settle_test = train_test_split(
-            X, y_settle, test_size=0.2, random_state=42
-        )
-        _, _, self.y_bearing_train, self.y_bearing_test = train_test_split(
-            X, y_bearing, test_size=0.2, random_state=42
-        )
+        _, _, self.y_D_train,  self.y_D_test  = train_test_split(X, y_D,  test_size=0.2, random_state=42)
+        _, _, self.y_lb_train, self.y_lb_test = train_test_split(X, y_lb, test_size=0.2, random_state=42)
 
         # Build validation dataframe in raw data format using test indices
         val_indices = self.X_test.index
         val_raw = self.df_raw.loc[val_indices].copy().reset_index(drop=True)
-        # Append computed targets so the Excel reflects what the model is predicting
-        val_raw['_target_liquefaction'] = self.y_liq_test.values
-        val_raw['_target_settlement_cm'] = self.y_settle_test.values
-        val_raw['_target_bearing_capacity_kpa'] = self.y_bearing_test.values
+        val_raw['_target_foundation_width_B_m']  = self.y_B_test.values
+        val_raw['_target_foundation_depth_D_m']  = self.y_D_test.values
+        val_raw['_target_lb_ratio']              = self.y_lb_test.values
         self.df_validation = val_raw
 
-        print(f"  Training set: {len(self.X_train)} samples (80%)")
+        print(f"  Training set  : {len(self.X_train)} samples (80%)")
         print(f"  Validation set: {len(self.X_test)} samples (20%)")
-        
+
         return True
     
     def train_models(self) -> bool:
@@ -450,7 +498,7 @@ class MultiOutputANNTraining:
         print("    HIDDEN LAYER 1: 30 neurons (Tansig/Tanh activation)")
         print("    HIDDEN LAYER 2: 15 neurons (Tansig/Tanh activation)")
         print("    OUTPUT LAYER:   3 neurons (Purelin/Linear activation)")
-        print("  Outputs: [Liquefaction, Settlement, Bearing Capacity]")
+        print("  Outputs: [Foundation Width B (m), Foundation Depth D (m), L/B Ratio]")
         print("  Solver: Adam")
         
         # Verify input features = 17
@@ -464,29 +512,23 @@ class MultiOutputANNTraining:
         X_train_scaled = self.scaler.fit_transform(self.X_train)
         X_test_scaled = self.scaler.transform(self.X_test)
         
-        # Prepare multi-output target (all as regression)
-        # Liquefaction: 0-1 probability (will threshold later)
-        # Settlement: cm
-        # Bearing Capacity: kPa
-        print("\n  Preparing multi-output target...")
+        # Multi-output target: [B (m), D (m), L/B ratio]
+        print("\n  Preparing multi-output target [B, D, L/B]...")
         y_multi_train = np.column_stack([
-            self.y_liq_train.astype(float),  # Liquefaction as probability
-            self.y_settle_train,
-            self.y_bearing_train
+            self.y_B_train,
+            self.y_D_train,
+            self.y_lb_train,
         ])
         y_multi_test = np.column_stack([
-            self.y_liq_test.astype(float),
-            self.y_settle_test,
-            self.y_bearing_test
+            self.y_B_test,
+            self.y_D_test,
+            self.y_lb_test,
         ])
         
-        # Train multi-output regressor (all 3 outputs)
+        # Train multi-output regressor (all 3 outputs: B, D, L/B)
         print("\n  Training Multi-Output ANN...")
         print("    Architecture: 17 -> 30 (tanh) -> 15 (tanh) -> 3 (linear)")
-        
-        # Use MLPRegressor with tanh activation and linear output
-        # Note: scikit-learn doesn't support different activations per layer,
-        # so we use tanh for hidden layers (closest to Tansig)
+        print("    Outputs: Foundation Width B (m) | Foundation Depth D (m) | L/B Ratio")
         self.multi_model = MLPRegressor(
             hidden_layer_sizes=(30, 15),  # 2 hidden layers: 30, 15
             activation='tanh',  # Tansig = tanh
@@ -504,11 +546,10 @@ class MultiOutputANNTraining:
         self.multi_model.fit(X_train_scaled, y_multi_train)
         print(f"    [OK] Completed in {self.multi_model.n_iter_} iterations")
         
-        # Also train separate models for individual evaluation
+        # Also train individual models for per-output evaluation
         print("\n  Training individual models for validation...")
-        
-        # MODEL 1: Liquefaction Classifier (for confusion matrix)
-        self.liq_model = MLPClassifier(
+
+        _mlp_kwargs = dict(
             hidden_layer_sizes=(30, 15),
             activation='tanh',
             solver='adam',
@@ -519,44 +560,23 @@ class MultiOutputANNTraining:
             validation_fraction=0.1,
             n_iter_no_change=30,
             random_state=42,
-            verbose=False
+            verbose=False,
         )
-        self.liq_model.fit(X_train_scaled, self.y_liq_train)
-        print(f"    [OK] Liquefaction classifier trained")
-        
-        # MODEL 2: Settlement Regressor
-        self.settle_model = MLPRegressor(
-            hidden_layer_sizes=(30, 15),
-            activation='tanh',
-            solver='adam',
-            alpha=0.001,
-            learning_rate='adaptive',
-            max_iter=2000,
-            early_stopping=True,
-            validation_fraction=0.1,
-            n_iter_no_change=30,
-            random_state=42,
-            verbose=False
-        )
-        self.settle_model.fit(X_train_scaled, self.y_settle_train)
-        print(f"    [OK] Settlement regressor trained")
-        
-        # MODEL 3: Bearing Capacity Regressor
-        self.bearing_model = MLPRegressor(
-            hidden_layer_sizes=(30, 15),
-            activation='tanh',
-            solver='adam',
-            alpha=0.001,
-            learning_rate='adaptive',
-            max_iter=2000,
-            early_stopping=True,
-            validation_fraction=0.1,
-            n_iter_no_change=30,
-            random_state=42,
-            verbose=False
-        )
-        self.bearing_model.fit(X_train_scaled, self.y_bearing_train)
-        print(f"    [OK] Bearing capacity regressor trained")
+
+        # MODEL 1: Foundation Width B
+        self.liq_model = MLPRegressor(**_mlp_kwargs)   # reuse slot, now predicts B
+        self.liq_model.fit(X_train_scaled, self.y_B_train)
+        print(f"    [OK] Foundation Width (B) regressor trained")
+
+        # MODEL 2: Foundation Depth D
+        self.settle_model = MLPRegressor(**_mlp_kwargs)  # reuse slot, now predicts D
+        self.settle_model.fit(X_train_scaled, self.y_D_train)
+        print(f"    [OK] Foundation Depth (D) regressor trained")
+
+        # MODEL 3: L/B Ratio
+        self.bearing_model = MLPRegressor(**_mlp_kwargs)  # reuse slot, now predicts L/B
+        self.bearing_model.fit(X_train_scaled, self.y_lb_train)
+        print(f"    [OK] L/B Ratio regressor trained")
         
         return True
     
@@ -567,113 +587,62 @@ class MultiOutputANNTraining:
         print("="*80)
         
         X_test_scaled = self.scaler.transform(self.X_test)
-        
-        # Evaluate multi-output model
+
+        def _reg_metrics(name, y_true, y_pred, unit=''):
+            r2   = r2_score(y_true, y_pred)
+            mae  = mean_absolute_error(y_true, y_pred)
+            rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+            pi   = 1.0 - rmse / (float(y_true.mean()) + 1e-9)
+            print(f"\n  {name}:")
+            print(f"    R²  : {r2:.4f}")
+            print(f"    MAE : {mae:.4f}{unit}")
+            print(f"    RMSE: {rmse:.4f}{unit}")
+            print(f"    PI  : {pi:.4f}")
+            return r2, mae, rmse, pi
+
+        # ── Multi-output model ────────────────────────────────────────────────
         print("\n" + "-"*80)
         print("MULTI-OUTPUT MODEL EVALUATION")
         print("Architecture: 17 -> 30 (tanh) -> 15 (tanh) -> 3 (linear)")
+        print("Outputs: Foundation Width B (m) | Foundation Depth D (m) | L/B Ratio")
         print("-"*80)
-        
+
         y_multi_pred = self.multi_model.predict(X_test_scaled)
-        y_multi_test = np.column_stack([
-            self.y_liq_test.astype(float),
-            self.y_settle_test,
-            self.y_bearing_test
-        ])
-        
+        y_multi_test = np.column_stack([self.y_B_test, self.y_D_test, self.y_lb_test])
+
         print("\n  Multi-Output Performance:")
-        for i, output_name in enumerate(['Liquefaction', 'Settlement', 'Bearing Capacity']):
-            r2 = r2_score(y_multi_test[:, i], y_multi_pred[:, i])
-            mae = mean_absolute_error(y_multi_test[:, i], y_multi_pred[:, i])
+        for i, (out_name, unit) in enumerate([
+            ('Foundation Width B',  ' m'),
+            ('Foundation Depth D',  ' m'),
+            ('L/B Ratio',           ''),
+        ]):
+            r2   = r2_score(y_multi_test[:, i], y_multi_pred[:, i])
+            mae  = mean_absolute_error(y_multi_test[:, i], y_multi_pred[:, i])
             rmse = np.sqrt(mean_squared_error(y_multi_test[:, i], y_multi_pred[:, i]))
-            print(f"    {output_name}:")
-            print(f"      R²: {r2:.4f}, MAE: {mae:.4f}, RMSE: {rmse:.4f}")
-        
+            print(f"    {out_name}: R²={r2:.4f}  MAE={mae:.4f}{unit}  RMSE={rmse:.4f}{unit}")
+
+        # ── Individual model evaluations ──────────────────────────────────────
         print("\n" + "-"*80)
-        
-        # EVALUATION 1: Liquefaction (Confusion Matrix per DPWH BSDS 2013)
-        print("\n" + "-"*80)
-        print("EVALUATION 1: LIQUEFACTION CLASSIFIER")
-        print("Validation: DPWH BSDS (2013)")
+        print("EVALUATION 1: FOUNDATION WIDTH B (m)")
+        print("Basis: Meyerhof (1974) / Bowles (1988) — FS_bearing >= 3, q_actual=50 kPa")
         print("-"*80)
-        
-        y_liq_pred = self.liq_model.predict(X_test_scaled)
-        y_liq_proba = self.liq_model.predict_proba(X_test_scaled)[:, 1]
-        
-        accuracy = accuracy_score(self.y_liq_test, y_liq_pred)
-        precision = precision_score(self.y_liq_test, y_liq_pred, zero_division=0)
-        recall = recall_score(self.y_liq_test, y_liq_pred, zero_division=0)
-        f1 = f1_score(self.y_liq_test, y_liq_pred, zero_division=0)
-        
-        cm = confusion_matrix(self.y_liq_test, y_liq_pred)
-        print("\n  Confusion Matrix:")
-        print("    " + " " * 20 + "Predicted")
-        print("    " + " " * 20 + "No" + " " * 10 + "Yes")
-        print("    " + "Actual No" + " " * 10 + f"{cm[0,0]:4d}" + " " * 6 + f"{cm[0,1]:4d}")
-        print("    " + "Actual Yes" + " " * 9 + f"{cm[1,0]:4d}" + " " * 6 + f"{cm[1,1]:4d}")
-        print(f"\n  Accuracy: {accuracy:.4f} ({accuracy*100:.2f}%)")
-        print(f"  Precision: {precision:.4f}")
-        print(f"  Recall: {recall:.4f}")
-        print(f"  F1-Score: {f1:.4f}")
-        
-        # EVALUATION 2: Settlement (R², MAE, RMSE, PI)
+        y_B_pred = self.liq_model.predict(X_test_scaled)
+        _reg_metrics("Foundation Width B", self.y_B_test, y_B_pred, ' m')
+
         print("\n" + "-"*80)
-        print("EVALUATION 2: SETTLEMENT REGRESSOR")
-        print("Validation: Tokimatsu & Seed (1987), Bray & Macedo (2017)")
+        print("EVALUATION 2: FOUNDATION DEPTH D (m)")
+        print("Basis: Standard 1.5 m / 3.0 m for liquefiable soils")
         print("-"*80)
-        
-        y_settle_pred = self.settle_model.predict(X_test_scaled)
-        
-        # Calculate validation values using both methods
-        settle_ts_test = self.X_test.apply(self.calculate_settlement_tokimatsu_seed, axis=1)
-        settle_bm_test = self.X_test.apply(self.calculate_settlement_bray_macedo, axis=1)
-        settle_validation = (settle_ts_test + settle_bm_test) / 2.0
-        
-        r2 = r2_score(self.y_settle_test, y_settle_pred)
-        mae = mean_absolute_error(self.y_settle_test, y_settle_pred)
-        rmse = np.sqrt(mean_squared_error(self.y_settle_test, y_settle_pred))
-        
-        # Performance Index (PI) = 1 - (RMSE / mean)
-        mean_settle = self.y_settle_test.mean()
-        pi = 1 - (rmse / (mean_settle + 0.001))
-        
-        print(f"\n  R² Score: {r2:.4f}")
-        print(f"  MAE: {mae:.4f} cm")
-        print(f"  RMSE: {rmse:.4f} cm")
-        print(f"  Performance Index (PI): {pi:.4f}")
-        print(f"\n  Validation Comparison (vs Tokimatsu & Seed + Bray & Macedo):")
-        r2_val = r2_score(settle_validation, y_settle_pred)
-        print(f"    R² vs Validation Methods: {r2_val:.4f}")
-        
-        # EVALUATION 3: Bearing Capacity (R², MAE, RMSE, PI)
+        y_D_pred = self.settle_model.predict(X_test_scaled)
+        _reg_metrics("Foundation Depth D", self.y_D_test, y_D_pred, ' m')
+
         print("\n" + "-"*80)
-        print("EVALUATION 3: BEARING CAPACITY REGRESSOR")
-        print("Validation: Terzaghi (1943), Olsen & Stark (2002)")
+        print("EVALUATION 3: L/B RATIO (-)")
+        print("Basis: 1.0 square footing (thesis standard)")
         print("-"*80)
-        
-        y_bearing_pred = self.bearing_model.predict(X_test_scaled)
-        
-        # Calculate validation values
-        bearing_terzaghi_test = self.X_test.apply(self.calculate_bearing_capacity_terzaghi, axis=1)
-        bearing_olsen_test = self.X_test.apply(self.calculate_bearing_capacity_olsen_stark, axis=1)
-        
-        r2 = r2_score(self.y_bearing_test, y_bearing_pred)
-        mae = mean_absolute_error(self.y_bearing_test, y_bearing_pred)
-        rmse = np.sqrt(mean_squared_error(self.y_bearing_test, y_bearing_pred))
-        
-        mean_bearing = self.y_bearing_test.mean()
-        pi = 1 - (rmse / (mean_bearing + 0.001))
-        
-        print(f"\n  R² Score: {r2:.4f}")
-        print(f"  MAE: {mae:.4f} kPa")
-        print(f"  RMSE: {rmse:.4f} kPa")
-        print(f"  Performance Index (PI): {pi:.4f}")
-        print(f"\n  Validation Comparison:")
-        r2_terzaghi = r2_score(bearing_terzaghi_test, y_bearing_pred)
-        r2_olsen = r2_score(bearing_olsen_test, y_bearing_pred)
-        print(f"    R² vs Terzaghi: {r2_terzaghi:.4f}")
-        print(f"    R² vs Olsen & Stark: {r2_olsen:.4f}")
-        
+        y_lb_pred = self.bearing_model.predict(X_test_scaled)
+        _reg_metrics("L/B Ratio", self.y_lb_test, y_lb_pred, '')
+
         return True
     
     def save_models(self) -> bool:
@@ -712,48 +681,48 @@ class MultiOutputANNTraining:
             )
             print("    [OK] models/ann_multi_output.pkl")
             
-            # Save liquefaction classifier (for individual evaluation)
-            print("  Saving liquefaction classifier...")
+            # Save Foundation Width B regressor
+            print("  Saving Foundation Width B regressor...")
             liq_buffer = io.BytesIO()
             joblib.dump(self.liq_model, liq_buffer)
             liq_buffer.seek(0)
             self.client.storage.from_(bucket_name).upload(
-                'models/ann_liquefaction_classifier.pkl',
+                'models/ann_foundation_width_regressor.pkl',
                 liq_buffer.getvalue(),
                 file_options={'content-type': 'application/octet-stream', 'upsert': 'true'}
             )
-            print("    [OK] models/ann_liquefaction_classifier.pkl")
-            
-            # Save settlement regressor
-            print("  Saving settlement regressor...")
+            print("    [OK] models/ann_foundation_width_regressor.pkl")
+
+            # Save Foundation Depth D regressor
+            print("  Saving Foundation Depth D regressor...")
             settle_buffer = io.BytesIO()
             joblib.dump(self.settle_model, settle_buffer)
             settle_buffer.seek(0)
             self.client.storage.from_(bucket_name).upload(
-                'models/ann_settlement_regressor.pkl',
+                'models/ann_foundation_depth_regressor.pkl',
                 settle_buffer.getvalue(),
                 file_options={'content-type': 'application/octet-stream', 'upsert': 'true'}
             )
-            print("    [OK] models/ann_settlement_regressor.pkl")
-            
-            # Save bearing capacity regressor
-            print("  Saving bearing capacity regressor...")
+            print("    [OK] models/ann_foundation_depth_regressor.pkl")
+
+            # Save L/B Ratio regressor
+            print("  Saving L/B Ratio regressor...")
             bearing_buffer = io.BytesIO()
             joblib.dump(self.bearing_model, bearing_buffer)
             bearing_buffer.seek(0)
             self.client.storage.from_(bucket_name).upload(
-                'models/ann_bearing_capacity_regressor.pkl',
+                'models/ann_lb_ratio_regressor.pkl',
                 bearing_buffer.getvalue(),
                 file_options={'content-type': 'application/octet-stream', 'upsert': 'true'}
             )
-            print("    [OK] models/ann_bearing_capacity_regressor.pkl")
+            print("    [OK] models/ann_lb_ratio_regressor.pkl")
             
             # Save metadata
             print("  Saving metadata...")
             metadata = {
                 'version': '2.0',
                 'model_type': 'multi_output',
-                'targets': ['liquefaction', 'settlement', 'bearing_capacity'],
+                'targets': ['foundation_width_B', 'foundation_depth_D', 'lb_ratio'],
                 'architecture': {
                     'type': 'MLP',
                     'input_layer': 17,
@@ -769,9 +738,9 @@ class MultiOutputANNTraining:
                 'training_samples': len(self.X_train),
                 'test_samples': len(self.X_test),
                 'validation_methods': {
-                    'liquefaction': 'DPWH BSDS (2013)',
-                    'settlement': 'Tokimatsu & Seed (1987), Bray & Macedo (2017)',
-                    'bearing_capacity': 'Terzaghi (1943), Olsen & Stark (2002)'
+                    'foundation_width_B': 'Meyerhof (1974) / Bowles (1988) — FS_bearing >= 3, q_actual=50 kPa',
+                    'foundation_depth_D': 'Standard 1.5 m (normal) / 3.0 m (liquefiable, FS < 1.0)',
+                    'lb_ratio': 'Square footing L/B = 1.0 (thesis standard)',
                 },
                 'timestamp': datetime.now().isoformat()
             }
@@ -793,7 +762,7 @@ class MultiOutputANNTraining:
             return False
     
     def export_validation_excel(self) -> str:
-        """Export 20% validation set as Excel file in the same format as raw data"""
+        """Export 20% validation set as Excel/CSV and upload to Supabase Storage"""
         print("\n" + "="*80)
         print("EXPORTING VALIDATION DATA (20%)")
         print("="*80)
@@ -802,27 +771,54 @@ class MultiOutputANNTraining:
             print("  [ERROR] Validation dataframe not available")
             return ""
 
+        import io as _io
+
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f"validation_data_20pct_{timestamp}.xlsx"
+        bucket_name = os.getenv('SUPABASE_STORAGE_BUCKET', 'geotechnical-data')
 
         try:
             if EXCEL_AVAILABLE:
-                self.df_validation.to_excel(filename, index=False, engine='openpyxl')
-                print(f"  [OK] Excel file saved: {filename}")
+                filename = f"validation_data_20pct_{timestamp}.xlsx"
+                storage_path = f"validation/{filename}"
+                content_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+
+                # Write to in-memory buffer for upload
+                buf = _io.BytesIO()
+                self.df_validation.to_excel(buf, index=False, engine='openpyxl')
+                file_bytes = buf.getvalue()
+
+                # Also save locally
+                with open(filename, 'wb') as f:
+                    f.write(file_bytes)
+                print(f"  [OK] Local file saved: {filename}")
             else:
-                # Fallback to CSV if openpyxl not installed
-                csv_filename = filename.replace('.xlsx', '.csv')
-                self.df_validation.to_csv(csv_filename, index=False)
-                filename = csv_filename
+                filename = f"validation_data_20pct_{timestamp}.csv"
+                storage_path = f"validation/{filename}"
+                content_type = 'text/csv'
+
+                buf = _io.StringIO()
+                self.df_validation.to_csv(buf, index=False)
+                file_bytes = buf.getvalue().encode('utf-8')
+
+                with open(filename, 'wb') as f:
+                    f.write(file_bytes)
                 print(f"  [INFO] openpyxl not available, saved as CSV: {filename}")
 
             print(f"  Rows: {len(self.df_validation)} (20% validation set)")
             print(f"  Columns: {len(self.df_validation.columns)}")
-            print(f"  Columns include: raw data + _target_liquefaction, "
-                  f"_target_settlement_cm, _target_bearing_capacity_kpa")
+
+            # Upload to Supabase Storage
+            print(f"  Uploading to Supabase Storage: {storage_path} ...")
+            self.client.storage.from_(bucket_name).upload(
+                storage_path,
+                file_bytes,
+                file_options={'content-type': content_type, 'upsert': 'true'}
+            )
+            print(f"  [OK] Uploaded to bucket '{bucket_name}' -> {storage_path}")
+
             return filename
         except Exception as e:
-            print(f"  [ERROR] Export failed: {e}")
+            print(f"  [ERROR] Export/upload failed: {e}")
             import traceback
             traceback.print_exc()
             return ""
@@ -867,13 +863,14 @@ class MultiOutputANNTraining:
         print(f"  Validation samples: {len(self.X_test)} (20%)")
         print(f"  Features: {len(self.feature_names)}")
         if validation_file:
-            print(f"\n  Validation Excel: {validation_file}")
+            print(f"\n  Validation file (local): {validation_file}")
+            print(f"  Validation file (bucket): validation/{validation_file}")
         print(f"\n  Models saved:")
         print(f"    - models/scaler.pkl")
         print(f"    - models/ann_multi_output.pkl (Primary: 3 outputs)")
-        print(f"    - models/ann_liquefaction_classifier.pkl")
-        print(f"    - models/ann_settlement_regressor.pkl")
-        print(f"    - models/ann_bearing_capacity_regressor.pkl")
+        print(f"    - models/ann_foundation_width_regressor.pkl")
+        print(f"    - models/ann_foundation_depth_regressor.pkl")
+        print(f"    - models/ann_lb_ratio_regressor.pkl")
         print(f"    - models/ann_metadata.json")
         
         return True
