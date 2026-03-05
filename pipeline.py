@@ -405,17 +405,93 @@ class GeotechnicalPipeline:
         
         # Groundwater depth validation - try exact column names
         gwl_col = None
-        for col in ['Groundwater Level', 'Groundwater Depth', 'groundwater_depth_m', 'GWL', 'Water Table']:
+        for col in ['Groundwater Level (m)', 'Ground Water Table', 'Groundwater Level',
+                    'Groundwater Depth', 'groundwater_depth_m', 'GWL', 'Water Table']:
             if col in df_clean.columns:
                 gwl_col = col
                 break
-        
+
         if gwl_col:
             df_clean['groundwater_depth_m'] = pd.to_numeric(df_clean[gwl_col], errors='coerce')
             df_clean['groundwater_depth_m'] = df_clean['groundwater_depth_m'].fillna(5.0)  # Default
         else:
             df_clean['groundwater_depth_m'] = 5.0
-        
+
+        # Soil type — try common column names from Excel
+        soil_type_col = None
+        for col in ['Soil Type', 'soil_type', 'Soil Classification', 'Classification']:
+            if col in df_clean.columns:
+                soil_type_col = col
+                break
+
+        if soil_type_col:
+            df_clean['soil_type'] = df_clean[soil_type_col].astype(str).str.strip()
+            df_clean['soil_type'] = df_clean['soil_type'].replace({'nan': None, '': None})
+
+        # USCS symbol
+        uscs_col = None
+        for col in ['USCS Symbol', 'uscs_symbol', 'USCS Classification', 'USCS']:
+            if col in df_clean.columns:
+                uscs_col = col
+                break
+
+        if uscs_col:
+            df_clean['uscs_symbol'] = df_clean[uscs_col].astype(str).str.strip()
+            df_clean['uscs_symbol'] = df_clean['uscs_symbol'].replace({'nan': None, '': None})
+
+        # Soil description
+        desc_col = None
+        for col in ['Soil/Rock Description', 'Soil Description', 'soil_description', 'Description', 'Soil Name']:
+            if col in df_clean.columns:
+                desc_col = col
+                break
+
+        if desc_col:
+            df_clean['soil_description'] = df_clean[desc_col].astype(str).str.strip()
+            df_clean['soil_description'] = df_clean['soil_description'].replace({'nan': None, '': None})
+
+        # Internal friction angle
+        friction_col = None
+        for col in ['Internal Friction Angle', 'Friction Angle', 'friction_angle', 'φ']:
+            if col in df_clean.columns:
+                friction_col = col
+                break
+
+        if friction_col:
+            df_clean['friction_angle'] = pd.to_numeric(df_clean[friction_col], errors='coerce')
+
+        # Plasticity Index
+        pi_col = None
+        for col in ['Plasticity Index (PI)', 'Plasticity Index', 'plasticity_index', 'PI']:
+            if col in df_clean.columns:
+                pi_col = col
+                break
+
+        if pi_col:
+            df_clean['plasticity_index'] = pd.to_numeric(df_clean[pi_col], errors='coerce')
+
+        # Natural water content / moisture content
+        wc_col = None
+        for col in ['Natural Water Content (ω)', 'Natural Water Content', 'moisture_content',
+                    'Water Content', 'Moisture Content']:
+            if col in df_clean.columns:
+                wc_col = col
+                break
+
+        if wc_col:
+            df_clean['moisture_content'] = pd.to_numeric(df_clean[wc_col], errors='coerce')
+
+        # Mean particle size D50
+        d50_col = None
+        for col in ['Mean Particle Size (D50) (mm)', 'Mean Particle Size', 'mean_particle_size_d50',
+                    'D50', 'Particle Size (D50)']:
+            if col in df_clean.columns:
+                d50_col = col
+                break
+
+        if d50_col:
+            df_clean['mean_particle_size_d50'] = pd.to_numeric(df_clean[d50_col], errors='coerce')
+
         return df_clean
     
     def process_and_validate(self) -> bool:
@@ -865,60 +941,34 @@ class GeotechnicalPipeline:
         
         df = self.processed_data.copy()
         
-        # Select and order columns for database (prioritize exact raw data column names)
+        # Select and order columns for CSV export — clean names only, no duplicates
         output_columns = [
-            # Identifiers (exact names from raw data)
-            'Borehole ID', 'borehole_id', 'Municipality', 'municipality', 'Depth_Layer',
-            # Coordinates (both original and cleaned)
-            'Latitude', 'Longitude', 'latitude', 'longitude',
+            # Identifiers
+            'borehole_id', 'municipality', 'Depth_Layer',
+            # Coordinates
+            'latitude', 'longitude',
             # Depth
-            'depth_from_m', 'depth_to_m', 'depth_mid_m', 'depth_range',
-            # SPT (exact name from raw data)
-            'SPT N-Value', 'spt_n_value', 'spt_n60', 'spt_n160',
-            # Soil properties (exact names from raw data)
-            'Unit Weight', 'unit_weight', 'Fines Content', 'fines_content',
-            'Groundwater Level', 'Groundwater Depth', 'groundwater_depth_m',
-            # Seismic (exact name from raw data)
-            'Peak Ground Acceleration', 'pga_g', 'csr', 'crr', 'cyclic_strength_ratio',
-            # Relative Density (exact name from raw data)
-            'Relative Density', 'relative_density_percent',
-            # Elastic Modulus (exact name from raw data)
-            'Elastic Modulus (Es) (MN/m²)',
-            # Liquefaction
+            'depth_from_m', 'depth_to_m', 'depth_mid_m',
+            # SPT
+            'spt_n_value', 'spt_n160',
+            # Soil description
+            'uscs_symbol', 'soil_type', 'soil_description',
+            # Soil properties
+            'unit_weight', 'fines_content', 'groundwater_depth_m',
+            'friction_angle', 'moisture_content', 'plasticity_index', 'mean_particle_size_d50',
+            'relative_density_percent', 'elastic_modulus_es',
+            # Seismic / liquefaction analysis
+            'pga_g', 'csr', 'cyclic_strength_ratio',
+            'effective_overburden_pressure', 'total_overburden_pressure',
             'factor_of_safety', 'liquefaction_probability', 'liquefaction',
             'liquefaction_risk_level', 'liquefaction_status',
-            # Stress
-            'total_overburden_pressure', 'effective_overburden_pressure',
-            # Features
-            'is_clean_sand', 'is_silty_sand',
         ]
-        
-        # Select available columns (keep all that exist)
+
+        # Select available columns (only those present in df)
         available_cols = [col for col in output_columns if col in df.columns]
         
-        # Also include any other calculated columns
-        calculated_cols = ['depth_range', 'spt_n60', 'spt_n160', 'csr', 'crr', 
-                          'factor_of_safety', 'liquefaction_probability', 'liquefaction',
-                          'liquefaction_risk_level', 'liquefaction_status',
-                          'total_overburden_pressure', 'effective_overburden_pressure',
-                          'depth_mid_m', 'is_clean_sand', 'is_silty_sand']
-        
-        for col in calculated_cols:
-            if col in df.columns and col not in available_cols:
-                available_cols.append(col)
-        
         df_export = df[available_cols].copy()
-        
-        # Create depth_range if not exists
-        if 'depth_range' not in df_export.columns:
-            df_export['depth_range'] = df_export.apply(
-                lambda row: f"{row['depth_from_m']:.1f}-{row['depth_to_m']:.1f}m", axis=1
-            )
-        
-        # Rename cyclic_strength_ratio if crr exists
-        if 'crr' in df_export.columns and 'cyclic_strength_ratio' not in df_export.columns:
-            df_export['cyclic_strength_ratio'] = df_export['crr']
-        
+
         # Fill any remaining NaN with appropriate defaults
         numeric_cols = df_export.select_dtypes(include=[np.number]).columns
         for col in numeric_cols:
@@ -1182,8 +1232,10 @@ class GeotechnicalPipeline:
                 'depth_to_m': self.safe_float(row['depth_to_m']),
                 'depth_range': depth_range,
                 'spt_n_value': self.safe_float(row['spt_n_value']),
-                'spt_n60': self.safe_float(row.get('spt_n60')),
                 'spt_n160': self.safe_float(row.get('spt_n160')),
+                'soil_type': self.safe_str(row.get('soil_type')) if row.get('soil_type') not in (None, 'nan', '') else None,
+                'uscs_symbol': self.safe_str(row.get('uscs_symbol')) if row.get('uscs_symbol') not in (None, 'nan', '') else None,
+                'soil_description': self.safe_str(row.get('soil_description')) if row.get('soil_description') not in (None, 'nan', '') else None,
                 'unit_weight': self.safe_float(row['unit_weight']),
                 'fines_content': self.safe_float(row['fines_content']),
                 'groundwater_depth_m': self.safe_float(row['groundwater_depth_m']),
@@ -1209,14 +1261,20 @@ class GeotechnicalPipeline:
             }
 
             # Add optional fields if available
-            if 'moisture_content' in row and pd.notna(row['moisture_content']):
+            if 'moisture_content' in row.index and pd.notna(row.get('moisture_content')):
                 record['moisture_content'] = self.safe_float(row['moisture_content'])
 
-            if 'friction_angle' in row and pd.notna(row['friction_angle']):
+            if 'friction_angle' in row.index and pd.notna(row.get('friction_angle')):
                 record['friction_angle'] = self.safe_float(row['friction_angle'])
 
-            if 'cohesion_kpa' in row and pd.notna(row['cohesion_kpa']):
+            if 'cohesion_kpa' in row.index and pd.notna(row.get('cohesion_kpa')):
                 record['cohesion_kpa'] = self.safe_float(row['cohesion_kpa'])
+
+            if 'plasticity_index' in row.index and pd.notna(row.get('plasticity_index')):
+                record['plasticity_index'] = self.safe_float(row['plasticity_index'])
+
+            if 'mean_particle_size_d50' in row.index and pd.notna(row.get('mean_particle_size_d50')):
+                record['mean_particle_size_d50'] = self.safe_float(row['mean_particle_size_d50'])
 
             # Elastic Modulus
             if 'Elastic Modulus (Es) (MN/m²)' in row and pd.notna(row['Elastic Modulus (Es) (MN/m²)']):

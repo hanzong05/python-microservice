@@ -371,21 +371,24 @@ class MultiOutputANNTraining:
         
         df = self.df.copy()
         
-        # Select exactly 17 features as per project requirements
-        # Priority features for geotechnical prediction
+        # Priority features — thesis-required inputs first, then derived values.
+        # friction_angle, moisture_content, plasticity_index, mean_particle_size_d50
+        # are now extracted from Excel so they should be present in the training data.
         priority_features = [
-            'spt_n_value', 'spt_n60', 'spt_n160',
+            'spt_n_value', 'spt_n160',
             'unit_weight', 'fines_content', 'groundwater_depth_m',
-            'pga_g', 'csr', 'cyclic_strength_ratio', 'crr',
+            'pga_g', 'csr', 'cyclic_strength_ratio',
             'effective_overburden_pressure', 'total_overburden_pressure',
-            'depth_from_m', 'depth_to_m', 'depth_mid_m',
-            'relative_density_percent', 'moisture_content'
+            'depth_mid_m', 'relative_density_percent',
+            'friction_angle', 'moisture_content',
+            'plasticity_index', 'mean_particle_size_d50',
+            'elastic_modulus_es',
         ]
-        
-        # Get available priority features
+
+        # Get available priority features (only those present in the dataset)
         available_priority = [col for col in priority_features if col in df.columns]
-        
-        # Fill remaining slots with other numeric features
+
+        # Fill remaining slots with other numeric features if priority list is short
         exclude_cols = [
             'id', 'layer_id', 'borehole_id', 'borehole_record_id',
             'municipality_id', 'barangay_id', 'created_at', 'updated_at',
@@ -395,29 +398,26 @@ class MultiOutputANNTraining:
             'settlement_cm', 'bearing_capacity_kpa', 'qa_allowable_kpa',
             'liquefaction', 'liquefaction_probability', 'factor_of_safety'
         ]
-        
+
         other_features = [
             col for col in df.columns
             if col not in exclude_cols and col not in available_priority
             and df[col].dtype in ['int64', 'float64', 'bool']
         ]
-        
-        # Select exactly 17 features
-        feature_cols = available_priority[:17]
+
+        # Use however many priority features are available; pad only if fewer than 17
+        feature_cols = list(available_priority)
         if len(feature_cols) < 17:
             needed = 17 - len(feature_cols)
             feature_cols.extend(other_features[:needed])
-        
-        # If still less than 17, pad with zeros or use what we have
+
         if len(feature_cols) < 17:
             print(f"  [WARNING] Only {len(feature_cols)} features available, padding to 17")
             for i in range(len(feature_cols), 17):
                 df[f'feature_{i}'] = 0.0
                 feature_cols.append(f'feature_{i}')
-        elif len(feature_cols) > 17:
-            feature_cols = feature_cols[:17]
-        
-        print(f"  Selected exactly {len(feature_cols)} feature columns (as required)")
+
+        print(f"  Selected {len(feature_cols)} feature columns")
         self.feature_names = feature_cols
         
         # Prepare feature matrix
@@ -786,11 +786,6 @@ class MultiOutputANNTraining:
                 buf = _io.BytesIO()
                 self.df_validation.to_excel(buf, index=False, engine='openpyxl')
                 file_bytes = buf.getvalue()
-
-                # Also save locally
-                with open(filename, 'wb') as f:
-                    f.write(file_bytes)
-                print(f"  [OK] Local file saved: {filename}")
             else:
                 filename = f"validation_data_20pct_{timestamp}.csv"
                 storage_path = f"validation/{filename}"
@@ -799,10 +794,6 @@ class MultiOutputANNTraining:
                 buf = _io.StringIO()
                 self.df_validation.to_csv(buf, index=False)
                 file_bytes = buf.getvalue().encode('utf-8')
-
-                with open(filename, 'wb') as f:
-                    f.write(file_bytes)
-                print(f"  [INFO] openpyxl not available, saved as CSV: {filename}")
 
             print(f"  Rows: {len(self.df_validation)} (20% validation set)")
             print(f"  Columns: {len(self.df_validation.columns)}")
@@ -863,8 +854,7 @@ class MultiOutputANNTraining:
         print(f"  Validation samples: {len(self.X_test)} (20%)")
         print(f"  Features: {len(self.feature_names)}")
         if validation_file:
-            print(f"\n  Validation file (local): {validation_file}")
-            print(f"  Validation file (bucket): validation/{validation_file}")
+            print(f"\n  Validation file (bucket): validation/{validation_file}")
         print(f"\n  Models saved:")
         print(f"    - models/scaler.pkl")
         print(f"    - models/ann_multi_output.pkl (Primary: 3 outputs)")
