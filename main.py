@@ -14,7 +14,7 @@ from datetime import datetime
 from math import radians, sin, cos, sqrt, atan2
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import numpy as np
@@ -76,8 +76,46 @@ _model_metadata = None
 _pipeline_status = {"status": "idle", "message": "", "timestamp": None}
 _training_status = {"status": "idle", "message": "", "timestamp": None}
 
+# ── Prediction cache ───────────────────────────────────────────────────────
+# Key: (lat_r, lon_r, q_actual_r, magnitude_r)  — rounded to reduce key space
+# Value: (result, timestamp)
+_prediction_cache: dict = {}
+_CACHE_TTL_SECONDS = 3600  # 1 hour
+
+def _cache_key(lat: float, lon: float, q_actual: float, magnitude: float) -> tuple:
+    """Round inputs to 4 dp / 1 dp to group near-identical requests."""
+    return (round(lat, 4), round(lon, 4), round(q_actual, 1), round(magnitude, 1))
+
+def _cache_get(key: tuple):
+    """Return cached result if still fresh, else None."""
+    import time
+    entry = _prediction_cache.get(key)
+    if entry and (time.time() - entry["ts"]) < _CACHE_TTL_SECONDS:
+        print(f"[CACHE] HIT {key}")
+        return entry["result"]
+    return None
+
+def _cache_set(key: tuple, result) -> None:
+    import time
+    _prediction_cache[key] = {"result": result, "ts": time.time()}
+    # Evict oldest entries if cache grows too large (keep last 200)
+    if len(_prediction_cache) > 200:
+        oldest = sorted(_prediction_cache, key=lambda k: _prediction_cache[k]["ts"])
+        for k in oldest[:50]:
+            del _prediction_cache[k]
+    print(f"[CACHE] SET {key}  (cache size: {len(_prediction_cache)})")
+
 # Populated dynamically from ann_metadata.json on startup
 EXPECTED_FEATURES: list = []
+
+
+_API_SECRET_KEY = os.getenv("API_SECRET_KEY", "geoteam")
+
+
+async def verify_api_key(x_api_key: str = Header(..., alias="x-api-key")):
+    """Dependency: reject requests with a missing or wrong API key."""
+    if x_api_key != _API_SECRET_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized. Invalid API key.")
 
 
 class PredictionRequest(BaseModel):
@@ -688,7 +726,7 @@ async def health():
 
 
 @app.post("/pipeline/start")
-async def pipeline_start(background_tasks: BackgroundTasks):
+async def pipeline_start(background_tasks: BackgroundTasks, _: None = Depends(verify_api_key)):
     """Start geotechnical data processing pipeline"""
     if not PIPELINE_AVAILABLE:
         raise HTTPException(
@@ -708,13 +746,13 @@ async def pipeline_start(background_tasks: BackgroundTasks):
 
 
 @app.get("/pipeline/status")
-async def pipeline_status():
+async def pipeline_status(_: None = Depends(verify_api_key)):
     """Get pipeline execution status"""
     return _pipeline_status
 
 
 @app.post("/train/start")
-async def train_start(background_tasks: BackgroundTasks):
+async def train_start(background_tasks: BackgroundTasks, _: None = Depends(verify_api_key)):
     """Start model training"""
     if not TRAINING_AVAILABLE:
         raise HTTPException(
@@ -734,7 +772,7 @@ async def train_start(background_tasks: BackgroundTasks):
 
 
 @app.get("/train/status")
-async def train_status():
+async def train_status(_: None = Depends(verify_api_key)):
     """Get training execution status"""
     return _training_status
 
@@ -781,7 +819,7 @@ def run_full_workflow_background():
 
 
 @app.post("/pipeline-and-train/start")
-async def pipeline_and_train_start(background_tasks: BackgroundTasks):
+async def pipeline_and_train_start(background_tasks: BackgroundTasks, _: None = Depends(verify_api_key)):
     """Start pipeline followed by training (complete workflow)"""
     if not PIPELINE_AVAILABLE or not TRAINING_AVAILABLE:
         raise HTTPException(
@@ -815,6 +853,7 @@ async def predict(
         50.0, ge=0, description="Actual building contact pressure (kPa)"),
     magnitude: Optional[float] = Query(
         6.5, ge=4.0, le=10.0, description="Earthquake moment magnitude (Mw)"),
+    _: None = Depends(verify_api_key),
 ):
     """
     Predict liquefaction using spatial interpolation from multiple boreholes.
@@ -845,6 +884,12 @@ async def predict(
     if lat is None or lon is None:
         raise HTTPException(
             status_code=400, detail="Latitude and longitude required")
+
+    # ── Cache lookup ───────────────────────────────────────────────────────
+    ck = _cache_key(lat, lon, q_actual, magnitude)
+    cached = _cache_get(ck)
+    if cached is not None:
+        return cached
 
     try:
         scaler, multi_model, liq_model, settle_model, bearing_model, metadata = load_model()
@@ -1108,7 +1153,7 @@ async def predict(
 
         nearest_dist_km = interpolation_info.get('nearest_distance_km', 0)
 
-        return PredictionResponse(
+        result = PredictionResponse(
             location={
                 "latitude": lat,
                 "longitude": lon,
@@ -1157,6 +1202,8 @@ async def predict(
             },
             interpolation_info=interpolation_info
         )
+        _cache_set(ck, result)
+        return result
     except Exception as e:
         import traceback
         error_detail = f"Prediction failed: {str(e)}\n{traceback.format_exc()}"
@@ -1167,6 +1214,7 @@ async def predict(
 @app.get("/boreholes")
 async def get_boreholes(
     municipality: Optional[str] = Query(None, description="Filter by municipality name"),
+    _: None = Depends(verify_api_key),
 ):
     """
     Return all boreholes with geolocations and liquefaction risk classification.
@@ -1291,7 +1339,7 @@ async def get_boreholes(
 
 
 @app.get("/features")
-async def features_info():
+async def features_info(_: None = Depends(verify_api_key)):
     """Get feature information"""
     return {
         "feature_count": len(EXPECTED_FEATURES),
@@ -1301,7 +1349,7 @@ async def features_info():
 
 
 @app.get("/model-info")
-async def model_info():
+async def model_info(_: None = Depends(verify_api_key)):
     """Get model metadata"""
     if _model_metadata is None:
         try:

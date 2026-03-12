@@ -762,9 +762,11 @@ class MultiOutputANNTraining:
             return False
     
     def export_validation_excel(self) -> str:
-        """Export 20% validation set as Excel/CSV and upload to Supabase Storage"""
+        """Export 20% validation set formatted exactly like Raw_data (2).xlsx:
+        Summary sheet + one sheet per depth range (0m-1.5m ... 13.5m-15.0m).
+        """
         print("\n" + "="*80)
-        print("EXPORTING VALIDATION DATA (20%)")
+        print("EXPORTING VALIDATION DATA (20%) — Raw_data format")
         print("="*80)
 
         if self.df_validation is None:
@@ -776,30 +778,143 @@ class MultiOutputANNTraining:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         bucket_name = os.getenv('SUPABASE_STORAGE_BUCKET', 'geotechnical-data')
 
+        df = self.df_validation.copy()
+
+        DEPTH_SHEETS = [
+            ("0m-1.5m",     0.0,   1.5),
+            ("1.5m-3.0m",   1.5,   3.0),
+            ("3.0m-4.5m",   3.0,   4.5),
+            ("4.5m-6.0m",   4.5,   6.0),
+            ("6.0m-7.5m",   6.0,   7.5),
+            ("7.5m-9.0m",   7.5,   9.0),
+            ("9.0m-10.5m",  9.0,  10.5),
+            ("10.5m-12.0m", 10.5, 12.0),
+            ("12.0m-13.5m", 12.0, 13.5),
+            ("13.5m-15.0m", 13.5, 15.0),
+        ]
+
+        OUTPUT_COLUMNS = [
+            "Municipality",
+            "Borehole ID",
+            "Sample No.",
+            "Latitude",
+            "Longitude",
+            "Elevation",
+            "Soil/Rock Description",
+            "USCS Symbol",
+            "Fault Distance (km)",
+            "Ground Water Table",
+            "SPT N-Value",
+            "Plasticity Index (PI)",
+            "Natural Water Content (\u03c9)",
+            "Mean Particle Size (D50) (mm)",
+            "Groundwater Level (m)",
+            "Unit Weight (\u03b3)",
+            "Internal Friction Angle",
+            "Corrected SPT-N Value (N1(60))",
+            "Fines Content",
+            "Relative Density",
+            "Peak Ground Acceleration",
+            "Cyclic Stress Ratio (CSR)",
+            "Elastic Modulus (Es) (MN/m\u00b2)",
+        ]
+
+        def _get(row, *keys, default=''):
+            for k in keys:
+                v = row.get(k)
+                if v is not None and not (isinstance(v, float) and pd.isna(v)):
+                    return v
+            return default
+
+        def _format_pga(val):
+            try:
+                v = float(val)
+                if v > 0:
+                    return f"{v}g"
+            except Exception:
+                pass
+            return val if val else ''
+
+        def build_sheet_df(subset):
+            rows = []
+            for _, row in subset.iterrows():
+                layer_num = _get(row, 'layer_number')
+                sample_no = f"SS-{int(layer_num)}" if layer_num != '' and layer_num == layer_num else ''
+                lat = _get(row, 'latitude')
+                lon = _get(row, 'longitude')
+                rows.append({
+                    "Municipality":                    _get(row, 'municipality'),
+                    "Borehole ID":                     _get(row, 'borehole_id'),
+                    "Sample No.":                      sample_no,
+                    "Latitude":                        f"{lat}\u00b0" if lat != '' else '',
+                    "Longitude":                       f"{lon}\u00b0" if lon != '' else '',
+                    "Elevation":                       _get(row, 'elevation'),
+                    "Soil/Rock Description":           _get(row, 'soil_type', 'soil_description'),
+                    "USCS Symbol":                     _get(row, 'uscs_symbol'),
+                    "Fault Distance (km)":             '',
+                    "Ground Water Table":              _get(row, 'groundwater_depth_m'),
+                    "SPT N-Value":                     _get(row, 'spt_n_value'),
+                    "Plasticity Index (PI)":           _get(row, 'plasticity_index'),
+                    "Natural Water Content (\u03c9)":  _get(row, 'moisture_content'),
+                    "Mean Particle Size (D50) (mm)":   _get(row, 'mean_particle_size_d50'),
+                    "Groundwater Level (m)":           _get(row, 'groundwater_depth_m'),
+                    "Unit Weight (\u03b3)":            _get(row, 'unit_weight'),
+                    "Internal Friction Angle":         _get(row, 'friction_angle'),
+                    "Corrected SPT-N Value (N1(60))":  _get(row, 'spt_n60', 'spt_n160'),
+                    "Fines Content":                   _get(row, 'fines_content'),
+                    "Relative Density":                _get(row, 'relative_density_percent'),
+                    "Peak Ground Acceleration":        _format_pga(_get(row, 'pga_g')),
+                    "Cyclic Stress Ratio (CSR)":       _get(row, 'csr'),
+                    "Elastic Modulus (Es) (MN/m\u00b2)": _get(row, 'elastic_modulus_es'),
+                })
+            return pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
+
         try:
-            if EXCEL_AVAILABLE:
-                filename = f"validation_data_20pct_{timestamp}.xlsx"
-                storage_path = f"validation/{filename}"
-                content_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            filename = f"validation_data_20pct_{timestamp}.xlsx"
+            storage_path = f"validation/{filename}"
+            content_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 
-                # Write to in-memory buffer for upload
-                buf = _io.BytesIO()
-                self.df_validation.to_excel(buf, index=False, engine='openpyxl')
-                file_bytes = buf.getvalue()
-            else:
-                filename = f"validation_data_20pct_{timestamp}.csv"
-                storage_path = f"validation/{filename}"
-                content_type = 'text/csv'
+            municipalities = int(df['municipality'].nunique()) if 'municipality' in df.columns else 0
 
-                buf = _io.StringIO()
-                self.df_validation.to_csv(buf, index=False)
-                file_bytes = buf.getvalue().encode('utf-8')
+            buf = _io.BytesIO()
+            with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+                # ── Summary sheet ──────────────────────────────────────────────
+                pd.DataFrame({
+                    'Project':            ['Geotechnical Investigation'],
+                    'Location':           ['Tarlac Province, Philippines'],
+                    'Investigation Type': ['Borehole Sampling (SPT)'],
+                    'Depth Range':        ['0m - 15m'],
+                    'Number of Layers':   [10],
+                    'Data Status':        ['Validation Set (20%) — Machine Learning Split'],
+                    'Total Samples':      [len(df)],
+                    'Municipalities':     [municipalities],
+                }).to_excel(writer, sheet_name='Summary', index=False)
 
-            print(f"  Rows: {len(self.df_validation)} (20% validation set)")
-            print(f"  Columns: {len(self.df_validation.columns)}")
+                # ── One sheet per depth range ──────────────────────────────────
+                for sheet_name, depth_from, depth_to in DEPTH_SHEETS:
+                    if 'depth_from_m' in df.columns:
+                        mask = (
+                            pd.to_numeric(df['depth_from_m'], errors='coerce') >= depth_from - 0.01
+                        ) & (
+                            pd.to_numeric(df['depth_from_m'], errors='coerce') < depth_to - 0.01
+                        )
+                        subset = df[mask]
+                    elif 'layer_number' in df.columns:
+                        layer_idx = [s[0] for s in DEPTH_SHEETS].index(sheet_name) + 1
+                        subset = df[pd.to_numeric(df['layer_number'], errors='coerce') == layer_idx]
+                    else:
+                        subset = df.iloc[0:0]
+
+                    build_sheet_df(subset).to_excel(writer, sheet_name=sheet_name, index=False)
+                    print(f"  {sheet_name}: {len(subset)} rows")
+
+            file_bytes = buf.getvalue()
+
+            print(f"\n  Total rows: {len(df)} (20% validation set)")
+            print(f"  Sheets: Summary + {len(DEPTH_SHEETS)} depth sheets")
 
             # Upload to Supabase Storage
-            print(f"  Uploading to Supabase Storage: {storage_path} ...")
+            print(f"  Uploading to: {storage_path} ...")
             self.client.storage.from_(bucket_name).upload(
                 storage_path,
                 file_bytes,
