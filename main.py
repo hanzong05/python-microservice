@@ -109,7 +109,9 @@ def _cache_set(key: tuple, result) -> None:
 EXPECTED_FEATURES: list = []
 
 
-_API_SECRET_KEY = os.getenv("API_SECRET_KEY", "geoteam")
+_API_SECRET_KEY = os.getenv("API_SECRET_KEY")
+if not _API_SECRET_KEY:
+    raise RuntimeError("API_SECRET_KEY environment variable is not set")
 
 
 async def verify_api_key(x_api_key: str = Header(..., alias="x-api-key")):
