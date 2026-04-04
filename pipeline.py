@@ -425,7 +425,10 @@ class GeotechnicalPipeline:
                 break
 
         if soil_type_col:
-            df_clean['soil_type'] = df_clean[soil_type_col].astype(str).str.strip()
+            df_clean['soil_type'] = (df_clean[soil_type_col]
+                                      .fillna('')
+                                      .astype(str)
+                                      .str.strip())
             df_clean['soil_type'] = df_clean['soil_type'].replace('nan', '')
 
         # USCS symbol
@@ -436,7 +439,10 @@ class GeotechnicalPipeline:
                 break
 
         if uscs_col:
-            df_clean['uscs_symbol'] = df_clean[uscs_col].astype(str).str.strip()
+            df_clean['uscs_symbol'] = (df_clean[uscs_col]
+                                        .fillna('')
+                                        .astype(str)
+                                        .str.strip())
             df_clean['uscs_symbol'] = df_clean['uscs_symbol'].replace('nan', '')
 
         # Soil description
@@ -447,7 +453,10 @@ class GeotechnicalPipeline:
                 break
 
         if desc_col:
-            df_clean['soil_description'] = df_clean[desc_col].astype(str).str.strip()
+            df_clean['soil_description'] = (df_clean[desc_col]
+                                             .fillna('')
+                                             .astype(str)
+                                             .str.strip())
             df_clean['soil_description'] = df_clean['soil_description'].replace('nan', '')
 
         # Internal friction angle
@@ -625,7 +634,7 @@ class GeotechnicalPipeline:
         uscs_col = 'USCS Symbol'
         if rd_col in df.columns and n160_col in df.columns:
             n1_60 = pd.to_numeric(df[n160_col], errors='coerce')
-            uscs  = (df[uscs_col].astype(str).str.strip().str.upper()
+            uscs  = (df[uscs_col].fillna('').astype(str).str.strip().str.upper()
                      if uscs_col in df.columns
                      else pd.Series([''] * len(df), index=df.index))
             missing = (
