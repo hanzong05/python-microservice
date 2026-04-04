@@ -426,7 +426,7 @@ class GeotechnicalPipeline:
 
         if soil_type_col:
             df_clean['soil_type'] = df_clean[soil_type_col].astype(str).str.strip()
-            df_clean['soil_type'] = df_clean['soil_type'].replace({'nan': None, '': None})
+            df_clean['soil_type'] = df_clean['soil_type'].replace('nan', '')
 
         # USCS symbol
         uscs_col = None
@@ -437,7 +437,7 @@ class GeotechnicalPipeline:
 
         if uscs_col:
             df_clean['uscs_symbol'] = df_clean[uscs_col].astype(str).str.strip()
-            df_clean['uscs_symbol'] = df_clean['uscs_symbol'].replace({'nan': None, '': None})
+            df_clean['uscs_symbol'] = df_clean['uscs_symbol'].replace('nan', '')
 
         # Soil description
         desc_col = None
@@ -448,7 +448,7 @@ class GeotechnicalPipeline:
 
         if desc_col:
             df_clean['soil_description'] = df_clean[desc_col].astype(str).str.strip()
-            df_clean['soil_description'] = df_clean['soil_description'].replace({'nan': None, '': None})
+            df_clean['soil_description'] = df_clean['soil_description'].replace('nan', '')
 
         # Internal friction angle
         friction_col = None
