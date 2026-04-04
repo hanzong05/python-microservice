@@ -26,7 +26,7 @@ warnings.filterwarnings('ignore')
 # Load environment variables from .env file
 try:
     from dotenv import load_dotenv
-    load_dotenv()  # Load .env file automatically
+    load_dotenv()
     DOTENV_AVAILABLE = True
 except ImportError:
     DOTENV_AVAILABLE = False
@@ -47,24 +47,14 @@ class GeotechnicalPipeline:
     """
 
     def __init__(self, excel_file_path: Optional[str] = None, output_csv_path: Optional[str] = None, use_storage: bool = True):
-        """
-        Initialize pipeline
-
-        Args:
-            excel_file_path: Path to local Excel file (or None to use Supabase Storage)
-            output_csv_path: Optional output CSV path (default: auto-generated)
-            use_storage: If True and excel_file_path is None, load from Supabase Storage
-        """
         self.use_storage = use_storage
         self.excel_path = None
         self.excel_file_bytes = None
 
         if excel_file_path:
             self.excel_path = Path(excel_file_path)
-            # No local output path needed - files go to storage only
             self.output_path = None
         else:
-            # No local output path needed - files go to storage only
             self.output_path = None
 
         self.raw_data = {}
@@ -72,7 +62,6 @@ class GeotechnicalPipeline:
         self.validation_errors = []
         self.validation_warnings = []
 
-        # Database connection and ID mappings
         self.client = None
         self.municipality_ids = {}
         self.borehole_record_ids = {}
@@ -97,7 +86,6 @@ class GeotechnicalPipeline:
         try:
             self.client = create_client(supabase_url, supabase_key)
 
-            # Download from raw/excel folder in storage bucket
             storage_path = "raw/Raw_data.xlsx"
             bucket_name = os.getenv(
                 'SUPABASE_STORAGE_BUCKET', 'geotechnical-data')
@@ -122,7 +110,7 @@ class GeotechnicalPipeline:
     def upload_raw_file_to_bucket(self) -> bool:
         """Upload the local raw Excel file to Supabase Storage (raw/ folder)"""
         if not self.excel_path or not self.excel_path.exists():
-            return True  # Nothing to upload
+            return True
 
         if not self.client:
             print("  [INFO] No database connection - skipping raw file upload")
@@ -148,7 +136,7 @@ class GeotechnicalPipeline:
             return True
         except Exception as e:
             print(f"  [WARNING] Raw file upload failed: {e}")
-            return True  # Non-fatal
+            return True
 
     def load_excel(self) -> bool:
         """Load Excel file from local path or memory bytes"""
@@ -157,7 +145,6 @@ class GeotechnicalPipeline:
         print("="*80)
 
         try:
-            # Use file bytes from storage if available, otherwise use local file
             if self.excel_file_bytes:
                 print("  Loading from memory (Supabase Storage)...")
                 xl_file = pd.ExcelFile(io.BytesIO(self.excel_file_bytes))
@@ -172,7 +159,6 @@ class GeotechnicalPipeline:
 
             print(f"\n  Found {len(xl_file.sheet_names)} sheets")
 
-            # Load all depth layer sheets (skip Summary like reference script)
             for sheet_name in xl_file.sheet_names:
                 if sheet_name == 'Summary':
                     print(f"    Skipping: {sheet_name}")
@@ -212,11 +198,9 @@ class GeotechnicalPipeline:
         if pd.isna(value):
             return None
         try:
-            # Extract numeric value before 'g'
             matches = re.findall(r'(\d+\.?\d*)g', str(value).lower())
             if matches:
                 return np.mean([float(m) for m in matches])
-            # Try direct conversion
             return float(str(value).replace('g', '').strip())
         except:
             return None
@@ -226,13 +210,11 @@ class GeotechnicalPipeline:
         if pd.isna(value):
             return None
 
-        # If already numeric, return it
         try:
             return float(value)
         except:
             pass
 
-        # Map text descriptions to percentages (same as reference)
         density_map = {
             'very loose': 15.0,
             'loose': 35.0,
@@ -248,21 +230,18 @@ class GeotechnicalPipeline:
         return density_map.get(value_str, None)
 
     def parse_elastic_modulus(self, value) -> Optional[float]:
-        """Parse elastic modulus from various formats (like reference script)"""
+        """Parse elastic modulus from various formats"""
         if pd.isna(value):
             return None
 
-        # If it's a datetime (Excel parsing error), return None
         if isinstance(value, datetime):
             return None
 
-        # If already numeric, return it
         try:
             return float(value)
         except:
             pass
 
-        # Handle ranges like "3000 to 5000" - take midpoint
         value_str = str(value).lower()
         if 'to' in value_str:
             try:
@@ -276,38 +255,52 @@ class GeotechnicalPipeline:
         return None
 
     def pre_clean_dataframe(self, df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
+        """
+        PRE-CLEAN dataframe — must run FIRST before any numeric operations.
+
+        FIX 1: Drop stray unnamed columns (Excel formatting artifacts that cause
+                StringDtype crashes when the pipeline tries to write float values).
+        FIX 2: Convert pandas StringDtype → object dtype.
+                pandas 2.x reads Excel string columns as StringDtype which is strict
+                and rejects float assignments (df.loc[mask, col] = float_series).
+                Converting to object dtype restores pandas 1.x behaviour.
+        """
         df_clean = df.copy()
 
-        # ← ADD THIS BLOCK RIGHT HERE ↓
-        # Drop stray unnamed columns (Excel formatting artifacts)
+        # ── FIX 1: Drop unnamed columns ───────────────────────────────────────
         unnamed_cols = [c for c in df_clean.columns if str(
             c).lower().startswith('unnamed')]
         if unnamed_cols:
             df_clean = df_clean.drop(columns=unnamed_cols)
-            print(f'    [FIX] Dropped unnamed columns: {unnamed_cols}')
-        # ← END OF NEW BLOCK ↑
+            print(f"    [FIX] Dropped unnamed columns: {unnamed_cols}")
+
+        # ── FIX 2: StringDtype → object ───────────────────────────────────────
+        str_cols = [c for c in df_clean.columns if str(
+            df_clean[c].dtype) == 'str']
+        if str_cols:
+            df_clean[str_cols] = df_clean[str_cols].astype(object)
 
         # 1. Clean Latitude (remove degree symbols)
         if 'Latitude' in df_clean.columns:
             df_clean['Latitude'] = df_clean['Latitude'].apply(
                 self.clean_coordinate)
 
-        # 2. Clean Longitude (remove degree symbols) - exact column name from raw data
+        # 2. Clean Longitude (remove degree symbols)
         if 'Longitude' in df_clean.columns:
             df_clean['Longitude'] = df_clean['Longitude'].apply(
                 self.clean_coordinate)
 
-        # 3. Clean Peak Ground Acceleration (parse complex strings) - exact column name
+        # 3. Clean Peak Ground Acceleration (parse complex strings)
         if 'Peak Ground Acceleration' in df_clean.columns:
             df_clean['Peak Ground Acceleration'] = df_clean['Peak Ground Acceleration'].apply(
                 self.parse_pga)
 
-        # 4. Clean Relative Density (convert text to numeric) - exact column name
+        # 4. Clean Relative Density (convert text to numeric)
         if 'Relative Density' in df_clean.columns:
             df_clean['Relative Density'] = df_clean['Relative Density'].apply(
                 self.parse_relative_density)
 
-        # 5. Clean Elastic Modulus (parse ranges and dates) - exact column name
+        # 5. Clean Elastic Modulus (parse ranges and dates)
         if 'Elastic Modulus (Es) (MN/m²)' in df_clean.columns:
             df_clean['Elastic Modulus (Es) (MN/m²)'] = df_clean['Elastic Modulus (Es) (MN/m²)'].apply(
                 self.parse_elastic_modulus)
@@ -318,7 +311,6 @@ class GeotechnicalPipeline:
         """Validate coordinates after pre-cleaning"""
         df_clean = df.copy()
 
-        # Use exact column names from raw data
         if 'Latitude' in df_clean.columns:
             df_clean['latitude'] = df_clean['Latitude']
             invalid = df_clean['latitude'].isna().sum()
@@ -326,7 +318,6 @@ class GeotechnicalPipeline:
                 self.validation_warnings.append(
                     f"Missing/invalid latitude: {invalid} records")
 
-            # Check Tarlac range (15.0 to 16.0)
             valid_lat = df_clean['latitude'].dropna()
             if len(valid_lat) > 0:
                 out_of_range = ((valid_lat < 15.0) | (valid_lat > 16.0)).sum()
@@ -341,7 +332,6 @@ class GeotechnicalPipeline:
                 self.validation_warnings.append(
                     f"Missing/invalid longitude: {invalid} records")
 
-            # Check Tarlac range (120.0 to 121.0)
             valid_lon = df_clean['longitude'].dropna()
             if len(valid_lon) > 0:
                 out_of_range = ((valid_lon < 120.0) |
@@ -353,10 +343,9 @@ class GeotechnicalPipeline:
         return df_clean
 
     def validate_spt(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Validate SPT values (check for exact column names from raw data)"""
+        """Validate SPT values"""
         df_clean = df.copy()
 
-        # Try exact column names from raw data first
         spt_col = None
         for col in ['SPT N-Value', 'SPT N Value', 'spt_n_value', 'N-Value', 'N Value', 'SPT']:
             if col in df_clean.columns:
@@ -367,7 +356,6 @@ class GeotechnicalPipeline:
             df_clean['spt_n_value'] = pd.to_numeric(
                 df_clean[spt_col], errors='coerce')
 
-            # Validate range (typically 0-100)
             valid_spt = df_clean['spt_n_value'].dropna()
             if len(valid_spt) > 0:
                 invalid = ((valid_spt < 0) | (valid_spt > 100)).sum()
@@ -379,8 +367,7 @@ class GeotechnicalPipeline:
             if missing > 0:
                 self.validation_warnings.append(
                     f"Missing SPT values: {missing} records")
-                df_clean['spt_n_value'] = df_clean['spt_n_value'].fillna(
-                    15.0)  # Default
+                df_clean['spt_n_value'] = df_clean['spt_n_value'].fillna(15.0)
         else:
             self.validation_warnings.append(
                 "SPT column not found, using default value 15.0")
@@ -389,12 +376,12 @@ class GeotechnicalPipeline:
         return df_clean
 
     def validate_soil_parameters(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Validate soil parameters (check for exact column names from raw data)"""
+        """Validate soil parameters"""
         df_clean = df.copy()
 
-        # Unit weight validation - try exact column names
+        # Unit weight
         unit_weight_col = None
-        for col in ['Unit Weight', 'unit_weight', 'Unit Weight (kN/m³)', 'γ']:
+        for col in ['Unit Weight (γ)', 'Unit Weight', 'unit_weight', 'Unit Weight (kN/m³)', 'γ']:
             if col in df_clean.columns:
                 unit_weight_col = col
                 break
@@ -408,12 +395,11 @@ class GeotechnicalPipeline:
                 if invalid > 0:
                     self.validation_warnings.append(
                         f"Unit weight out of typical range (10-25 kN/m³): {invalid} records")
-            df_clean['unit_weight'] = df_clean['unit_weight'].fillna(
-                18.0)  # Default
+            df_clean['unit_weight'] = df_clean['unit_weight'].fillna(18.0)
         else:
             df_clean['unit_weight'] = 18.0
 
-        # Fines content validation - try exact column names
+        # Fines content
         fines_col = None
         for col in ['Fines Content', 'fines_content', 'Fines (%)', 'Fines']:
             if col in df_clean.columns:
@@ -429,12 +415,11 @@ class GeotechnicalPipeline:
                 if invalid > 0:
                     self.validation_errors.append(
                         f"Fines content out of valid range (0-100%): {invalid} records")
-            df_clean['fines_content'] = df_clean['fines_content'].fillna(
-                15.0)  # Default
+            df_clean['fines_content'] = df_clean['fines_content'].fillna(15.0)
         else:
             df_clean['fines_content'] = 15.0
 
-        # Groundwater depth validation - try exact column names
+        # Groundwater depth
         gwl_col = None
         for col in ['Groundwater Level (m)', 'Ground Water Table', 'Groundwater Level',
                     'Groundwater Depth', 'groundwater_depth_m', 'GWL', 'Water Table']:
@@ -446,11 +431,11 @@ class GeotechnicalPipeline:
             df_clean['groundwater_depth_m'] = pd.to_numeric(
                 df_clean[gwl_col], errors='coerce')
             df_clean['groundwater_depth_m'] = df_clean['groundwater_depth_m'].fillna(
-                5.0)  # Default
+                5.0)
         else:
             df_clean['groundwater_depth_m'] = 5.0
 
-        # Soil type — try common column names from Excel
+        # Soil type
         soil_type_col = None
         for col in ['Soil Type', 'soil_type', 'Soil Classification', 'Classification']:
             if col in df_clean.columns:
@@ -516,7 +501,7 @@ class GeotechnicalPipeline:
             df_clean['plasticity_index'] = pd.to_numeric(
                 df_clean[pi_col], errors='coerce')
 
-        # Natural water content / moisture content
+        # Natural water content
         wc_col = None
         for col in ['Natural Water Content (ω)', 'Natural Water Content', 'moisture_content',
                     'Water Content', 'Moisture Content']:
@@ -543,7 +528,7 @@ class GeotechnicalPipeline:
         return df_clean
 
     def process_and_validate(self) -> bool:
-        """Single-pass processing with validation (following reference script pattern)"""
+        """Single-pass processing with validation"""
         print("\n" + "="*80)
         print("STEP 2: PRE-CLEANING AND VALIDATING DATA")
         print("="*80)
@@ -553,7 +538,7 @@ class GeotechnicalPipeline:
         for sheet_name, df in self.raw_data.items():
             print(f"\n  Pre-cleaning sheet: {sheet_name}")
 
-            # STEP 1: PRE-CLEAN (like reference script) - must run FIRST
+            # STEP 1: PRE-CLEAN — must run FIRST (drops unnamed cols + fixes StringDtype)
             df = self.pre_clean_dataframe(df, sheet_name)
 
             # STEP 2: Validate coordinates
@@ -569,7 +554,7 @@ class GeotechnicalPipeline:
             if 'Peak Ground Acceleration' in df.columns:
                 df['pga_g'] = df['Peak Ground Acceleration']
             else:
-                df['pga_g'] = 0.35  # Default PGA for Tarlac
+                df['pga_g'] = 0.35
 
             df['pga_g'] = pd.to_numeric(
                 df['pga_g'], errors='coerce').fillna(0.35)
@@ -578,10 +563,10 @@ class GeotechnicalPipeline:
             if 'Relative Density' in df.columns:
                 df['relative_density_percent'] = df['Relative Density']
 
-            # STEP 7: Add Depth_Layer column (like reference script)
+            # STEP 7: Add Depth_Layer column
             df['Depth_Layer'] = sheet_name
 
-            # STEP 8: Extract depth from sheet name or Depth_Layer
+            # STEP 8: Extract depth from sheet name
             def extract_depth(layer_name):
                 match = re.search(
                     r'(\d+\.?\d*)\s*-\s*(\d+\.?\d*)', str(layer_name))
@@ -600,14 +585,12 @@ class GeotechnicalPipeline:
             all_dfs.append(df)
             print(f"    [OK] Processed {len(df)} rows")
 
-        # Combine all sheets (like reference script)
         if all_dfs:
             self.processed_data = pd.concat(all_dfs, ignore_index=True)
             print(
                 f"\n  [OK] Combined {len(self.processed_data)} total records")
             print(f"  Sheets combined: {len(self.raw_data)}")
 
-            # Show depth layer distribution (like reference script)
             if 'Depth_Layer' in self.processed_data.columns:
                 print(f"\n  Depth Layer Distribution:")
                 depth_counts = self.processed_data['Depth_Layer'].value_counts(
@@ -627,10 +610,8 @@ class GeotechnicalPipeline:
           - Effective Overburden Pressure (σ'_v = σ_v − u, min 1 kPa)
           - Relative Density (Dr % = √(N1_60/60) × 100, Skempton 1986)
           - Cyclic Stress Ratio (CSR = 0.65 × σ_v/σ'_v × PGA × rd)
-
-        Formulas from the "Empirical Formula" sheet of RAW_DATA_OF_THESIS.xlsx.
         """
-        GAMMA_WATER = 9.81   # kN/m³
+        GAMMA_WATER = 9.81
         COHESIVE_USCS = {"CL", "CH", "ML", "MH", "OL", "OH", "Pt", "CL-ML"}
 
         df = df.copy()
@@ -638,12 +619,10 @@ class GeotechnicalPipeline:
         γ = df['unit_weight']
         gwl = df['groundwater_depth_m']
 
-        # ── Overburden pressures ──────────────────────────────────────────────
         sigma_v = γ * z
         u = np.maximum(0.0, z - gwl) * GAMMA_WATER
         sigma_eff = np.maximum(1.0, sigma_v - u)
 
-        # ── Stress reduction coefficient rd (Seed & Idriss 1971) ─────────────
         rd = np.where(z <= 9.15,
                       1.0 - 0.00765 * z,
                       np.where(z <= 23.0,
@@ -651,7 +630,7 @@ class GeotechnicalPipeline:
                                0.0))
         rd = np.clip(rd, 0.0, 1.0)
 
-        # ── 1. Total Overburden Pressure ─────────────────────────────────────
+        # 1. Total Overburden Pressure
         tot_col = 'Total Overburden Pressure'
         if tot_col in df.columns:
             missing = pd.to_numeric(df[tot_col], errors='coerce').isna()
@@ -661,8 +640,7 @@ class GeotechnicalPipeline:
                 print(
                     f"      [FILL] Total Overburden Pressure: {filled} rows computed")
 
-        # ── 2. Effective Overburden Pressure ──────────────────────────────────
-        # Raw Excel has a typo: "Effective Overburden Presssure" (3 s's)
+        # 2. Effective Overburden Pressure (typo "Presssure" in raw data)
         for eff_col in ('Effective Overburden Presssure', 'Effective Overburden Pressure'):
             if eff_col in df.columns:
                 missing = pd.to_numeric(df[eff_col], errors='coerce').isna()
@@ -673,7 +651,7 @@ class GeotechnicalPipeline:
                         f"      [FILL] Effective Overburden Pressure: {filled} rows computed")
                 break
 
-        # ── 3. Relative Density (Dr %) ────────────────────────────────────────
+        # 3. Relative Density (Dr %)
         rd_col = 'Relative Density'
         n160_col = 'Corrected SPT-N Value (N1(60))'
         uscs_col = 'USCS Symbol'
@@ -686,7 +664,7 @@ class GeotechnicalPipeline:
                 pd.to_numeric(df[rd_col], errors='coerce').isna()
                 & n1_60.notna()
                 & (n1_60 > 0)
-                & ~uscs.isin(COHESIVE_USCS)      # N/A for cohesive soils
+                & ~uscs.isin(COHESIVE_USCS)
             )
             df.loc[missing, rd_col] = (
                 np.sqrt(n1_60[missing] / 60.0) * 100.0
@@ -696,7 +674,7 @@ class GeotechnicalPipeline:
                 print(
                     f"      [FILL] Relative Density: {filled} rows computed (Skempton 1986)")
 
-        # ── 4. Cyclic Stress Ratio (CSR) ──────────────────────────────────────
+        # 4. Cyclic Stress Ratio (CSR)
         csr_col = 'Cyclic Stress Ratio (CSR)'
         if csr_col in df.columns:
             csr_vals = 0.65 * (sigma_v / sigma_eff) * df['pga_g'] * rd
@@ -714,47 +692,33 @@ class GeotechnicalPipeline:
 
     def calculate_csr_crr(self) -> bool:
         """
-        Calculate CSR, CRR, MSF, FS, and LPI components per thesis methodology:
-        - CSR: Seed & Idriss (1971) with correct rd formula
-        - (N1)60cs: NCEER fines correction (Youd et al. 2001)
-        - CRR(7.5): Robertson-Wride / Idriss-Boulanger formula
-        - MSF: Magnitude Scaling Factor (Idriss 1999)
-        - LPI: Liquefaction Potential Index components (Iwasaki et al. 1978)
-        - q_actual: Default building contact pressure 50 kPa (Bowles 1988)
+        Calculate CSR, CRR, MSF, FS, and LPI components per thesis methodology.
         """
         print("\n" + "="*80)
         print("STEP 3: CSR/CRR ANALYSIS (Thesis Methodology)")
         print("="*80)
 
         df = self.processed_data.copy()
-        gamma_water = 9.81  # kN/m³
+        gamma_water = 9.81
 
-        # ── Magnitude (Mw) ────────────────────────────────────────────────────
-        # Fixed at 6.5 for Tarlac region (same as thesis)
         MAGNITUDE_MW = 6.5
         df['magnitude_mw'] = MAGNITUDE_MW
         print(f"  Magnitude (Mw): {MAGNITUDE_MW} (Tarlac seismic zone)")
 
-        # ── Magnitude Scaling Factor (MSF) ────────────────────────────────────
-        # Idriss (1999): MSF = 10^2.24 / Mw^2.56
         MSF = (10 ** 2.24) / (MAGNITUDE_MW ** 2.56)
         df['msf'] = MSF
         print(f"  MSF: {MSF:.6f}")
 
-        # ── q_actual (building contact pressure) ──────────────────────────────
-        Q_ACTUAL = 50.0  # kPa — default from thesis (Without Liq sheet)
+        Q_ACTUAL = 50.0
         df['q_actual_kpa'] = Q_ACTUAL
         print(
             f"  q_actual: {Q_ACTUAL} kPa (default building contact pressure)")
 
-        # ── SPT N-values ──────────────────────────────────────────────────────
-        df['spt_n60'] = df['spt_n_value'] * 1.0   # N60 (field N value)
+        df['spt_n60'] = df['spt_n_value'] * 1.0
         n1_60 = pd.to_numeric(df.get('Corrected SPT-N Value (N1(60))', df['spt_n_value']),
                               errors='coerce').fillna(df['spt_n_value'])
-        # N1(60) — overburden-corrected
         df['spt_n160'] = n1_60
 
-        # ── Overburden pressures ──────────────────────────────────────────────
         df['total_overburden_pressure'] = df['unit_weight'] * df['depth_mid_m']
         depth_below_wt = np.maximum(
             0, df['depth_mid_m'] - df['groundwater_depth_m'])
@@ -762,7 +726,6 @@ class GeotechnicalPipeline:
             df['total_overburden_pressure'] - gamma_water * depth_below_wt
         ).clip(lower=1.0)
 
-        # ── rd: Stress reduction coefficient (Seed & Idriss 1971) ─────────────
         z = df['depth_mid_m']
         rd = np.where(z <= 9.15,
                       1.0 - 0.00765 * z,
@@ -771,31 +734,21 @@ class GeotechnicalPipeline:
                                0.0))
         rd = np.clip(rd, 0.0, 1.0)
 
-        # ── CSR (Cyclic Stress Ratio) — thesis formula ────────────────────────
-        # CSR = 0.65 × (σv/σ'v) × (amax/g) × rd   (pga_g already in g units)
         print("  Calculating CSR (Seed & Idriss 1971)...")
         df['csr'] = (0.65
                      * df['pga_g']
                      * (df['total_overburden_pressure'] / df['effective_overburden_pressure'])
                      * rd)
 
-        # ── (N1)60cs: Fines-corrected SPT (NCEER, Youd et al. 2001) ──────────
         print("  Computing (N1)60cs with fines correction (NCEER)...")
         FC = df['fines_content'].clip(lower=0.1)
-        # Coefficients α, β
         alpha = np.where(FC < 5.0,  0.0,
-                         np.where(FC <= 35.0,
-                                  np.exp(1.76 - 190.0 / FC**2),
-                                  5.0))
+                         np.where(FC <= 35.0, np.exp(1.76 - 190.0 / FC**2), 5.0))
         beta = np.where(FC < 5.0,  1.0,
-                        np.where(FC <= 35.0,
-                                 0.99 + FC**1.5 / 1000.0,
-                                 1.2))
+                        np.where(FC <= 35.0, 0.99 + FC**1.5 / 1000.0, 1.2))
         df['n1_60cs'] = alpha + beta * df['spt_n160']
 
-        # ── CRR(7.5): Robertson-Wride / Idriss-Boulanger (capped at 0.6) ─────
         print("  Calculating CRR(7.5) (Robertson-Wride formula)...")
-        # cap before exp to avoid overflow
         N = df['n1_60cs'].clip(upper=30.0)
         crr_raw = np.exp(
             N / 14.1
@@ -804,20 +757,16 @@ class GeotechnicalPipeline:
             + (N / 25.4) ** 4
             - 2.67
         )
-        # Cap at 0.6 for (N1)60cs ≥ 30 (NCEER / Idriss-Boulanger guideline)
         df['crr'] = np.where(df['n1_60cs'] >= 30.0, 0.6,
                              crr_raw.clip(0.0, 0.6))
 
-        # ── Factor of Safety (magnitude-adjusted) ────────────────────────────
         df['factor_of_safety'] = (df['crr'] * MSF) / (df['csr'] + 1e-9)
 
-        # ── LPI components (Iwasaki et al. 1978) ─────────────────────────────
         df['lpi_weighing_factor'] = np.maximum(
             0.0, 10.0 - 0.5 * df['depth_mid_m'])
         df['lpi_severity_factor'] = np.maximum(
             0.0, 1.0 - df['factor_of_safety'])
 
-        # ── Liquefaction probability ──────────────────────────────────────────
         df['liquefaction_probability'] = np.where(
             df['factor_of_safety'] < 1.0,
             (1.0 - df['factor_of_safety']) * 100,
@@ -839,20 +788,6 @@ class GeotechnicalPipeline:
     def calculate_bearing_bowles(self) -> bool:
         """
         Bearing capacity and settlement per Bowles (1988) / Meyerhof (1956) SPT method.
-
-        Foundation defaults (matching thesis 'Without Liq' sheet):
-          B = 2.0 m  (width)
-          D = 1.5 m  (embedment depth)
-          q_actual = 50 kPa  (building contact pressure)
-          Si_allow = 25 mm   (allowable settlement)
-
-        Formulas:
-          Kd        = 1 + 0.33 × (D/B)
-          φ (deg)   = 27.1 + 0.3×N – 0.00054×N²  (Peck 1974 via SPT)
-          Nq, Nγ    = Meyerhof bearing capacity factors
-          Qu (kPa)  = q×Nq×Fqs + 0.5×γ×B×Nγ×Fγs  (no depth factors)
-          Qa (kPa)  = Qu / 3  (design FS = 3)
-          Settlement= (q_actual / Qa) × Si_allow
         """
         print("\n" + "="*80)
         print("STEP 3b: BEARING CAPACITY & SETTLEMENT (Bowles 1988)")
@@ -860,44 +795,35 @@ class GeotechnicalPipeline:
 
         df = self.processed_data.copy()
 
-        B = 2.0        # Foundation width (m)
-        D = 1.5        # Embedment depth (m)
-        SI_ALLOW = 25.0  # Allowable settlement (mm)
-        FS_DESIGN = 3.0  # Design factor of safety
+        B = 2.0
+        D = 1.5
+        SI_ALLOW = 25.0
+        FS_DESIGN = 3.0
 
-        # Depth factor per Bowles
         Kd = 1.0 + 0.33 * (D / B)
         df['foundation_kd'] = Kd
 
-        # N-value for bearing (use N1(60) column if available)
         N = df['spt_n160'].clip(lower=1.0)
 
-        # Friction angle from SPT – Peck (1974)
         phi_deg = (27.1 + 0.3 * N - 0.00054 * N **
                    2).clip(lower=25.0, upper=45.0)
         phi_rad = np.radians(phi_deg)
 
-        # Meyerhof bearing capacity factors
         Nq = np.exp(np.pi * np.tan(phi_rad)) * \
             np.tan(np.radians(45) + phi_rad / 2) ** 2
         Ng = 2.0 * (Nq + 1.0) * np.tan(phi_rad)
 
-        # Shape factors for square footing (B = L)
-        Fqs = 1.0 + np.tan(phi_rad)          # = 1 + tan(φ)
-        Fgs = 0.6                              # = 1 – 0.4 for square
+        Fqs = 1.0 + np.tan(phi_rad)
+        Fgs = 0.6
 
-        # Overburden at foundation level q = γ × D
         q_overburden = df['unit_weight'] * D
 
-        # Ultimate bearing capacity (no separate depth factors — thesis pattern)
         Qu = q_overburden * Nq * Fqs + 0.5 * df['unit_weight'] * B * Ng * Fgs
         df['bearing_qu_kpa'] = Qu.clip(lower=0.0)
 
-        # Allowable bearing capacity (FS_design = 3)
         Qa = Qu / FS_DESIGN
         df['bearing_qa_kpa'] = Qa.clip(lower=1.0)
 
-        # Settlement = (q_actual / Qa) × Si_allow  [mm]
         df['settlement_mm'] = (df['q_actual_kpa'] /
                                df['bearing_qa_kpa']) * SI_ALLOW
 
@@ -924,42 +850,24 @@ class GeotechnicalPipeline:
 
         df = self.processed_data.copy()
 
-        # DPWH BSDS (2013) Liquefaction Screening Criteria
-        # Based on SPT N-value, fines content, and depth
-
         def dpwh_classify(row):
-            spt_n = row['spt_n_value']
-            fines = row['fines_content']
-            depth = row['depth_mid_m']
             fs = row['factor_of_safety']
-
-            # Very High Risk: FS < 0.8
             if fs < 0.8:
                 return 'VERY HIGH', 'LIQUEFIES'
-
-            # High Risk: 0.8 <= FS < 1.0
             if fs < 1.0:
                 return 'HIGH', 'LIQUEFIES'
-
-            # Medium Risk: 1.0 <= FS < 1.2
             if fs < 1.2:
                 return 'MEDIUM', 'MARGINAL'
-
-            # Low Risk: 1.2 <= FS < 1.5
             if fs < 1.5:
                 return 'LOW', 'UNLIKELY'
-
-            # Very Low Risk: FS >= 1.5
             return 'VERY LOW', 'NO LIQUEFACTION'
 
-        # Apply classification
         classification = df.apply(dpwh_classify, axis=1)
         df['liquefaction_risk_level'] = classification.apply(lambda x: x[0])
         df['liquefaction_status'] = classification.apply(lambda x: x[1])
         df['liquefaction'] = df['liquefaction_risk_level'].isin(
             ['VERY HIGH', 'HIGH']).astype(int)
 
-        # Summary
         risk_counts = df['liquefaction_risk_level'].value_counts()
         print("\n  Classification Summary:")
         for risk_level, count in risk_counts.items():
@@ -981,30 +889,25 @@ class GeotechnicalPipeline:
 
         df = self.processed_data.copy()
 
-        # Depth features
         df['depth_thickness_m'] = df['depth_to_m'] - df['depth_from_m']
         df['depth_to_groundwater_m'] = df['groundwater_depth_m'] - df['depth_mid_m']
         df['is_below_groundwater'] = (
             df['depth_mid_m'] > df['groundwater_depth_m']).astype(int)
         df['depth_normalized'] = df['depth_mid_m'] / 15.0
 
-        # SPT features
         df['spt_n_log'] = np.log1p(df['spt_n_value'])
         df['spt_n160_log'] = np.log1p(df['spt_n160'])
         df['relative_density_from_spt'] = np.clip(
             np.sqrt(df['spt_n160'] / 60) * 100, 0, 100)
 
-        # Stress features
         df['effective_stress_ratio'] = df['effective_overburden_pressure'] / \
             (df['total_overburden_pressure'] + 1)
 
-        # Soil classification
         df['is_clean_sand'] = (df['fines_content'] < 5).astype(int)
         df['is_silty_sand'] = ((df['fines_content'] >= 5) & (
             df['fines_content'] < 35)).astype(int)
         df['is_fine_grained'] = (df['fines_content'] >= 35).astype(int)
 
-        # Interaction features
         df['depth_spt_interaction'] = df['depth_mid_m'] * df['spt_n_value']
         df['csr_depth_interaction'] = df['csr'] * df['depth_mid_m']
 
@@ -1020,40 +923,28 @@ class GeotechnicalPipeline:
 
         df = self.processed_data.copy()
 
-        # Select and order columns for CSV export — clean names only, no duplicates
         output_columns = [
-            # Identifiers
             'borehole_id', 'municipality', 'Depth_Layer',
-            # Coordinates
             'latitude', 'longitude',
-            # Depth
             'depth_from_m', 'depth_to_m', 'depth_mid_m',
-            # SPT
             'spt_n_value', 'spt_n160',
-            # Soil description
             'uscs_symbol', 'soil_type', 'soil_description',
-            # Soil properties
             'unit_weight', 'fines_content', 'groundwater_depth_m',
             'friction_angle', 'moisture_content', 'plasticity_index', 'mean_particle_size_d50',
             'relative_density_percent', 'elastic_modulus_es',
-            # Seismic / liquefaction analysis
             'pga_g', 'csr', 'cyclic_strength_ratio',
             'effective_overburden_pressure', 'total_overburden_pressure',
             'factor_of_safety', 'liquefaction_probability', 'liquefaction',
             'liquefaction_risk_level', 'liquefaction_status',
         ]
 
-        # Select available columns (only those present in df)
         available_cols = [col for col in output_columns if col in df.columns]
-
         df_export = df[available_cols].copy()
 
-        # Fill any remaining NaN with appropriate defaults
         numeric_cols = df_export.select_dtypes(include=[np.number]).columns
         for col in numeric_cols:
             df_export[col] = df_export[col].fillna(0)
 
-        # Upload to Supabase Storage in cleaned/ folder (no local file)
         if not self.client:
             print("  [WARNING] No database connection - cannot upload to storage")
             return False
@@ -1062,39 +953,27 @@ class GeotechnicalPipeline:
             bucket_name = os.getenv(
                 'SUPABASE_STORAGE_BUCKET', 'geotechnical-data')
             storage_path = "cleaned/Cleaned_data.csv"
-            old_storage_path = "old_cleaned_data/Cleaned_data.csv"
 
-            # Check if Cleaned_data.csv exists and move it to old_cleaned_data/ folder
             try:
-                # Try to download existing file
                 existing_file = self.client.storage.from_(
                     bucket_name).download(storage_path)
                 if existing_file:
-                    # Move old file to old_cleaned_data/ folder with timestamp
                     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                     old_path_with_timestamp = f"old_cleaned_data/Cleaned_data_{timestamp}.csv"
-
-                    # Upload old file to archive folder
                     self.client.storage.from_(bucket_name).upload(
                         old_path_with_timestamp,
                         existing_file,
                         file_options={
                             'content-type': 'text/csv', 'upsert': 'true'}
                     )
-
-                    # Delete old file from cleaned/ folder
                     self.client.storage.from_(
                         bucket_name).remove([storage_path])
                     print(
                         f"  [OK] Archived old file to: {old_path_with_timestamp}")
             except:
-                # File doesn't exist, that's fine
                 pass
 
-            # Create CSV as bytes (no physical file)
             csv_bytes = df_export.to_csv(index=False).encode('utf-8')
-
-            # Upload new file as Cleaned_data.csv
             self.client.storage.from_(bucket_name).upload(
                 storage_path,
                 csv_bytes,
@@ -1121,8 +1000,7 @@ class GeotechnicalPipeline:
         print("CONNECTING TO POSTGIS DATABASE")
         print("="*80)
 
-        # Try multiple environment variable names (PowerShell and bash compatible)
-        supabase_url = os.getenv('SUPABASE_URL') or os.getenv('SUPABASE_URL')
+        supabase_url = os.getenv('SUPABASE_URL')
         supabase_key = os.getenv(
             'SUPABASE_SERVICE_ROLE_KEY') or os.getenv('SUPABASE_KEY')
 
@@ -1140,7 +1018,6 @@ class GeotechnicalPipeline:
 
         try:
             self.client = create_client(supabase_url, supabase_key)
-            # Test connection
             self.client.table('municipalities').select('id').limit(1).execute()
             print("  [OK] Connected to PostGIS database")
             return True
@@ -1181,14 +1058,12 @@ class GeotechnicalPipeline:
 
             muni_name = str(muni_name).strip()
             try:
-                # Check if exists
                 result = self.client.table('municipalities').select(
                     'id, name').eq('name', muni_name).execute()
 
                 if result.data and len(result.data) > 0:
                     self.municipality_ids[muni_name] = result.data[0]['id']
                 else:
-                    # Insert new
                     insert_data = {
                         'name': muni_name,
                         'description': f'Municipality in Tarlac Province'
@@ -1206,7 +1081,7 @@ class GeotechnicalPipeline:
         return True
 
     def upsert_boreholes(self) -> bool:
-        """Upsert boreholes following schema (directly linked to municipalities)"""
+        """Upsert boreholes following schema"""
         print("\n  Step 7.2: Upserting boreholes...")
 
         df = self.processed_data
@@ -1217,7 +1092,6 @@ class GeotechnicalPipeline:
             print("    [ERROR] No borehole ID column found")
             return False
 
-        # Get unique boreholes
         borehole_groups = df.groupby(borehole_col.name).first()
 
         skipped_count = 0
@@ -1228,14 +1102,13 @@ class GeotechnicalPipeline:
 
             if not muni_name or muni_name not in self.municipality_ids:
                 skipped_count += 1
-                if skipped_count <= 3:  # Show first 3 skipped
+                if skipped_count <= 3:
                     print(
                         f"    [SKIP] Borehole {borehole_id_str}: Municipality '{muni_name}' not found")
                 continue
 
             municipality_id = self.municipality_ids[muni_name]
 
-            # Get coordinates
             lat = self.safe_float(row.get('Latitude', row.get('latitude')))
             lon = self.safe_float(row.get('Longitude', row.get('longitude')))
 
@@ -1247,7 +1120,6 @@ class GeotechnicalPipeline:
                 continue
 
             try:
-                # Check if exists
                 result = self.client.table('boreholes').select(
                     'id').eq('borehole_id', borehole_id_str).execute()
 
@@ -1256,20 +1128,15 @@ class GeotechnicalPipeline:
                     print(
                         f"    Found existing: {borehole_id_str} (ID: {result.data[0]['id']})")
                 else:
-                    # Insert new - schema needs municipality_id column (barangay table removed)
-                    # Try with municipality_id, if it fails, the database schema needs updating
                     insert_data = {
                         'borehole_id': borehole_id_str,
                         'latitude': lat,
                         'longitude': lon,
                         'elevation': self.safe_float(row.get('Elevation', row.get('elevation'))),
-                        'depth_total_m': 15.0,  # Default, can be calculated from max depth
-                        'remarks': f'Data from {muni_name}'
+                        'depth_total_m': 15.0,
+                        'remarks': f'Data from {muni_name}',
+                        'municipality_id': municipality_id
                     }
-
-                    # Add municipality_id - database schema must have this column
-                    # If error occurs, update boreholes table to replace barangay_id with municipality_id
-                    insert_data['municipality_id'] = municipality_id
                     result = self.client.table(
                         'boreholes').insert(insert_data).execute()
                     if result.data and len(result.data) > 0:
@@ -1303,7 +1170,6 @@ class GeotechnicalPipeline:
 
         df = self.processed_data.copy()
 
-        # Map depth layers to layer numbers
         depth_layer_map = {}
         unique_layers = df['Depth_Layer'].unique()
         for i, layer_name in enumerate(sorted(unique_layers), 1):
@@ -1318,17 +1184,16 @@ class GeotechnicalPipeline:
 
             if not borehole_record_id:
                 skipped_count += 1
-                if skipped_count <= 3:  # Show first 3 skipped
+                if skipped_count <= 3:
                     print(
                         f"    [SKIP] Soil layer: Borehole '{borehole_id_str}' not found in boreholes table")
-                continue  # Skip if borehole not found
+                continue
 
             layer_number = depth_layer_map.get(row['Depth_Layer'], 1)
             depth_range = f"{row['depth_from_m']:.1f}-{row['depth_to_m']:.1f}m"
 
-            # Build record following schema
             record = {
-                'borehole_id': borehole_record_id,  # FK to boreholes.id
+                'borehole_id': borehole_record_id,
                 'layer_number': int(layer_number),
                 'depth_from_m': self.safe_float(row['depth_from_m']),
                 'depth_to_m': self.safe_float(row['depth_to_m']),
@@ -1343,14 +1208,12 @@ class GeotechnicalPipeline:
                 'groundwater_depth_m': self.safe_float(row['groundwater_depth_m']),
                 'pga_g': self.safe_float(row['pga_g']),
                 'csr': self.safe_float(row['csr']),
-                # CRR stored as cyclic_strength_ratio
                 'cyclic_strength_ratio': self.safe_float(row.get('crr')),
                 'liquefaction': bool(row.get('liquefaction', 0)) if pd.notna(row.get('liquefaction')) else False,
                 'liquefaction_risk_level': self.safe_str(row.get('liquefaction_risk_level')),
                 'effective_overburden_pressure': self.safe_float(row['effective_overburden_pressure']),
                 'total_overburden_pressure': self.safe_float(row['total_overburden_pressure']),
                 'relative_density_percent': self.safe_float(row.get('relative_density_percent')),
-                # ── Thesis analysis fields ────────────────────────────────────
                 'magnitude_mw': self.safe_float(row.get('magnitude_mw')),
                 'msf': self.safe_float(row.get('msf')),
                 'n1_60cs': self.safe_float(row.get('n1_60cs')),
@@ -1363,7 +1226,6 @@ class GeotechnicalPipeline:
                 'lpi_severity_factor': self.safe_float(row.get('lpi_severity_factor')),
             }
 
-            # Add optional fields if available
             if 'moisture_content' in row.index and pd.notna(row.get('moisture_content')):
                 record['moisture_content'] = self.safe_float(
                     row['moisture_content'])
@@ -1383,14 +1245,12 @@ class GeotechnicalPipeline:
                 record['mean_particle_size_d50'] = self.safe_float(
                     row['mean_particle_size_d50'])
 
-            # Elastic Modulus
             if 'Elastic Modulus (Es) (MN/m²)' in row and pd.notna(row['Elastic Modulus (Es) (MN/m²)']):
                 record['elastic_modulus_es'] = self.safe_float(
                     row['Elastic Modulus (Es) (MN/m²)'])
 
             records.append(record)
 
-        # New thesis analysis columns (may not exist if migration hasn't been run)
         THESIS_COLUMNS = {
             'magnitude_mw', 'msf', 'n1_60cs', 'q_actual_kpa', 'foundation_kd',
             'bearing_qu_kpa', 'bearing_qa_kpa', 'settlement_mm',
@@ -1400,10 +1260,9 @@ class GeotechnicalPipeline:
         def strip_thesis_columns(batch):
             return [{k: v for k, v in r.items() if k not in THESIS_COLUMNS} for r in batch]
 
-        # Insert in batches
         batch_size = 25
         total_inserted = 0
-        schema_fallback = False  # once triggered, all remaining batches skip new cols
+        schema_fallback = False
 
         for i in range(0, len(records), batch_size):
             batch = records[i:i+batch_size]
@@ -1421,7 +1280,6 @@ class GeotechnicalPipeline:
                         f"    Inserted batch {batch_num}: {len(batch)} records (without thesis cols — run SQL migration)")
             except Exception as e:
                 err_str = str(e)
-                # PGRST204: column not found — schema migration not yet applied
                 if 'PGRST204' in err_str or 'schema cache' in err_str:
                     if not schema_fallback:
                         print(
@@ -1481,15 +1339,12 @@ class GeotechnicalPipeline:
         print("  Following schema hierarchy: municipalities → boreholes → soil_layers")
 
         try:
-            # Step 1: Upsert municipalities
             if not self.upsert_municipalities():
                 return False
 
-            # Step 2: Upsert boreholes (directly linked to municipalities)
             if not self.upsert_boreholes():
                 return False
 
-            # Step 3: Insert soil layers
             if not self.store_soil_layers():
                 return False
 
@@ -1541,17 +1396,14 @@ class GeotechnicalPipeline:
         print(f"Output: Supabase Storage (cleaned/ folder)")
         print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 
-        # Step 0: Connect database early so upload_raw_file_to_bucket can use it
         if not self.client:
             self.connect_database()
 
-        # Step 0a: Download from storage if needed
         if not self.excel_path and self.use_storage:
             if not self.download_from_supabase_storage():
                 print("\n[ERROR] Failed to download from Supabase Storage")
                 return False
 
-        # Step 0b: Upload local raw file to bucket (raw/ folder)
         self.upload_raw_file_to_bucket()
 
         steps = [
@@ -1573,7 +1425,6 @@ class GeotechnicalPipeline:
 
         self.print_validation_report()
 
-        # Optional: Store to PostGIS database (reuse connection if available)
         db_connected = self.connect_database()
         if db_connected:
             if self.store_to_postgis():
@@ -1598,9 +1449,8 @@ def main():
     """Main execution"""
     import sys
 
-    # Default to Supabase Storage if no argument provided
     if len(sys.argv) < 2:
-        excel_file = None  # Will download from storage
+        excel_file = None
         output_csv = None
         print(
             f"[INFO] No file specified, will download from Supabase Storage (raw/Raw_data.xlsx)")
@@ -1608,7 +1458,6 @@ def main():
         excel_file = sys.argv[1]
         output_csv = sys.argv[2] if len(sys.argv) > 2 else None
 
-    # Check if environment variables are loaded from .env
     supabase_url = os.getenv('SUPABASE_URL')
     supabase_key = os.getenv('SUPABASE_SERVICE_ROLE_KEY')
 
