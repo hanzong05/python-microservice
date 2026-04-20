@@ -442,9 +442,10 @@ class MultiOutputANNTraining:
         print("  Preparing TARGET 2: Foundation Depth D (m) ...")
         print("  Preparing TARGET 3: L/B Ratio (-) ...")
 
-        y_B = df['foundation_width_m']
-        y_D = df['foundation_depth_m']
-        y_lb = df['lb_ratio']
+        foundation_targets = df.apply(self.compute_foundation_targets, axis=1)
+        y_B  = foundation_targets.apply(lambda r: r['B'])
+        y_D  = foundation_targets.apply(lambda r: r['D'])
+        y_lb = foundation_targets.apply(lambda r: r['lb_ratio'])
 
         # Remove rows with missing targets (all computed so should be none)
         valid_mask = ~(y_B.isna() | y_D.isna() | y_lb.isna())
