@@ -8,6 +8,7 @@ Changes made:
 - Removed L/B output because it was constant at 1.0.
 - Predicts only: Foundation Width B (m), Foundation Depth D (m).
 - Strictly cleans invalid rows before training.
+- Uses 100% of cleaned data for training; no 80/20 split.
 
 Model:
 - Inputs: available raw soil features only
@@ -37,7 +38,6 @@ except ImportError:
 
 try:
     from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
-    from sklearn.model_selection import train_test_split
     from sklearn.neural_network import MLPRegressor
     from sklearn.preprocessing import StandardScaler
     import joblib
@@ -56,7 +56,7 @@ except ImportError:
     SUPABASE_AVAILABLE = False
 
 
-class NoLeakageANNTraining:
+class MultiOutputANNTraining:
     """
     ANN training without target leakage.
 
@@ -69,7 +69,6 @@ class NoLeakageANNTraining:
         self.client = None
         self.df = None
         self.df_raw = None
-        self.df_validation = None
 
         self.feature_names = []
         self.scaler = None
@@ -77,12 +76,9 @@ class NoLeakageANNTraining:
         self.width_model = None
         self.depth_model = None
 
-        self.X_train = None
-        self.X_test = None
-        self.y_B_train = None
-        self.y_B_test = None
-        self.y_D_train = None
-        self.y_D_test = None
+        self.X_all = None
+        self.y_B_all = None
+        self.y_D_all = None
 
     def connect_database(self) -> bool:
         print("\n" + "=" * 80)
@@ -324,24 +320,17 @@ class NoLeakageANNTraining:
 
         self.feature_names = feature_cols
 
-        self.X_train, self.X_test, self.y_B_train, self.y_B_test = train_test_split(
-            X, y_B, test_size=0.2, random_state=42
-        )
-        _, _, self.y_D_train, self.y_D_test = train_test_split(
-            X, y_D, test_size=0.2, random_state=42
-        )
-
-        val_indices = self.X_test.index
-        val_raw = self.df_raw.loc[val_indices].copy().reset_index(drop=True)
-        val_raw["_target_foundation_width_B_m"] = self.y_B_test.values
-        val_raw["_target_foundation_depth_D_m"] = self.y_D_test.values
-        self.df_validation = val_raw
+        # Use the WHOLE cleaned dataset for model fitting.
+        # No 80/20 segregation is done here.
+        self.X_all = X
+        self.y_B_all = y_B
+        self.y_D_all = y_D
 
         print(f"\n  Features shape: {X.shape}")
         print(f"  Target B: Mean={y_B.mean():.2f} m, Range=[{y_B.min():.2f}, {y_B.max():.2f}] m")
         print(f"  Target D: Mean={y_D.mean():.2f} m, Range=[{y_D.min():.2f}, {y_D.max():.2f}] m")
-        print(f"  Training set: {len(self.X_train)} samples")
-        print(f"  Validation set: {len(self.X_test)} samples")
+        print(f"  Training set: {len(self.X_all)} samples (100% of cleaned data)")
+        print("  Validation split: disabled")
         return True
 
     def train_models(self) -> bool:
@@ -351,15 +340,15 @@ class NoLeakageANNTraining:
         print("\n" + "=" * 80)
         print("TRAINING NO-LEAKAGE ANN MODEL")
         print("=" * 80)
-        print(f"  INPUT LAYER: {self.X_train.shape[1]} neurons")
+        print(f"  INPUT LAYER: {self.X_all.shape[1]} neurons")
         print("  HIDDEN 1: 30 neurons, tanh")
         print("  HIDDEN 2: 15 neurons, tanh")
         print("  OUTPUT: 2 neurons, linear [B, D]")
 
         self.scaler = StandardScaler()
-        X_train_scaled = self.scaler.fit_transform(self.X_train)
+        X_all_scaled = self.scaler.fit_transform(self.X_all)
 
-        y_train = np.column_stack([self.y_B_train, self.y_D_train])
+        y_train = np.column_stack([self.y_B_all, self.y_D_all])
 
         mlp_kwargs = dict(
             hidden_layer_sizes=(30, 15),
@@ -368,23 +357,22 @@ class NoLeakageANNTraining:
             alpha=0.001,
             learning_rate="adaptive",
             max_iter=2000,
-            early_stopping=True,
-            validation_fraction=0.1,
+            early_stopping=False,
             n_iter_no_change=30,
             random_state=42,
             verbose=False,
         )
 
         self.multi_model = MLPRegressor(**mlp_kwargs)
-        self.multi_model.fit(X_train_scaled, y_train)
+        self.multi_model.fit(X_all_scaled, y_train)
         print(f"  [OK] Multi-output model completed in {self.multi_model.n_iter_} iterations")
 
         self.width_model = MLPRegressor(**mlp_kwargs)
-        self.width_model.fit(X_train_scaled, self.y_B_train)
+        self.width_model.fit(X_all_scaled, self.y_B_all)
         print("  [OK] Foundation width model trained")
 
         self.depth_model = MLPRegressor(**mlp_kwargs)
-        self.depth_model.fit(X_train_scaled, self.y_D_train)
+        self.depth_model.fit(X_all_scaled, self.y_D_all)
         print("  [OK] Foundation depth model trained")
         return True
 
@@ -393,7 +381,8 @@ class NoLeakageANNTraining:
         print("MODEL EVALUATION")
         print("=" * 80)
 
-        X_test_scaled = self.scaler.transform(self.X_test)
+        print("  NOTE: Since the 80/20 split is disabled, these metrics are training-fit metrics, not independent validation metrics.")
+        X_all_scaled = self.scaler.transform(self.X_all)
 
         def reg_metrics(name, y_true, y_pred, unit=""):
             r2 = r2_score(y_true, y_pred)
@@ -407,58 +396,23 @@ class NoLeakageANNTraining:
             print(f"    PI  : {pi:.4f}")
             return {"r2": r2, "mae": mae, "rmse": rmse, "pi": pi}
 
-        y_pred = self.multi_model.predict(X_test_scaled)
-        reg_metrics("Multi-output Foundation Width B", self.y_B_test, y_pred[:, 0], " m")
-        reg_metrics("Multi-output Foundation Depth D", self.y_D_test, y_pred[:, 1], " m")
+        y_pred = self.multi_model.predict(X_all_scaled)
+        reg_metrics("Multi-output Foundation Width B", self.y_B_all, y_pred[:, 0], " m")
+        reg_metrics("Multi-output Foundation Depth D", self.y_D_all, y_pred[:, 1], " m")
 
-        y_B_pred = self.width_model.predict(X_test_scaled)
-        y_D_pred = self.depth_model.predict(X_test_scaled)
-        reg_metrics("Individual Foundation Width B", self.y_B_test, y_B_pred, " m")
-        reg_metrics("Individual Foundation Depth D", self.y_D_test, y_D_pred, " m")
+        y_B_pred = self.width_model.predict(X_all_scaled)
+        y_D_pred = self.depth_model.predict(X_all_scaled)
+        reg_metrics("Individual Foundation Width B", self.y_B_all, y_B_pred, " m")
+        reg_metrics("Individual Foundation Depth D", self.y_D_all, y_D_pred, " m")
         return True
 
     def export_validation_excel(self) -> str:
+        """Validation export disabled because training now uses 100% of cleaned data."""
         print("\n" + "=" * 80)
-        print("EXPORTING VALIDATION DATA")
+        print("VALIDATION EXPORT SKIPPED")
         print("=" * 80)
-
-        if self.df_validation is None:
-            print("  [ERROR] Validation dataframe not available")
-            return ""
-
-        try:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"validation_no_leakage_20pct_{timestamp}.xlsx"
-            storage_path = f"validation/{filename}"
-            bucket_name = os.getenv("SUPABASE_STORAGE_BUCKET", "geotechnical-data")
-
-            buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                pd.DataFrame({
-                    "Project": ["Geotechnical Investigation"],
-                    "Data Status": ["No-leakage validation set, 20% split"],
-                    "Outputs": ["Foundation Width B, Foundation Depth D"],
-                    "Removed Outputs": ["L/B Ratio"],
-                    "Removed Leakage Features": ["factor_of_safety, csr, crr, cyclic_strength_ratio"],
-                    "Total Samples": [len(self.df_validation)],
-                }).to_excel(writer, sheet_name="Summary", index=False)
-
-                self.df_validation.to_excel(writer, sheet_name="Validation_Data", index=False)
-
-            file_bytes = buf.getvalue()
-            self.client.storage.from_(bucket_name).upload(
-                storage_path,
-                file_bytes,
-                file_options={
-                    "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    "upsert": "true",
-                },
-            )
-            print(f"  [OK] Uploaded to bucket '{bucket_name}' -> {storage_path}")
-            return filename
-        except Exception as e:
-            print(f"  [WARNING] Validation export failed: {e}")
-            return ""
+        print("  80/20 segregation is disabled; processing whole cleaned dataset now.")
+        return ""
 
     def save_models(self) -> bool:
         print("\n" + "=" * 80)
@@ -505,8 +459,9 @@ class NoLeakageANNTraining:
                     "output_activation": "linear",
                     "solver": "adam",
                 },
-                "training_samples": len(self.X_train),
-                "validation_samples": len(self.X_test),
+                "training_samples": len(self.X_all),
+                "validation_samples": 0,
+                "data_split": "none - 100% cleaned data used for training",
                 "timestamp": datetime.now().isoformat(),
             }
 
@@ -550,8 +505,7 @@ class NoLeakageANNTraining:
         print("  Outputs: B and D only")
         print("  Removed leakage: factor_of_safety, csr, crr/cyclic_strength_ratio")
         print("  Removed output: L/B ratio")
-        if validation_file:
-            print(f"  Validation file: validation/{validation_file}")
+        print("  Data split: none, 100% cleaned data used for training")
         return True
 
 
@@ -559,7 +513,7 @@ def main():
     if not SKLEARN_AVAILABLE:
         sys.exit(1)
 
-    trainer = NoLeakageANNTraining()
+    trainer = MultiOutputANNTraining()
     success = trainer.run()
     if not success:
         sys.exit(1)

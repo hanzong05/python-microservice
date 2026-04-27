@@ -38,16 +38,16 @@ except ImportError:
 try:
     from pipeline import GeotechnicalPipeline
     PIPELINE_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     PIPELINE_AVAILABLE = False
-    print("[WARNING] Pipeline module not available")
+    print(f"[WARNING] Pipeline module not available: {e}")
 
 try:
     from train_ann import MultiOutputANNTraining
     TRAINING_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     TRAINING_AVAILABLE = False
-    print("[WARNING] Training module not available")
+    print(f"[WARNING] Training module not available: {e}")
 
 app = FastAPI(
     title="Geotechnical Prediction API - Spatial Interpolation",
@@ -157,77 +157,50 @@ def get_supabase_client():
 
 
 def load_model():
-    """Load models from Supabase Storage"""
     global _scaler, _multi_model, _liq_model, _settle_model, _bearing_model, _model_metadata
+    global EXPECTED_FEATURES
 
     if _scaler is not None:
         return _scaler, _multi_model, _liq_model, _settle_model, _bearing_model, _model_metadata
 
-    print("[INFO] Loading models from Supabase Storage...")
+    print("[INFO] Loading no-leakage models from Supabase Storage...")
 
     client = get_supabase_client()
-    bucket_name = os.getenv('SUPABASE_STORAGE_BUCKET', 'geotechnical-data')
+    bucket_name = os.getenv("SUPABASE_STORAGE_BUCKET", "geotechnical-data")
 
     try:
-        scaler_data = client.storage.from_(
-            bucket_name).download('models/scaler.pkl')
+        scaler_data = client.storage.from_(bucket_name).download(
+            "models/scaler_no_leakage.pkl"
+        )
         _scaler = joblib.load(io.BytesIO(scaler_data))
-        print(
-            f"  [OK] Scaler loaded (expects {_scaler.n_features_in_} features)")
+        print(f"  [OK] No-leakage scaler loaded")
 
-        try:
-            multi_data = client.storage.from_(
-                bucket_name).download('models/ann_multi_output.pkl')
-            _multi_model = joblib.load(io.BytesIO(multi_data))
-            print("  [OK] Multi-output model loaded")
-        except:
-            _multi_model = None
+        multi_data = client.storage.from_(bucket_name).download(
+            "models/ann_multi_output_BD_no_leakage.pkl"
+        )
+        _multi_model = joblib.load(io.BytesIO(multi_data))
+        print("  [OK] No-leakage B/D model loaded")
 
-        try:
-            liq_data = client.storage.from_(bucket_name).download(
-                'models/ann_liquefaction_classifier.pkl')
-            _liq_model = joblib.load(io.BytesIO(liq_data))
-            print("  [OK] Liquefaction classifier loaded")
-        except:
-            _liq_model = None
+        _liq_model = None
+        _settle_model = None
+        _bearing_model = None
 
-        try:
-            settle_data = client.storage.from_(bucket_name).download(
-                'models/ann_settlement_regressor.pkl')
-            _settle_model = joblib.load(io.BytesIO(settle_data))
-            print("  [OK] Settlement regressor loaded")
-        except:
-            _settle_model = None
+        metadata_data = client.storage.from_(bucket_name).download(
+            "models/ann_metadata_no_leakage.json"
+        )
+        _model_metadata = json.loads(metadata_data.decode("utf-8"))
 
-        try:
-            bearing_data = client.storage.from_(bucket_name).download(
-                'models/ann_bearing_capacity_regressor.pkl')
-            _bearing_model = joblib.load(io.BytesIO(bearing_data))
-            print("  [OK] Bearing capacity regressor loaded")
-        except:
-            _bearing_model = None
+        EXPECTED_FEATURES = _model_metadata.get("feature_names", [])
 
-        try:
-            metadata_data = client.storage.from_(
-                bucket_name).download('models/ann_metadata.json')
-            _model_metadata = json.loads(metadata_data.decode('utf-8'))
-            print("  [OK] Metadata loaded")
-        except:
-            _model_metadata = {}
+        if not EXPECTED_FEATURES:
+            raise RuntimeError("No feature_names found in ann_metadata_no_leakage.json")
 
-        # Populate EXPECTED_FEATURES from metadata so inference always uses
-        # the exact same features the model was trained on
-        global EXPECTED_FEATURES
-        loaded_features = (_model_metadata or {}).get('feature_names', [])
-        if loaded_features:
-            EXPECTED_FEATURES = loaded_features
-            print(f"  [OK] Feature names loaded from metadata ({len(EXPECTED_FEATURES)} features): {EXPECTED_FEATURES}")
-        else:
-            print("  [WARNING] No feature_names in metadata — EXPECTED_FEATURES remains empty")
+        print(f"  [OK] Expected features loaded: {EXPECTED_FEATURES}")
 
         return _scaler, _multi_model, _liq_model, _settle_model, _bearing_model, _model_metadata
+
     except Exception as e:
-        print(f"  [ERROR] Failed to load models: {e}")
+        print(f"  [ERROR] Failed to load no-leakage models: {e}")
         raise
 
 
@@ -560,46 +533,54 @@ def engineer_features_from_interpolated(
     longitude: float,
     depth_m: Optional[float] = None
 ) -> pd.DataFrame:
-    """Create feature vector from interpolated parameters.
+    global EXPECTED_FEATURES
 
-    Builds the vector using exactly the feature names stored in EXPECTED_FEATURES
-    (loaded from ann_metadata.json) so inference always matches training.
-    """
-    target_depth = depth_m if depth_m else 0.0
-    unit_wt = float(interpolated_params.get('unit_weight', 18.0))
-    spt_n60 = float(interpolated_params.get('spt_n60', 20.0))
-    crr_val = float(interpolated_params.get('crr', 0.0) or interpolated_params.get('cyclic_strength_ratio', 0.2))
+    if not EXPECTED_FEATURES:
+        raise RuntimeError("EXPECTED_FEATURES is empty. Metadata was not loaded.")
 
-    # Pre-computed derived values keyed by feature name
-    derived: Dict[str, float] = {
-        'spt_n_value':                  float(interpolated_params.get('spt_n_value', 20.0)),
-        'spt_n60':                      spt_n60,
-        'spt_n160':                     spt_n60,  # best available proxy
-        'unit_weight':                  unit_wt,
-        'fines_content':                float(interpolated_params.get('fines_content', 10.0)),
-        'groundwater_depth_m':          float(interpolated_params.get('groundwater_depth_m', 5.0)),
-        'pga_g':                        float(interpolated_params.get('pga_g', 0.3)),
-        'csr':                          float(interpolated_params.get('csr', 0.2)),
-        'cyclic_strength_ratio':        crr_val,
-        'crr':                          crr_val,
-        'effective_overburden_pressure': unit_wt * max(target_depth, 1.0),
-        'total_overburden_pressure':    unit_wt * (max(target_depth, 1.0) + 1.5),
-        'depth_from_m':                 target_depth,
-        'depth_to_m':                   target_depth + 1.5,
-        'depth_mid_m':                  target_depth + 0.75,
-        'layer_number':                 1.0,
-        'elastic_modulus_es':           float(interpolated_params.get('elastic_modulus_es', 10000.0)),
-        # Approximate relative density from N60 (Skempton 1986)
-        'relative_density_percent':     min(100.0, max(0.0, (spt_n60 / 60.0) * 100.0)),
-        'moisture_content':             float(interpolated_params.get('moisture_content') or interpolated_params.get('fines_content', 15.0)),
-        'friction_angle':               float(interpolated_params.get('friction_angle', 30.0)),
-        'plasticity_index':             float(interpolated_params.get('plasticity_index', 0.0)),
-        'mean_particle_size_d50':       float(interpolated_params.get('mean_particle_size_d50', 0.1)),
+    target_depth = float(depth_m if depth_m is not None else interpolated_params.get("depth_mid_m", 1.5))
+
+    spt_n_value = float(interpolated_params.get("spt_n_value", 20.0))
+    spt_n60 = float(interpolated_params.get("spt_n60", spt_n_value))
+    spt_n160 = float(interpolated_params.get("spt_n160", spt_n60))
+
+    unit_weight = float(interpolated_params.get("unit_weight", 18.0))
+    fines_content = float(interpolated_params.get("fines_content", 10.0))
+    groundwater_depth_m = float(interpolated_params.get("groundwater_depth_m", 5.0))
+
+    derived = {
+        "spt_n_value": spt_n_value,
+        "spt_n60": spt_n60,
+        "spt_n160": spt_n160,
+        "unit_weight": unit_weight,
+        "fines_content": fines_content,
+        "friction_angle": float(interpolated_params.get("friction_angle", 30.0)),
+        "depth_mid_m": target_depth,
+        "depth_from_m": float(interpolated_params.get("depth_from_m", target_depth - 0.75)),
+        "depth_to_m": float(interpolated_params.get("depth_to_m", target_depth + 0.75)),
+        "groundwater_depth_m": groundwater_depth_m,
+        "moisture_content": float(interpolated_params.get("moisture_content", fines_content)),
+        "plasticity_index": float(interpolated_params.get("plasticity_index", 0.0)),
+        "mean_particle_size_d50": float(interpolated_params.get("mean_particle_size_d50", 0.1)),
+        "relative_density_percent": float(
+            interpolated_params.get(
+                "relative_density_percent",
+                min(100.0, max(0.0, (spt_n60 / 60.0) * 100.0))
+            )
+        ),
+        "elastic_modulus_es": float(interpolated_params.get("elastic_modulus_es", 10000.0)),
+        "pga_g": float(interpolated_params.get("pga_g", 0.3)),
     }
 
-    # Build vector in the exact column order used during training
-    features = {feat: derived.get(feat, 0.0) for feat in EXPECTED_FEATURES}
-    return pd.DataFrame([features], columns=EXPECTED_FEATURES)
+    # IMPORTANT: only use features that the no-leakage model was trained on
+    features = {feature: derived.get(feature, 0.0) for feature in EXPECTED_FEATURES}
+
+    features_df = pd.DataFrame([features], columns=EXPECTED_FEATURES)
+
+    print(f"[DEBUG] Expected features: {EXPECTED_FEATURES}")
+    print(f"[DEBUG] Input features: {features_df.columns.tolist()}")
+
+    return features_df
 
 
 @app.on_event("startup")
@@ -826,7 +807,6 @@ async def pipeline_and_train_start(background_tasks: BackgroundTasks, _: None = 
     if not PIPELINE_AVAILABLE or not TRAINING_AVAILABLE:
         raise HTTPException(
             status_code=503, detail="Pipeline or training module not available")
-
     if _pipeline_status["status"] == "running" or _training_status["status"] == "running":
         raise HTTPException(
             status_code=409, detail="Pipeline or training is already running")
@@ -947,9 +927,12 @@ async def predict(
         # ANN model predicts foundation design parameters [B (m), D (m), L/B ratio]
         if multi_model is not None:
             predictions = multi_model.predict(features_scaled)[0]
-            B_pred  = max(1.0, min(10.0, float(predictions[0])))
-            D_pred  = max(0.5, min(6.0,  float(predictions[1])))
-            lb_pred = max(1.0, min(5.0,  float(predictions[2])))
+
+            B_pred = max(1.0, min(10.0, float(predictions[0])))
+            D_pred = max(0.5, min(6.0, float(predictions[1])))
+
+            # L/B removed from model
+            lb_pred = None
         else:
             N_spt = max(1.0, float(interpolated_params.get('spt_n60', 15) or 15))
             if N_spt >= 6.0:
@@ -1192,7 +1175,6 @@ async def predict(
             foundation_recommendation={
                 "base_m": round(B_pred, 2),
                 "depth_m": round(D_pred, 2),
-                "lb_ratio": round(lb_pred, 2)
             },
             recommendations=recommendations,
             analysis_parameters={
