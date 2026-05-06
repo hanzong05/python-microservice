@@ -5,7 +5,7 @@ No-Leakage Multi-Output ANN Model Training
 Changes made:
 - Removed leakage features: factor_of_safety, csr, crr/cyclic_strength_ratio.
 - Uses raw soil properties only as inputs.
-- Removed L/B output because it was constant at 1.0.
+- Removed L/B output because it was constant at 1.0.12
 - Predicts only: Foundation Width B (m), Foundation Depth D (m).
 - Strictly cleans invalid rows before training.
 - Uses 100% of cleaned data for training; no 80/20 split.
