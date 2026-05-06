@@ -287,11 +287,16 @@ def get_borehole_all_layers(borehole_uuid: int) -> List[Dict]:
     try:
         result = client.table('soil_layers').select(
             'layer_number, depth_from_m, depth_to_m, '
-            'spt_n_value, unit_weight, fines_content, groundwater_depth_m, '
+            'spt_n_value, sample_no, unit_weight, fines_content, groundwater_depth_m, '
             'pga_g, csr, cyclic_strength_ratio, friction_angle, cohesion_kpa, '
             'elastic_modulus_es, liquefaction_risk_level, liquefaction'
         ).eq('borehole_id', borehole_uuid).order('layer_number').execute()
-        return result.data if result.data else []
+        layers = result.data if result.data else []
+        # CS (Casing Sample) indicates near-refusal; stored as 0 but should be treated as 100
+        for lyr in layers:
+            if str(lyr.get('sample_no', '')).strip().upper() == 'CS' and (lyr.get('spt_n_value') or 0) == 0:
+                lyr['spt_n_value'] = 100
+        return layers
     except Exception as e:
         print(f"[WARNING] Failed to get layers for borehole {borehole_uuid}: {e}")
         return []
@@ -835,6 +840,10 @@ async def predict(
         50.0, ge=0, description="Actual building contact pressure (kPa)"),
     magnitude: Optional[float] = Query(
         6.5, ge=4.0, le=10.0, description="Earthquake moment magnitude (Mw)"),
+    b_increment: Optional[float] = Query(
+        0.1, ge=0.05, le=0.5, description="Width increment step (m) for iterative foundation width optimisation"),
+    t_years: Optional[float] = Query(
+        None, ge=1, le=200, description="Design life / assessment period (years)"),
     _: None = Depends(verify_api_key),
 ):
     """
@@ -860,8 +869,10 @@ async def predict(
         lat, lon, depth_m, munic = latitude, longitude, depth, municipality
 
     # Ensure defaults
-    q_actual  = float(q_actual  or 50.0)
-    magnitude = float(magnitude or 6.5)
+    q_actual    = float(q_actual    or 50.0)
+    magnitude   = float(magnitude   or 6.5)
+    b_increment = float(b_increment or 0.1)
+    t_years     = float(t_years)     if t_years is not None else None
 
     if lat is None or lon is None:
         raise HTTPException(
@@ -955,11 +966,13 @@ async def predict(
 
         # ── Risk level from critical layer FS ──────────────────────────────────
         if fs_adjusted < 1.0:
-            liq_adjusted_prob = min(100.0, (1.0 - fs_adjusted) * 100)
+            # FS < 1.0 = liquefaction occurring; ensure at minimum HIGH probability
+            raw_prob = min(100.0, (1.0 - fs_adjusted) * 100)
+            liq_adjusted_prob = max(raw_prob, 40.0)
         elif fs_adjusted < 1.5:
-            liq_adjusted_prob = 30.0
+            liq_adjusted_prob = 25.0   # LOW
         else:
-            liq_adjusted_prob = 10.0
+            liq_adjusted_prob = 8.0    # VERY LOW
 
         db_risk_prob = float(interpolated_params.get('risk_probability', 0))
         if db_risk_prob > 0:
@@ -969,12 +982,14 @@ async def predict(
         else:
             liquefaction_prob = liq_adjusted_prob
 
-        if liquefaction_prob >= 60:
-            risk_level, severity = "HIGH", "Severe"
-        elif liquefaction_prob >= 30:
-            risk_level, severity = "MEDIUM", "Moderate"
+        if liquefaction_prob >= 75:
+            risk_level, severity = "VERY HIGH", "Very High"
+        elif liquefaction_prob >= 40:
+            risk_level, severity = "HIGH", "High"
+        elif liquefaction_prob >= 15:
+            risk_level, severity = "LOW", "Low"
         else:
-            risk_level, severity = "LOW", "Minor"
+            risk_level, severity = "VERY LOW", "Very Low"
 
         # ── DB override: use stored classification when within 5 km ────────────
         data_source = "ANN Model + IDW Interpolation (per-layer)"
@@ -990,15 +1005,19 @@ async def predict(
                         db_ov_weight * db_override['probability']
                         + (1.0 - db_ov_weight) * liquefaction_prob
                     )
-                    if liquefaction_prob >= 60:
-                        risk_level, severity = "HIGH", "Severe"
-                    elif liquefaction_prob >= 30:
-                        risk_level, severity = "MEDIUM", "Moderate"
+                    if liquefaction_prob >= 75:
+                        risk_level, severity = "VERY HIGH", "Very High"
+                    elif liquefaction_prob >= 40:
+                        risk_level, severity = "HIGH", "High"
+                    elif liquefaction_prob >= 15:
+                        risk_level, severity = "LOW", "Low"
                     else:
-                        risk_level, severity = "LOW", "Minor"
+                        risk_level, severity = "VERY LOW", "Very Low"
                     data_source = db_override['source']
 
         # ── Bearing capacity (Meyerhof/Bowles using ANN-predicted B and D) ─────
+        MAX_PRACTICAL_B_M = 3.0   # maximum practical shallow foundation width (m)
+        MAX_PRACTICAL_D_M = 3.0   # maximum practical shallow foundation depth (m)
         B = B_pred; D = D_pred; FS_DESIGN = 3.0; SI_ALLOW = 25.0
         N  = max(1.0, spt_n60)
         phi_deg = min(45.0, max(25.0, 27.1 + 0.3 * N - 0.00054 * N ** 2))
@@ -1011,34 +1030,45 @@ async def predict(
         qa_site = max(1.0, qu_site / FS_DESIGN)
 
         if qa_site < q_actual:
-            contrib_depth = unit_weight * D * Nq * Fqs
-            denom = 0.5 * unit_weight * Ng * Fgs
-            if denom > 0:
-                B_needed = (q_actual * FS_DESIGN - contrib_depth) / denom
-                B_needed = round(B_needed * 2) / 2
-                B = min(10.0, max(B, B_needed))
-                B_pred = B
-                qu_site = unit_weight * D * Nq * Fqs + 0.5 * unit_weight * B * Ng * Fgs
-                qa_site = max(1.0, qu_site / FS_DESIGN)
+            # Iterative width optimisation: step B by b_increment (m) until qa >= q_actual
+            B_iter = B
+            while B_iter <= MAX_PRACTICAL_B_M:
+                qu_iter = unit_weight * D * Nq * Fqs + 0.5 * unit_weight * B_iter * Ng * Fgs
+                qa_iter = max(1.0, qu_iter / FS_DESIGN)
+                if qa_iter >= q_actual:
+                    break
+                B_iter = round(B_iter + b_increment, 6)
+            B = B_iter
+            B_pred = B
+            qu_site = unit_weight * D * Nq * Fqs + 0.5 * unit_weight * B * Ng * Fgs
+            qa_site = max(1.0, qu_site / FS_DESIGN)
 
         # Pre-liquefaction settlement (Bowles)
         pre_liq_settlement_cm = (q_actual / qa_site) * SI_ALLOW / 10.0  # cm
 
         # ── Per-layer Tokimatsu & Seed (1987) settlement ───────────────────────
-        _DPWH_TO_3 = {'VERY HIGH': 'HIGH', 'HIGH': 'HIGH',
-                      'MEDIUM': 'MEDIUM', 'LOW': 'LOW', 'VERY LOW': 'LOW'}
+        # Map DPWH 5-level DB classification → our 4-level scheme
+        _DPWH_TO_4 = {
+            'VERY HIGH': 'VERY HIGH',
+            'HIGH':      'HIGH',
+            'MEDIUM':    'LOW',
+            'LOW':       'VERY LOW',
+            'VERY LOW':  'VERY LOW',
+        }
         total_settlement_cm = 0.0
         liquefiable_layers  = []
 
         for lyr in interpolated_layers:
             fs_lyr    = lyr['fs']
-            risk_3lyr = _DPWH_TO_3.get(lyr.get('liquefaction_risk_level', 'LOW'), 'LOW')
+            risk_4lyr = _DPWH_TO_4.get(lyr.get('liquefaction_risk_level', 'VERY LOW'), 'VERY LOW')
 
             # Cap FS based on stored risk level to honour DB-blended classification
-            if risk_3lyr == 'HIGH':
-                fs_settle = min(fs_lyr, 0.7)
-            elif risk_3lyr == 'MEDIUM':
-                fs_settle = min(fs_lyr, 0.9)
+            if risk_4lyr == 'VERY HIGH':
+                fs_settle = min(fs_lyr, 0.6)
+            elif risk_4lyr == 'HIGH':
+                fs_settle = min(fs_lyr, 0.8)
+            elif risk_4lyr == 'LOW':
+                fs_settle = min(fs_lyr, 0.95)
             else:
                 fs_settle = fs_lyr
 
@@ -1070,20 +1100,54 @@ async def predict(
                       f"FS={fs_lyr:.3f}, ev={ev:.2f}%, settle={lyr_settle:.2f} cm")
 
         # Apply minimum floors for HIGH/MEDIUM site risk
-        if risk_level == "HIGH":
-            total_settlement_cm = max(total_settlement_cm, 5.0)
-        elif risk_level == "MEDIUM":
-            total_settlement_cm = max(total_settlement_cm, 2.0)
+        if risk_level == "VERY HIGH":
+            total_settlement_cm = max(total_settlement_cm, 7.0)
+        elif risk_level == "HIGH":
+            total_settlement_cm = max(total_settlement_cm, 4.0)
+        elif risk_level == "LOW":
+            total_settlement_cm = max(total_settlement_cm, 1.5)
 
         settlement_cm = round(total_settlement_cm, 2) if liquefiable_layers else pre_liq_settlement_cm
 
-        # Pre / post liquefaction bearing capacity
-        pre_bearing = qa_site
-        if risk_level == "HIGH":
-            post_bearing = max(0.0, pre_bearing * 0.2)
-        elif risk_level == "MEDIUM":
-            post_bearing = max(0.0, pre_bearing * 0.6)
+        # ── Liquefaction Potential Index – Iwasaki et al. (1978) ──────────────
+        # LPI = Σ F(z) · W(z) · h   for all layers with midpoint depth ≤ 20 m
+        #   F(z) = max(0, 1 - FS)   (0 for non-liquefiable layers)
+        #   W(z) = max(0, 10 - 0.5·z)   (depth-weighting, zero below 20 m)
+        lpi = 0.0
+        for lyr in interpolated_layers:
+            z_mid = (float(lyr.get('depth_from_m', 0)) + float(lyr.get('depth_to_m', 0))) / 2.0
+            if z_mid > 20.0:
+                continue
+            h_i = float(lyr.get('layer_thickness', 1.5))
+            fs_i = lyr['fs']
+            F_i = max(0.0, 1.0 - fs_i)
+            W_i = max(0.0, 10.0 - 0.5 * z_mid)
+            lpi += F_i * W_i * h_i
+
+        lpi = round(lpi, 2)
+
+        if lpi == 0:
+            lpi_severity = "None"
+        elif lpi <= 2:
+            lpi_severity = "Low"
+        elif lpi <= 5:
+            lpi_severity = "Moderate"
+        elif lpi <= 15:
+            lpi_severity = "High"
         else:
+            lpi_severity = "Very High"
+
+        print(f"[INFO] LPI = {lpi:.2f}  ({lpi_severity})")
+
+        # Bearing capacity reduction based on liquefaction risk
+        pre_bearing = qa_site
+        if risk_level == "VERY HIGH":
+            post_bearing = max(0.0, pre_bearing * 0.10)
+        elif risk_level == "HIGH":
+            post_bearing = max(0.0, pre_bearing * 0.35)
+        elif risk_level == "LOW":
+            post_bearing = max(0.0, pre_bearing * 0.75)
+        else:   # VERY LOW
             post_bearing = pre_bearing
         capacity_reduction = ((pre_bearing - post_bearing) /
                               pre_bearing) * 100 if pre_bearing > 0 else 0
@@ -1104,25 +1168,78 @@ async def predict(
                 f"⚠️ {confidence} confidence prediction - Site-specific investigation REQUIRED"
             )
 
-        if risk_level == "HIGH":
+        if risk_level == "VERY HIGH":
             recommendations.extend([
-                "Consider deep foundation systems (piles or caissons)",
+                "VERY HIGH liquefaction risk — deep foundation systems (driven piles or drilled caissons) are required",
+                "Extensive ground improvement mandatory: vibro-compaction, stone columns, or deep soil mixing",
+                "Design for severe post-liquefaction settlement and lateral spreading",
+                "Conduct comprehensive site-specific geotechnical investigation immediately"
+            ])
+        elif risk_level == "HIGH":
+            recommendations.extend([
+                "HIGH liquefaction risk — consider deep foundation or heavily reinforced shallow foundation",
                 "Implement ground improvement techniques (vibro-compaction, stone columns)",
                 "Design for significant post-liquefaction settlement",
-                "Conduct detailed site-specific investigation"
+                "Conduct detailed site-specific geotechnical investigation"
             ])
-        elif risk_level == "MEDIUM":
+        elif risk_level == "LOW":
             recommendations.extend([
-                "Perform detailed site investigation",
-                "Consider shallow foundation with ground improvement",
-                "Design structures to accommodate moderate settlement",
-                "Monitor groundwater levels"
+                "LOW liquefaction risk — perform detailed site investigation before finalising design",
+                "Consider shallow foundation with moderate ground improvement",
+                "Design structures to accommodate some settlement",
+                "Monitor groundwater levels during and after construction"
             ])
-        else:
+        else:   # VERY LOW
             recommendations.extend([
-                "Standard foundation design practices may be acceptable",
+                "VERY LOW liquefaction risk — standard foundation design practices are acceptable",
                 "Monitor soil conditions during construction",
-                "Consider minor ground improvement for critical structures"
+                "Routine geotechnical checks are sufficient"
+            ])
+
+        # Mitigation strategies when settlement exceeds 25 mm limit at max practical foundation dimensions
+        settlement_mm = settlement_cm * 10.0
+        at_max_dimensions = (B_pred >= MAX_PRACTICAL_B_M and D_pred >= MAX_PRACTICAL_D_M)
+        mitigation_required = settlement_mm > SI_ALLOW and at_max_dimensions
+
+        # Append LPI-based note to recommendations
+        if lpi_severity in ("High", "Very High"):
+            recommendations.append(
+                f"LPI = {lpi:.2f} ({lpi_severity} liquefaction potential) — site poses significant liquefaction "
+                "hazard; incorporate LPI value in structural design and risk assessment."
+            )
+        elif lpi_severity == "Moderate":
+            recommendations.append(
+                f"LPI = {lpi:.2f} (Moderate liquefaction potential) — targeted ground improvement or "
+                "settlement-tolerant design should be evaluated."
+            )
+        elif lpi_severity == "Low":
+            recommendations.append(
+                f"LPI = {lpi:.2f} (Low liquefaction potential) — standard design with monitoring is acceptable."
+            )
+
+        if t_years is not None:
+            recommendations.append(
+                f"Design life = {t_years:.0f} year(s): verify that long-term consolidation and creep settlement "
+                f"over this period remain within the {SI_ALLOW:.0f} mm allowable limit; conduct time-dependent "
+                "settlement analysis (Terzaghi consolidation / secondary compression) if cohesive layers are present."
+            )
+
+        if mitigation_required:
+            recommendations.extend([
+                "⚠️ CRITICAL: Calculated settlement exceeds the 25 mm allowable limit and the foundation is "
+                "already at its maximum practical dimensions (width = 3 m, depth = 3 m). "
+                "Conventional shallow foundations are insufficient — mitigation is required.",
+                "Mitigation Option 1 — Deep Foundations: Install driven or bored piles / drilled caissons "
+                "to transfer structural loads to deep, competent bearing strata below the liquefiable zone.",
+                "Mitigation Option 2 — Ground Improvement (Densification): Apply vibro-compaction, "
+                "vibro-stone columns, or dynamic compaction to densify loose, liquefiable soils and "
+                "reduce post-liquefaction settlement.",
+                "Mitigation Option 3 — Soil Mixing / Grouting: Use jet grouting or deep soil mixing (DSM) "
+                "to create strengthened soil columns that limit differential settlement.",
+                "Mitigation Option 4 — Preloading with Vertical Drains: Apply surcharge preloading with "
+                "prefabricated vertical drains (PVDs) to accelerate consolidation before construction.",
+                "Conduct a detailed site-specific geotechnical investigation to confirm depth to competent "
+                "stratum and select the most appropriate and cost-effective mitigation strategy.",
             ])
 
         # Add distance-based warnings
@@ -1163,18 +1280,21 @@ async def predict(
                 "source": "Spatial Interpolation"
             },
             settlement={
-                "predicted_cm": round(settlement_cm, 2),           # W/ Liq  (post-liquefaction, model output)
-                "pre_liquefaction_cm": round(pre_liq_settlement_cm, 2),  # W/o Liq (Bowles q_actual/Qa×25mm)
-                "severity": settlement_severity
+                "settlement_cm": round(settlement_cm, 2),
+                "severity": settlement_severity,
+                "lpi": lpi,
+                "lpi_severity": lpi_severity,
             },
             bearing_capacity={
-                "pre_liquefaction_kpa": round(pre_bearing, 0),
-                "post_liquefaction_kpa": round(post_bearing, 0),
+                "allowable_bearing_capacity_kpa": round(pre_bearing, 0),
                 "capacity_reduction_percent": round(capacity_reduction, 1)
             },
             foundation_recommendation={
                 "base_m": round(B_pred, 2),
                 "depth_m": round(D_pred, 2),
+                "mitigation_required": mitigation_required,
+                "settlement_mm": round(settlement_mm, 1),
+                "allowable_settlement_mm": SI_ALLOW,
             },
             recommendations=recommendations,
             analysis_parameters={
@@ -1182,7 +1302,9 @@ async def predict(
                 "magnitude_mw": magnitude,
                 "msf": round(msf, 4),
                 "fs_design": FS_DESIGN,
-                "settlement_fs": round(settlement_fs, 2)
+                "settlement_fs": round(settlement_fs, 2),
+                "b_increment_m": b_increment,
+                "t_years": t_years,
             },
             interpolation_info=interpolation_info
         )
