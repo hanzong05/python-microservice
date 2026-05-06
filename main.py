@@ -287,16 +287,11 @@ def get_borehole_all_layers(borehole_uuid: int) -> List[Dict]:
     try:
         result = client.table('soil_layers').select(
             'layer_number, depth_from_m, depth_to_m, '
-            'spt_n_value, sample_no, unit_weight, fines_content, groundwater_depth_m, '
+            'spt_n_value, unit_weight, fines_content, groundwater_depth_m, '
             'pga_g, csr, cyclic_strength_ratio, friction_angle, cohesion_kpa, '
             'elastic_modulus_es, liquefaction_risk_level, liquefaction'
         ).eq('borehole_id', borehole_uuid).order('layer_number').execute()
-        layers = result.data if result.data else []
-        # CS (Casing Sample) indicates near-refusal; stored as 0 but should be treated as 100
-        for lyr in layers:
-            if str(lyr.get('sample_no', '')).strip().upper() == 'CS' and (lyr.get('spt_n_value') or 0) == 0:
-                lyr['spt_n_value'] = 100
-        return layers
+        return result.data if result.data else []
     except Exception as e:
         print(f"[WARNING] Failed to get layers for borehole {borehole_uuid}: {e}")
         return []
