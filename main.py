@@ -287,7 +287,7 @@ def get_borehole_all_layers(borehole_uuid: int) -> List[Dict]:
     try:
         result = client.table('soil_layers').select(
             'layer_number, depth_from_m, depth_to_m, '
-            'spt_n_value, unit_weight, fines_content, groundwater_depth_m, '
+            'spt_n_value, spt_n160, n1_60cs, unit_weight, fines_content, groundwater_depth_m, '
             'pga_g, csr, cyclic_strength_ratio, friction_angle, cohesion_kpa, '
             'elastic_modulus_es, liquefaction_risk_level, liquefaction'
         ).eq('borehole_id', borehole_uuid).order('layer_number').execute()
@@ -394,7 +394,8 @@ def interpolate_soil_parameters(
             'depth_to_m':            round(depth_to, 2),
             'layer_thickness':       round(thickness, 2),
             'spt_n_value':           idw_field(ln, 'spt_n_value', 20),
-            'spt_n60':               idw_field(ln, 'spt_n_value', 20),  # proxy (spt_n60 dropped from DB)
+            'spt_n60':               idw_field(ln, 'spt_n160', 20),
+            'n1_60cs':               idw_field(ln, 'n1_60cs', 20),
             'unit_weight':           idw_field(ln, 'unit_weight', 18),
             'fines_content':         idw_field(ln, 'fines_content', 10),
             'groundwater_depth_m':   idw_field(ln, 'groundwater_depth_m', 5),
