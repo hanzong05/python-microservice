@@ -125,8 +125,9 @@ class PredictionRequest(BaseModel):
     longitude: float
     depth_m: Optional[float] = None
     municipality: Optional[str] = None
-    q_actual: Optional[float] = 50.0    # kPa — building contact pressure
+    q_actual: Optional[float] = 50.0    # kN — building weight
     magnitude: Optional[float] = 6.5   # Mw — earthquake magnitude
+    t_years: Optional[float] = None     # design life (years)
 
 
 class PredictionResponse(BaseModel):
@@ -833,13 +834,13 @@ async def predict(
     n_boreholes: Optional[int] = Query(
         5, ge=1, le=10, description="Number of nearest boreholes to use for interpolation"),
     q_actual: Optional[float] = Query(
-        50.0, ge=0, description="Actual building contact pressure (kPa)"),
+        50.0, ge=0, description="Actual building weight (kN)"),
     magnitude: Optional[float] = Query(
-        6.5, ge=4.0, le=10.0, description="Earthquake moment magnitude (Mw)"),
+        6.5, ge=0, le=10.0, description="Earthquake moment magnitude (Mw)"),
     b_increment: Optional[float] = Query(
         0.1, ge=0.05, le=0.5, description="Width increment step (m) for iterative foundation width optimisation"),
     t_years: Optional[float] = Query(
-        None, ge=1, le=200, description="Design life / assessment period (years)"),
+        None, ge=0, le=200, description="Design life / assessment period (years)"),
     _: None = Depends(verify_api_key),
 ):
     """
@@ -861,14 +862,15 @@ async def predict(
         munic     = request.municipality
         q_actual  = request.q_actual  if request.q_actual  is not None else q_actual
         magnitude = request.magnitude if request.magnitude is not None else magnitude
+        t_years   = request.t_years   if request.t_years   is not None else t_years
     else:
         lat, lon, depth_m, munic = latitude, longitude, depth, municipality
 
-    # Ensure defaults
-    q_actual    = float(q_actual    or 50.0)
-    magnitude   = float(magnitude   or 6.5)
-    b_increment = float(b_increment or 0.1)
-    t_years     = float(t_years)     if t_years is not None else None
+    # Ensure defaults — use explicit None checks so 0 is preserved
+    q_actual    = float(q_actual)    if q_actual    is not None else 50.0
+    magnitude   = float(magnitude)   if magnitude   is not None else 6.5
+    b_increment = float(b_increment) if b_increment is not None else 0.1
+    t_years     = float(t_years)     if t_years     is not None else None
 
     if lat is None or lon is None:
         raise HTTPException(
@@ -898,7 +900,8 @@ async def predict(
 
         # ── Magnitude Scaling Factor (Idriss 1999) — needed before per-layer FS ─
         import math as _math
-        msf = (10 ** 2.24) / (magnitude ** 2.56)
+        _mag_for_msf = magnitude if magnitude >= 4.0 else 6.5  # guard against 0 / sub-4 input
+        msf = (10 ** 2.24) / (_mag_for_msf ** 2.56)
 
         # ── Per-layer FS computation ───────────────────────────────────────────
         _RISK_ORD_3 = {'VERY HIGH': 5, 'HIGH': 4, 'MEDIUM': 3, 'LOW': 2, 'VERY LOW': 1}
