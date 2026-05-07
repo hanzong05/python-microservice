@@ -836,7 +836,7 @@ async def predict(
     q_actual: Optional[float] = Query(
         50.0, ge=0, description="Actual building weight (kN)"),
     magnitude: Optional[float] = Query(
-        6.5, ge=0, le=10.0, description="Earthquake moment magnitude (Mw)"),
+        6.5, ge=0, description="Earthquake moment magnitude (Mw)"),
     b_increment: Optional[float] = Query(
         0.1, ge=0.05, le=0.5, description="Width increment step (m) for iterative foundation width optimisation"),
     t_years: Optional[float] = Query(
