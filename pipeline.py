@@ -1419,6 +1419,21 @@ class GeotechnicalPipeline:
         def strip_thesis_columns(batch):
             return [{k: v for k, v in r.items() if k not in THESIS_COLUMNS} for r in batch]
 
+        # Delete existing soil layers before inserting to prevent duplicate
+        # accumulation across pipeline re-runs (plain INSERT with no prior cleanup
+        # doubles the row count every time the pipeline runs).
+        bh_uuids = list(self.borehole_record_ids.values())
+        print(f"    Clearing existing soil layers for {len(bh_uuids)} boreholes...")
+        deleted_bh = 0
+        for _di in range(0, len(bh_uuids), 100):
+            chunk = bh_uuids[_di:_di + 100]
+            try:
+                self.client.table('soil_layers').delete().in_('borehole_id', chunk).execute()
+                deleted_bh += len(chunk)
+            except Exception as _de:
+                print(f"    [WARNING] Delete batch failed: {_de}")
+        print(f"    [OK] Cleared layers for {deleted_bh} boreholes")
+
         batch_size = 25
         total_inserted = 0
         schema_fallback = False

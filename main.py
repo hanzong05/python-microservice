@@ -1414,11 +1414,24 @@ async def get_boreholes(
                 and b['municipalities'].get('name', '').lower() == municipality.lower()
             ]
 
-        # ── 2. Fetch soil layer risk data for all boreholes ──────────────────
+        # ── 2. Fetch soil layer risk data for all boreholes (paginated) ────────
+        # Supabase caps responses at 1000 rows by default; page through all.
         bh_ids = [b['id'] for b in boreholes]
-        soil_result = client.table('soil_layers').select(
-            'borehole_id, liquefaction_risk_level, liquefaction, csr, cyclic_strength_ratio, spt_n_value'
-        ).in_('borehole_id', bh_ids).execute()
+        all_soil_layers = []
+        _PAGE = 1000
+        _offset = 0
+        while True:
+            page = client.table('soil_layers').select(
+                'borehole_id, liquefaction_risk_level, liquefaction, csr, cyclic_strength_ratio, spt_n_value'
+            ).in_('borehole_id', bh_ids).range(_offset, _offset + _PAGE - 1).execute()
+            if not page.data:
+                break
+            all_soil_layers.extend(page.data)
+            if len(page.data) < _PAGE:
+                break
+            _offset += _PAGE
+        print(f"[INFO] /boreholes: fetched {len(all_soil_layers)} soil layer rows "
+              f"for {len(bh_ids)} boreholes")
 
         # ── 3. Aggregate worst-case risk per borehole ────────────────────────
         RISK_ORDER = {'VERY HIGH': 5, 'HIGH': 4, 'MEDIUM': 3, 'LOW': 2, 'VERY LOW': 1}
@@ -1431,7 +1444,7 @@ async def get_boreholes(
 
         from collections import defaultdict
         layers_by_bh: dict = defaultdict(list)
-        for layer in (soil_result.data or []):
+        for layer in all_soil_layers:
             layers_by_bh[layer['borehole_id']].append(layer)
 
         def _avg(values):
