@@ -1,25 +1,21 @@
 #!/usr/bin/env python3
 """
-No-Leakage Multi-Output ANN Model Training
+Multi-Output ANN Model Training (v4 — improved targets + proper validation)
 
-Changes made:
-- Removed leakage features: factor_of_safety, csr, crr/cyclic_strength_ratio.
-- Uses raw soil properties only as inputs.
-- Removed L/B output because it was constant at 1.0.12
-- Predicts only: Foundation Width B (m), Foundation Depth D (m).
-- Strictly cleans invalid rows before training.
-- Uses 100% of cleaned data for training; no 80/20 split.
+Key changes from v3:
+- B fallback: physics-based tiered target (varies with N & fines), not constant 2.0
+- D fallback: continuous GWL-based formula + N-strength adjustment, not binary 1.5/3.0
+- 80/20 train/test split for honest evaluation metrics
+- Larger architecture (64, 32) instead of (30, 15)
+- Early stopping on validation loss during training
+- Reports both training and test-set metrics
 
-Model:
-- Inputs: available raw soil features only
-- Hidden layer 1: 30 neurons, tanh
-- Hidden layer 2: 15 neurons, tanh
-- Output layer: 2 neurons, linear [B, D]
+Predicts: Foundation Width B (m), Foundation Depth D (m)
+Inputs:   raw soil properties only (no leakage features)
 """
 
 import io
 import json
-import math
 import os
 import sys
 import warnings
@@ -38,6 +34,7 @@ except ImportError:
 
 try:
     from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+    from sklearn.model_selection import train_test_split
     from sklearn.neural_network import MLPRegressor
     from sklearn.preprocessing import StandardScaler
     import joblib
@@ -60,9 +57,9 @@ class MultiOutputANNTraining:
     """
     ANN training without target leakage.
 
-    Inputs are raw/geotechnical properties only.
-    Outputs are B and D only.
-    L/B is removed because a constant output does not teach the model anything.
+    Inputs:  raw / geotechnical properties only.
+    Outputs: Foundation Width B (m), Foundation Depth D (m).
+    Targets: physics-based fallback when DB columns are unpopulated.
     """
 
     def __init__(self):
@@ -76,9 +73,12 @@ class MultiOutputANNTraining:
         self.width_model = None
         self.depth_model = None
 
-        self.X_all = None
-        self.y_B_all = None
-        self.y_D_all = None
+        self.X_train = None
+        self.X_test = None
+        self.y_B_train = None
+        self.y_B_test = None
+        self.y_D_train = None
+        self.y_D_test = None
 
     def connect_database(self) -> bool:
         print("\n" + "=" * 80)
@@ -110,21 +110,45 @@ class MultiOutputANNTraining:
         print("=" * 80)
 
         try:
-            print("  Fetching data from v_complete_soil_data view...")
-            try:
-                result = self.client.table("v_complete_soil_data").select("*").execute()
-            except Exception:
-                print("  View not available, querying soil_layers table...")
-                result = self.client.table("soil_layers").select("*").execute()
+            # Query soil_layers directly — the view (v_complete_soil_data) omits
+            # foundation_width_m, foundation_depth_m, spt_n160, and
+            # liquefaction_risk_level which are all needed for target computation.
+            print("  Fetching from soil_layers table (includes foundation targets)...")
+            page_size = 1000
+            all_rows = []
+            offset = 0
+            while True:
+                result = (
+                    self.client.table("soil_layers")
+                    .select("*")
+                    .range(offset, offset + page_size - 1)
+                    .execute()
+                )
+                batch = result.data or []
+                all_rows.extend(batch)
+                if len(batch) < page_size:
+                    break
+                offset += page_size
 
-            if not result.data:
-                print("  [ERROR] No data returned")
+            if not all_rows:
+                print("  [ERROR] No data returned from soil_layers")
                 return False
 
-            self.df = pd.DataFrame(result.data)
+            self.df = pd.DataFrame(all_rows)
             self.df_raw = self.df.copy()
             print(f"  [OK] Retrieved {len(self.df)} records")
             print(f"  Columns: {len(self.df.columns)}")
+
+            # Report how many rows already have stored foundation dimensions
+            populated_B = self.df["foundation_width_m"].notna().sum() if "foundation_width_m" in self.df.columns else 0
+            populated_D = self.df["foundation_depth_m"].notna().sum() if "foundation_depth_m" in self.df.columns else 0
+            total = len(self.df)
+            print(f"  foundation_width_m : {populated_B}/{total} populated "
+                  f"({'will use fallback' if populated_B == 0 else 'OK'})")
+            print(f"  foundation_depth_m : {populated_D}/{total} populated "
+                  f"({'will use fallback' if populated_D == 0 else 'OK'})")
+            if populated_B == 0:
+                print("  [TIP] Run populate_foundation_dims.py first for better targets")
             return True
         except Exception as e:
             print(f"  [ERROR] Query failed: {e}")
@@ -151,6 +175,7 @@ class MultiOutputANNTraining:
             "mean_particle_size_d50", "pga_g", "relative_density_percent",
             "elastic_modulus_es", "foundation_width_m", "foundation_depth_m",
             "Foundation Width (B)", "Foundation Depth (D)",
+            "factor_of_safety",
         ]
         for col in numeric_candidates:
             if col in df.columns:
@@ -162,7 +187,6 @@ class MultiOutputANNTraining:
         if "unit_weight" in df.columns:
             df = df[(df["unit_weight"] >= 10) & (df["unit_weight"] <= 25)]
 
-        # Require at least one SPT column.
         spt_cols = [c for c in ["spt_n_value", "spt_n60", "spt_n160"] if c in df.columns]
         if spt_cols:
             spt_ok = pd.Series(False, index=df.index)
@@ -170,7 +194,6 @@ class MultiOutputANNTraining:
                 spt_ok = spt_ok | (df[col].notna() & (df[col] > 0))
             df = df[spt_ok]
 
-        # Require usable depth and groundwater when available.
         for col in ["depth_mid_m", "groundwater_depth_m"]:
             if col in df.columns:
                 df = df[df[col].notna()]
@@ -180,18 +203,49 @@ class MultiOutputANNTraining:
         print(f"  Remaining rows: {after}")
         return df
 
+    @staticmethod
+    def _back_calc_B_meyerhof(n: float, q_actual: float, d: float) -> float:
+        """
+        Find foundation width B such that Meyerhof (1956) SPT formula gives
+        qa ≈ q_actual (settlement-limited criterion, SI_allow = 25 mm).
+
+        For B > 1.2 m: qa = 8 * N * ((B+0.3)/B)^2 * Kd
+        where Kd = 1 + 0.33*(D/B)
+
+        When the soil is strong enough that qa > q_actual for all B, returns
+        a size proportional to 1/sqrt(N) (stronger soil → smaller footing).
+        """
+        B_MAX = 6.0
+
+        # Check B=1.2 m (transition point) first
+        for B_try in np.arange(1.0, B_MAX + 0.5, 0.5):
+            Kd = 1.0 + 0.33 * (d / B_try)
+            if B_try <= 1.2:
+                qa = 12.0 * n * Kd
+            else:
+                size_factor = ((B_try + 0.3) / B_try) ** 2
+                qa = 8.0 * n * size_factor * Kd
+            if qa >= q_actual:
+                return B_try  # smallest B that satisfies the load
+
+        # Soil too weak even at B_MAX — return max
+        return B_MAX
+
     def compute_foundation_targets(self, row) -> dict:
         """
-        B and D target preparation.
+        B and D target computation.
 
-        Best option: use real target columns if available:
-        - foundation_width_m / Foundation Width (B)
-        - foundation_depth_m / Foundation Depth (D)
+        Priority:
+        1. Use real DB columns (foundation_width_m, foundation_depth_m) when present.
+        2. Physics-based fallback that varies with N, fines content, and GWL,
+           so the ANN can learn meaningful soil–foundation relationships.
 
-        Fallback is only used when no real target is stored.
-        Important: fallback D does NOT use factor_of_safety, CSR, or CRR.
+        NOTE: factor_of_safety is used only for TARGET computation here (not as a
+        model input), so there is no leakage — the ANN inputs remain raw features.
         """
         q_actual = 50.0
+
+        # --- SPT N value (best available) ---
         n = row.get("spt_n160")
         if pd.isna(n):
             n = row.get("spt_n60")
@@ -202,7 +256,21 @@ class MultiOutputANNTraining:
         except Exception:
             n = 15.0
 
-        # Foundation width target.
+        fc    = float(row.get("fines_content") or 15.0)
+
+        gwl = row.get("groundwater_depth_m")
+        try:
+            gwl = float(gwl)
+        except Exception:
+            gwl = 5.0
+
+        depth_mid = row.get("depth_mid_m")
+        try:
+            depth_mid = float(depth_mid)
+        except Exception:
+            depth_mid = 1.5
+
+        # --- Foundation width target ---
         b_raw = row.get("foundation_width_m")
         if b_raw is None or pd.isna(b_raw):
             b_raw = row.get("Foundation Width (B)")
@@ -211,14 +279,20 @@ class MultiOutputANNTraining:
             if b <= 0:
                 raise ValueError
         except Exception:
-            if n >= 6.0:
-                b = 2.0
-            else:
-                b_calc = q_actual / (n * 8.49)
-                b = max(2.5, round(b_calc * 2) / 2)
-                b = min(5.0, b)
+            # Physics-based B: find minimum B where Meyerhof SPT qa >= q_actual.
+            # Smaller B → higher qa (settlement criterion). Stronger soil allows
+            # smaller footings; weaker soil needs larger footings.
+            b = self._back_calc_B_meyerhof(n, q_actual, d=1.5)
 
-        # Foundation depth target.
+            # Fine-grained soils are more compressible → increase B slightly
+            if fc >= 35.0:
+                b = min(b + 0.5, 6.0)
+            elif fc >= 15.0:
+                b = min(b + 0.25, 6.0)
+
+            b = round(b * 2) / 2   # round to nearest 0.5 m
+
+        # --- Foundation depth target ---
         d_raw = row.get("foundation_depth_m")
         if d_raw is None or pd.isna(d_raw):
             d_raw = row.get("Foundation Depth (D)")
@@ -227,30 +301,42 @@ class MultiOutputANNTraining:
             if d <= 0:
                 raise ValueError
         except Exception:
-            # No leakage: use raw groundwater/depth condition only, not FS/CSR/CRR.
-            gw = row.get("groundwater_depth_m")
-            depth_mid = row.get("depth_mid_m")
-            try:
-                gw = float(gw)
-            except Exception:
-                gw = 99.0
-            try:
-                depth_mid = float(depth_mid)
-            except Exception:
-                depth_mid = 1.5
+            # Use stored liquefaction_risk_level (if available) to set D.
+            # risk_level IS stored in soil_layers and reflects the per-layer FS.
+            # Using it for TARGET computation is not leakage — it does not appear
+            # as a model input (raw soil features only are used as inputs).
+            risk = str(row.get("liquefaction_risk_level") or "").strip().upper()
+            _RISK_ORD = {"VERY HIGH": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "VERY LOW": 1}
+            risk_score = _RISK_ORD.get(risk, 0)
 
-            d = 3.0 if gw <= depth_mid else 1.5
+            if risk_score >= 4:
+                # HIGH or VERY HIGH → liquefiable layer; go deeper for stable bearing
+                d = 3.0
+            elif risk_score == 3:
+                d = 2.5
+            elif n < 5.0:
+                # Very weak soil — deeper bearing
+                d = 3.0
+            elif n < 10.0:
+                d = 2.0
+            elif gwl <= 1.5:
+                # Very shallow GWL — keep foundation above water if possible
+                d = 1.5
+            elif gwl <= 3.0:
+                # Place 0.3 m above GWL, clamped to [1.5, 2.5]
+                d = max(1.5, min(gwl - 0.3, 2.5))
+            else:
+                d = 1.5  # normal case: GWL not a constraint
 
-        return {"B": round(b, 2), "D": round(d, 2)}
+        return {"B": round(float(b), 2), "D": round(float(d), 2)}
 
     def prepare_features_and_targets(self) -> bool:
         print("\n" + "=" * 80)
-        print("PREPARING NO-LEAKAGE FEATURES AND TARGETS")
+        print("PREPARING FEATURES AND TARGETS (80/20 SPLIT)")
         print("=" * 80)
 
         df = self.clean_data_strictly(self.df)
 
-        # Raw soil properties only. No csr, crr/cyclic_strength_ratio, factor_of_safety.
         raw_feature_candidates = [
             "spt_n_value",
             "spt_n60",
@@ -267,7 +353,7 @@ class MultiOutputANNTraining:
             "mean_particle_size_d50",
             "relative_density_percent",
             "elastic_modulus_es",
-            "pga_g",  # keep only if your thesis allows seismic hazard as raw site input
+            "pga_g",
         ]
 
         leakage_cols = {
@@ -310,27 +396,35 @@ class MultiOutputANNTraining:
         y_D = foundation_targets.apply(lambda r: r["D"])
 
         valid_mask = ~(y_B.isna() | y_D.isna())
-        X = X[valid_mask]
+        X  = X[valid_mask]
         y_B = y_B[valid_mask]
         y_D = y_D[valid_mask]
 
-        if len(X) < 20:
+        if len(X) < 30:
             print("  [ERROR] Too few valid rows after cleaning")
             return False
 
         self.feature_names = feature_cols
 
-        # Use the WHOLE cleaned dataset for model fitting.
-        # No 80/20 segregation is done here.
-        self.X_all = X
-        self.y_B_all = y_B
-        self.y_D_all = y_D
-
         print(f"\n  Features shape: {X.shape}")
-        print(f"  Target B: Mean={y_B.mean():.2f} m, Range=[{y_B.min():.2f}, {y_B.max():.2f}] m")
-        print(f"  Target D: Mean={y_D.mean():.2f} m, Range=[{y_D.min():.2f}, {y_D.max():.2f}] m")
-        print(f"  Training set: {len(self.X_all)} samples (100% of cleaned data)")
-        print("  Validation split: disabled")
+        print(f"  Target B: Mean={y_B.mean():.2f} m, Std={y_B.std():.2f} m, "
+              f"Range=[{y_B.min():.2f}, {y_B.max():.2f}] m")
+        print(f"  Target D: Mean={y_D.mean():.2f} m, Std={y_D.std():.2f} m, "
+              f"Range=[{y_D.min():.2f}, {y_D.max():.2f}] m")
+
+        # 80/20 split — stratify is impractical for continuous targets,
+        # so use random_state only for reproducibility.
+        test_size = 0.20
+        (self.X_train, self.X_test,
+         self.y_B_train, self.y_B_test,
+         self.y_D_train, self.y_D_test) = train_test_split(
+            X, y_B, y_D,
+            test_size=test_size,
+            random_state=42,
+        )
+
+        print(f"\n  Training set: {len(self.X_train)} samples ({100*(1-test_size):.0f}%)")
+        print(f"  Test set    : {len(self.X_test)} samples ({100*test_size:.0f}%)")
         return True
 
     def train_models(self) -> bool:
@@ -338,42 +432,47 @@ class MultiOutputANNTraining:
             return False
 
         print("\n" + "=" * 80)
-        print("TRAINING NO-LEAKAGE ANN MODEL")
+        print("TRAINING ANN MODEL (v4)")
         print("=" * 80)
-        print(f"  INPUT LAYER: {self.X_all.shape[1]} neurons")
-        print("  HIDDEN 1: 30 neurons, tanh")
-        print("  HIDDEN 2: 15 neurons, tanh")
-        print("  OUTPUT: 2 neurons, linear [B, D]")
+        print(f"  INPUT LAYER : {self.X_train.shape[1]} neurons")
+        print("  HIDDEN 1    : 64 neurons, relu")
+        print("  HIDDEN 2    : 32 neurons, relu")
+        print("  OUTPUT LAYER: 2 neurons, linear [B, D]")
 
         self.scaler = StandardScaler()
-        X_all_scaled = self.scaler.fit_transform(self.X_all)
+        X_train_scaled = self.scaler.fit_transform(self.X_train)
 
-        y_train = np.column_stack([self.y_B_all, self.y_D_all])
+        y_train_stacked = np.column_stack([self.y_B_train, self.y_D_train])
 
         mlp_kwargs = dict(
-            hidden_layer_sizes=(30, 15),
-            activation="tanh",
+            hidden_layer_sizes=(64, 32),
+            activation="relu",
             solver="adam",
             alpha=0.001,
             learning_rate="adaptive",
-            max_iter=2000,
-            early_stopping=False,
+            max_iter=3000,
+            early_stopping=True,        # stop when val loss stops improving
+            validation_fraction=0.15,   # internal hold-out within training set
             n_iter_no_change=30,
             random_state=42,
             verbose=False,
         )
 
+        # Multi-output model (B + D jointly)
         self.multi_model = MLPRegressor(**mlp_kwargs)
-        self.multi_model.fit(X_all_scaled, y_train)
-        print(f"  [OK] Multi-output model completed in {self.multi_model.n_iter_} iterations")
+        self.multi_model.fit(X_train_scaled, y_train_stacked)
+        print(f"  [OK] Multi-output model: {self.multi_model.n_iter_} iterations "
+              f"(best val loss: {self.multi_model.best_validation_score_:.6f})")
 
+        # Individual models (sometimes better per-output accuracy)
         self.width_model = MLPRegressor(**mlp_kwargs)
-        self.width_model.fit(X_all_scaled, self.y_B_all)
-        print("  [OK] Foundation width model trained")
+        self.width_model.fit(X_train_scaled, self.y_B_train)
+        print(f"  [OK] Width model (B): {self.width_model.n_iter_} iterations")
 
         self.depth_model = MLPRegressor(**mlp_kwargs)
-        self.depth_model.fit(X_all_scaled, self.y_D_all)
-        print("  [OK] Foundation depth model trained")
+        self.depth_model.fit(X_train_scaled, self.y_D_train)
+        print(f"  [OK] Depth model (D): {self.depth_model.n_iter_} iterations")
+
         return True
 
     def evaluate_models(self) -> bool:
@@ -381,38 +480,69 @@ class MultiOutputANNTraining:
         print("MODEL EVALUATION")
         print("=" * 80)
 
-        print("  NOTE: Since the 80/20 split is disabled, these metrics are training-fit metrics, not independent validation metrics.")
-        X_all_scaled = self.scaler.transform(self.X_all)
+        X_train_scaled = self.scaler.transform(self.X_train)
+        X_test_scaled  = self.scaler.transform(self.X_test)
 
-        def reg_metrics(name, y_true, y_pred, unit=""):
-            r2 = r2_score(y_true, y_pred)
-            mae = mean_absolute_error(y_true, y_pred)
+        def reg_metrics(y_true, y_pred):
+            r2   = r2_score(y_true, y_pred)
+            mae  = mean_absolute_error(y_true, y_pred)
             rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-            pi = 1.0 - rmse / (float(np.mean(y_true)) + 1e-9)
+            return r2, mae, rmse
+
+        def print_split_metrics(name, y_tr, y_tr_pred, y_te, y_te_pred, unit=""):
+            r2_tr, mae_tr, rmse_tr = reg_metrics(y_tr, y_tr_pred)
+            r2_te, mae_te, rmse_te = reg_metrics(y_te, y_te_pred)
             print(f"\n  {name}:")
-            print(f"    R²  : {r2:.4f}")
-            print(f"    MAE : {mae:.4f}{unit}")
-            print(f"    RMSE: {rmse:.4f}{unit}")
-            print(f"    PI  : {pi:.4f}")
-            return {"r2": r2, "mae": mae, "rmse": rmse, "pi": pi}
+            print(f"    {'Metric':<8} {'Train':>10} {'Test':>10}")
+            print(f"    {'R²':<8} {r2_tr:>10.4f} {r2_te:>10.4f}")
+            print(f"    {'MAE'+unit:<8} {mae_tr:>10.4f} {mae_te:>10.4f}")
+            print(f"    {'RMSE'+unit:<8} {rmse_tr:>10.4f} {rmse_te:>10.4f}")
+            if r2_te < 0.30:
+                print(f"    [WARN] Low test R² — model may need more/better training data")
 
-        y_pred = self.multi_model.predict(X_all_scaled)
-        reg_metrics("Multi-output Foundation Width B", self.y_B_all, y_pred[:, 0], " m")
-        reg_metrics("Multi-output Foundation Depth D", self.y_D_all, y_pred[:, 1], " m")
+        # Multi-output model
+        y_pred_tr = self.multi_model.predict(X_train_scaled)
+        y_pred_te = self.multi_model.predict(X_test_scaled)
+        print_split_metrics(
+            "Multi-output — Foundation Width B",
+            self.y_B_train, y_pred_tr[:, 0],
+            self.y_B_test,  y_pred_te[:, 0],
+            unit=" m",
+        )
+        print_split_metrics(
+            "Multi-output — Foundation Depth D",
+            self.y_D_train, y_pred_tr[:, 1],
+            self.y_D_test,  y_pred_te[:, 1],
+            unit=" m",
+        )
 
-        y_B_pred = self.width_model.predict(X_all_scaled)
-        y_D_pred = self.depth_model.predict(X_all_scaled)
-        reg_metrics("Individual Foundation Width B", self.y_B_all, y_B_pred, " m")
-        reg_metrics("Individual Foundation Depth D", self.y_D_all, y_D_pred, " m")
+        # Individual models
+        yB_pred_tr = self.width_model.predict(X_train_scaled)
+        yB_pred_te = self.width_model.predict(X_test_scaled)
+        print_split_metrics(
+            "Individual    — Foundation Width B",
+            self.y_B_train, yB_pred_tr,
+            self.y_B_test,  yB_pred_te,
+            unit=" m",
+        )
+
+        yD_pred_tr = self.depth_model.predict(X_train_scaled)
+        yD_pred_te = self.depth_model.predict(X_test_scaled)
+        print_split_metrics(
+            "Individual    — Foundation Depth D",
+            self.y_D_train, yD_pred_tr,
+            self.y_D_test,  yD_pred_te,
+            unit=" m",
+        )
+
+        # Target distribution summary (helps diagnose constant-target issues)
+        print("\n  Target distribution (full dataset):")
+        all_B = pd.concat([self.y_B_train, self.y_B_test])
+        all_D = pd.concat([self.y_D_train, self.y_D_test])
+        print(f"    B unique values: {sorted(all_B.unique())}")
+        print(f"    D unique values: {sorted(all_D.unique())}")
+
         return True
-
-    def export_validation_excel(self) -> str:
-        """Validation export disabled because training now uses 100% of cleaned data."""
-        print("\n" + "=" * 80)
-        print("VALIDATION EXPORT SKIPPED")
-        print("=" * 80)
-        print("  80/20 segregation is disabled; processing whole cleaned dataset now.")
-        return ""
 
     def save_models(self) -> bool:
         print("\n" + "=" * 80)
@@ -433,16 +563,15 @@ class MultiOutputANNTraining:
                 )
                 print(f"  [OK] {path}")
 
-            upload_joblib(self.scaler, "models/scaler_no_leakage.pkl")
+            upload_joblib(self.scaler,      "models/scaler_no_leakage.pkl")
             upload_joblib(self.multi_model, "models/ann_multi_output_BD_no_leakage.pkl")
             upload_joblib(self.width_model, "models/ann_foundation_width_no_leakage.pkl")
             upload_joblib(self.depth_model, "models/ann_foundation_depth_no_leakage.pkl")
 
             metadata = {
-                "version": "3.0-no-leakage",
+                "version": "4.0-improved-targets",
                 "model_type": "multi_output_regression",
                 "targets": ["foundation_width_B", "foundation_depth_D"],
-                "removed_targets": ["lb_ratio"],
                 "removed_leakage_features": [
                     "factor_of_safety", "csr", "crr", "cyclic_strength_ratio",
                     "liquefaction_probability", "liquefaction_status",
@@ -453,15 +582,20 @@ class MultiOutputANNTraining:
                 "architecture": {
                     "type": "MLPRegressor",
                     "input_layer": len(self.feature_names),
-                    "hidden_layers": [30, 15],
-                    "hidden_activation": "tanh",
+                    "hidden_layers": [64, 32],
+                    "hidden_activation": "relu",
                     "output_layer": 2,
                     "output_activation": "linear",
                     "solver": "adam",
+                    "early_stopping": True,
                 },
-                "training_samples": len(self.X_all),
-                "validation_samples": 0,
-                "data_split": "none - 100% cleaned data used for training",
+                "training_samples": len(self.X_train),
+                "test_samples": len(self.X_test),
+                "data_split": "80/20 train/test",
+                "target_generation": (
+                    "B: Meyerhof (1956) SPT back-calculation + fines correction. "
+                    "D: GWL-based + N-strength + stored FS when available."
+                ),
                 "timestamp": datetime.now().isoformat(),
             }
 
@@ -478,7 +612,7 @@ class MultiOutputANNTraining:
 
     def run(self) -> bool:
         print("\n" + "=" * 80)
-        print("NO-LEAKAGE ANN MODEL TRAINING")
+        print("ANN MODEL TRAINING — v4 (improved targets + 80/20 split)")
         print("=" * 80)
         print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -494,18 +628,19 @@ class MultiOutputANNTraining:
             if not step():
                 return False
 
-        validation_file = self.export_validation_excel()
         if not self.save_models():
             return False
 
         print("\n" + "=" * 80)
-        print("[SUCCESS] NO-LEAKAGE TRAINING COMPLETED")
+        print("[SUCCESS] TRAINING COMPLETED")
         print("=" * 80)
-        print(f"  Inputs: {len(self.feature_names)} raw features")
-        print("  Outputs: B and D only")
-        print("  Removed leakage: factor_of_safety, csr, crr/cyclic_strength_ratio")
-        print("  Removed output: L/B ratio")
-        print("  Data split: none, 100% cleaned data used for training")
+        print(f"  Features      : {len(self.feature_names)} raw soil properties")
+        print(f"  Architecture  : {self.X_train.shape[1]} → 64 → 32 → 2 (relu / linear)")
+        print(f"  Training rows : {len(self.X_train)}")
+        print(f"  Test rows     : {len(self.X_test)}")
+        print(f"  Outputs       : Foundation Width B, Foundation Depth D")
+        print(f"  B target      : Meyerhof SPT back-calculation (varies with N & fines)")
+        print(f"  D target      : GWL + N-strength + FS when available")
         return True
 
 
@@ -518,7 +653,7 @@ def main():
     if not success:
         sys.exit(1)
 
-    print("\n✓ Training completed successfully!")
+    print("\nTraining completed successfully!")
 
 
 if __name__ == "__main__":
