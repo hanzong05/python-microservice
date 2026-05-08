@@ -878,7 +878,7 @@ class GeotechnicalPipeline:
         df['msf'] = MSF
         print(f"  MSF: {MSF:.6f}")
 
-        Q_ACTUAL = 50.0
+        Q_ACTUAL = 150.0  # kPa — representative single/double-storey building load
         df['q_actual_kpa'] = Q_ACTUAL
         print(
             f"  q_actual: {Q_ACTUAL} kPa (default building contact pressure)")

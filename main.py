@@ -1159,13 +1159,30 @@ async def predict(
         # LPI = Σ F(z) · W(z) · h   for all layers with midpoint depth ≤ 20 m
         #   F(z) = max(0, 1 - FS)   (0 for non-liquefiable layers)
         #   W(z) = max(0, 10 - 0.5·z)   (depth-weighting, zero below 20 m)
+        #
+        # FS used here = min(computed_fs, db_proxy_fs) so the LPI always
+        # honours the stored DPWH BSDS classification per layer.  Without this,
+        # layers classified HIGH/VERY HIGH in the DB can show LPI = 0 when the
+        # IDW-interpolated CSR/CRR fall back to their safe defaults (0.2/0.3).
+        _DB_RISK_TO_FS = {
+            'VERY HIGH': 0.60,   # DPWH: FS < 0.8  → midpoint ~0.6
+            'HIGH':      0.90,   # DPWH: FS < 1.0  → midpoint ~0.9
+            'MEDIUM':    1.10,   # DPWH: FS < 1.2  → just above 1.0 (no LPI contribution)
+            'LOW':       1.35,   # DPWH: FS < 1.5
+            'VERY LOW':  2.00,   # DPWH: FS ≥ 1.5
+        }
         lpi = 0.0
         for lyr in interpolated_layers:
             z_mid = (float(lyr.get('depth_from_m', 0)) + float(lyr.get('depth_to_m', 0))) / 2.0
             if z_mid > 20.0:
                 continue
             h_i = float(lyr.get('layer_thickness', 1.5))
-            fs_i = lyr['fs']
+            fs_computed = lyr['fs']
+            db_risk_lyr = lyr.get('liquefaction_risk_level', 'VERY LOW')
+            fs_db_proxy = _DB_RISK_TO_FS.get(db_risk_lyr, 2.0)
+            # Use the more conservative (lower) FS so LPI is consistent with
+            # whichever source gives the stronger liquefaction signal
+            fs_i = min(fs_computed, fs_db_proxy)
             F_i = max(0.0, 1.0 - fs_i)
             W_i = max(0.0, 10.0 - 0.5 * z_mid)
             lpi += F_i * W_i * h_i

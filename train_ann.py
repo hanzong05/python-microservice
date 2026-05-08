@@ -243,7 +243,7 @@ class MultiOutputANNTraining:
         NOTE: factor_of_safety is used only for TARGET computation here (not as a
         model input), so there is no leakage — the ANN inputs remain raw features.
         """
-        q_actual = 50.0
+        q_actual = 150.0  # kPa — representative single/double-storey building load
 
         # --- SPT N value (best available) ---
         n = row.get("spt_n160")
