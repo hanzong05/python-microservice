@@ -41,6 +41,23 @@ except ImportError:
     print("[INFO] Supabase not available - database storage will be skipped")
 
 
+# USCS-based soil property lookup tables used in validate_soil_parameters.
+# Values are typical midpoints from Bowles (1988) and USCS classification tables.
+_USCS_UNIT_WEIGHT = {
+    'GW': 20.0, 'GP': 18.0, 'SW': 19.0, 'SP': 17.5,
+    'GM': 20.0, 'GC': 19.5, 'SM': 19.0, 'SC': 19.5,
+    'ML': 17.0, 'MH': 16.0, 'CL': 17.5, 'CH': 16.5,
+    'OL': 14.0, 'OH': 13.0, 'PT': 11.0,
+}  # kN/m³
+
+_USCS_FINES_PCT = {
+    'GW':  3.0, 'GP':  3.0, 'SW':  3.0, 'SP':  3.0,
+    'GM': 10.0, 'GC': 22.0, 'SM': 10.0, 'SC': 22.0,
+    'ML': 60.0, 'MH': 70.0, 'CL': 65.0, 'CH': 75.0,
+    'OL': 75.0, 'OH': 80.0, 'PT': 90.0,
+}  # percent passing #200 sieve
+
+
 class GeotechnicalPipeline:
     """
     Single-pass geotechnical data processing pipeline
@@ -379,7 +396,27 @@ class GeotechnicalPipeline:
         """Validate soil parameters"""
         df_clean = df.copy()
 
-        # Unit weight
+        # ── USCS symbol parsed FIRST so it can inform unit-weight / fines defaults ──
+        uscs_col = None
+        for col in ['USCS Symbol', 'uscs_symbol', 'USCS Classification', 'USCS']:
+            if col in df_clean.columns:
+                uscs_col = col
+                break
+
+        if uscs_col:
+            df_clean['uscs_symbol'] = (df_clean[uscs_col]
+                                       .fillna('')
+                                       .astype(str)
+                                       .str.strip())
+            df_clean['uscs_symbol'] = df_clean['uscs_symbol'].replace('nan', '')
+        else:
+            df_clean['uscs_symbol'] = ''
+
+        # Normalised USCS for lookup (takes the first 2 chars to handle duals like SM-SC)
+        uscs_upper = df_clean['uscs_symbol'].str.upper().str.strip()
+        uscs_primary = uscs_upper.str[:2]   # e.g. 'SM-SC' → 'SM'
+
+        # ── Unit weight ───────────────────────────────────────────────────────
         unit_weight_col = None
         for col in ['Unit Weight (γ)', 'Unit Weight', 'unit_weight', 'Unit Weight (kN/m³)', 'γ']:
             if col in df_clean.columns:
@@ -395,11 +432,14 @@ class GeotechnicalPipeline:
                 if invalid > 0:
                     self.validation_warnings.append(
                         f"Unit weight out of typical range (10-25 kN/m³): {invalid} records")
-            df_clean['unit_weight'] = df_clean['unit_weight'].fillna(18.0)
         else:
-            df_clean['unit_weight'] = 18.0
+            df_clean['unit_weight'] = np.nan
 
-        # Fines content
+        # Fill missing with USCS-informed default, then fall back to 18.0
+        uscs_uw_default = uscs_primary.map(_USCS_UNIT_WEIGHT).fillna(18.0)
+        df_clean['unit_weight'] = df_clean['unit_weight'].fillna(uscs_uw_default)
+
+        # ── Fines content ─────────────────────────────────────────────────────
         fines_col = None
         for col in ['Fines Content', 'fines_content', 'Fines (%)', 'Fines']:
             if col in df_clean.columns:
@@ -415,11 +455,14 @@ class GeotechnicalPipeline:
                 if invalid > 0:
                     self.validation_errors.append(
                         f"Fines content out of valid range (0-100%): {invalid} records")
-            df_clean['fines_content'] = df_clean['fines_content'].fillna(15.0)
         else:
-            df_clean['fines_content'] = 15.0
+            df_clean['fines_content'] = np.nan
 
-        # Groundwater depth
+        # Fill missing with USCS-informed default, then fall back to 15.0
+        uscs_fc_default = uscs_primary.map(_USCS_FINES_PCT).fillna(15.0)
+        df_clean['fines_content'] = df_clean['fines_content'].fillna(uscs_fc_default)
+
+        # ── Groundwater depth ─────────────────────────────────────────────────
         gwl_col = None
         for col in ['Groundwater Level (m)', 'Ground Water Table', 'Groundwater Level',
                     'Groundwater Depth', 'groundwater_depth_m', 'GWL', 'Water Table']:
@@ -428,14 +471,17 @@ class GeotechnicalPipeline:
                 break
 
         if gwl_col:
-            df_clean['groundwater_depth_m'] = pd.to_numeric(
-                df_clean[gwl_col], errors='coerce')
-            df_clean['groundwater_depth_m'] = df_clean['groundwater_depth_m'].fillna(
-                5.0)
+            gwl_numeric = pd.to_numeric(df_clean[gwl_col], errors='coerce')
         else:
-            df_clean['groundwater_depth_m'] = 5.0
+            gwl_numeric = pd.Series(np.nan, index=df_clean.index)
 
-        # Soil type
+        # Track which rows received the 5.0 fallback — fill_missing_by_borehole
+        # will later replace these with propagated within-borehole real values.
+        gwl_null_mask = gwl_numeric.isna()
+        df_clean['groundwater_depth_m'] = gwl_numeric.fillna(5.0)
+        df_clean['gwl_estimated'] = gwl_null_mask
+
+        # ── Soil type ─────────────────────────────────────────────────────────
         soil_type_col = None
         for col in ['Soil Type', 'soil_type', 'Soil Classification', 'Classification']:
             if col in df_clean.columns:
@@ -449,22 +495,7 @@ class GeotechnicalPipeline:
                                      .str.strip())
             df_clean['soil_type'] = df_clean['soil_type'].replace('nan', '')
 
-        # USCS symbol
-        uscs_col = None
-        for col in ['USCS Symbol', 'uscs_symbol', 'USCS Classification', 'USCS']:
-            if col in df_clean.columns:
-                uscs_col = col
-                break
-
-        if uscs_col:
-            df_clean['uscs_symbol'] = (df_clean[uscs_col]
-                                       .fillna('')
-                                       .astype(str)
-                                       .str.strip())
-            df_clean['uscs_symbol'] = df_clean['uscs_symbol'].replace(
-                'nan', '')
-
-        # Soil description
+        # ── Soil description ──────────────────────────────────────────────────
         desc_col = None
         for col in ['Soil/Rock Description', 'Soil Description', 'soil_description', 'Description', 'Soil Name']:
             if col in df_clean.columns:
@@ -479,7 +510,7 @@ class GeotechnicalPipeline:
             df_clean['soil_description'] = df_clean['soil_description'].replace(
                 'nan', '')
 
-        # Internal friction angle
+        # ── Internal friction angle ───────────────────────────────────────────
         friction_col = None
         for col in ['Internal Friction Angle', 'Friction Angle', 'friction_angle', 'φ']:
             if col in df_clean.columns:
@@ -490,7 +521,7 @@ class GeotechnicalPipeline:
             df_clean['friction_angle'] = pd.to_numeric(
                 df_clean[friction_col], errors='coerce')
 
-        # Plasticity Index
+        # ── Plasticity Index ──────────────────────────────────────────────────
         pi_col = None
         for col in ['Plasticity Index (PI)', 'Plasticity Index', 'plasticity_index', 'PI']:
             if col in df_clean.columns:
@@ -501,7 +532,7 @@ class GeotechnicalPipeline:
             df_clean['plasticity_index'] = pd.to_numeric(
                 df_clean[pi_col], errors='coerce')
 
-        # Natural water content
+        # ── Natural water content ─────────────────────────────────────────────
         wc_col = None
         for col in ['Natural Water Content (ω)', 'Natural Water Content', 'moisture_content',
                     'Water Content', 'Moisture Content']:
@@ -513,7 +544,7 @@ class GeotechnicalPipeline:
             df_clean['moisture_content'] = pd.to_numeric(
                 df_clean[wc_col], errors='coerce')
 
-        # Mean particle size D50
+        # ── Mean particle size D50 ────────────────────────────────────────────
         d50_col = None
         for col in ['Mean Particle Size (D50) (mm)', 'Mean Particle Size', 'mean_particle_size_d50',
                     'D50', 'Particle Size (D50)']:
@@ -688,7 +719,145 @@ class GeotechnicalPipeline:
                 print(
                     f"      [FILL] CSR: {filled} rows computed (Seed & Idriss 1971)")
 
+        # 5. Friction angle from SPT — Wolff (1989) for granular; 15° floor for cohesive
+        COHESIVE_USCS = {'CL', 'CH', 'ML', 'MH', 'OL', 'OH', 'PT', 'CL-ML'}
+        uscs_fa = (df['uscs_symbol'].fillna('').astype(str).str.strip().str.upper()
+                   if 'uscs_symbol' in df.columns
+                   else pd.Series([''] * len(df), index=df.index))
+        is_cohesive_fa = uscs_fa.str[:2].isin(COHESIVE_USCS) | uscs_fa.isin(COHESIVE_USCS)
+
+        fa_col_candidates = ['friction_angle', 'Internal Friction Angle', 'Friction Angle']
+        fa_col = next((c for c in fa_col_candidates if c in df.columns), None)
+        if fa_col:
+            missing_fa = pd.to_numeric(df[fa_col], errors='coerce').isna()
+            n_fa = df['spt_n_value'].clip(lower=1.0)
+            # Wolff (1989): φ = 27.1 + 0.3·N − 0.00054·N²  (granular soils)
+            phi_granular = (27.1 + 0.3 * n_fa - 0.00054 * n_fa ** 2).clip(25.0, 45.0)
+            phi_fill = np.where(is_cohesive_fa, 15.0, phi_granular)
+            df.loc[missing_fa, fa_col] = phi_fill[missing_fa].round(1)
+            filled = missing_fa.sum()
+            if filled:
+                print(f"      [FILL] Friction angle: {filled} rows computed "
+                      f"(Wolff 1989 granular / 15° cohesive floor)")
+
+        # 6. Elastic modulus from SPT — Bowles (1988), stored as MN/m²
+        #    Sand:  Es = 0.5·(N+15)   MN/m²
+        #    Silt:  Es = 0.3·(N+6)    MN/m²
+        #    Clay:  Es = 0.2·N        MN/m²
+        SAND_USCS = {'SW', 'SP', 'SM', 'SC', 'GW', 'GP', 'GM', 'GC'}
+        SILT_USCS = {'ML', 'MH'}
+        uscs_es = (df['uscs_symbol'].fillna('').astype(str).str.strip().str.upper()
+                   if 'uscs_symbol' in df.columns
+                   else pd.Series([''] * len(df), index=df.index))
+        uscs_es_primary = uscs_es.str[:2]
+        is_sand_es = uscs_es_primary.isin(SAND_USCS) | uscs_es.isin(SAND_USCS)
+        is_silt_es = uscs_es_primary.isin(SILT_USCS) | uscs_es.isin(SILT_USCS)
+
+        es_col_candidates = ['Elastic Modulus (Es) (MN/m²)', 'elastic_modulus_es']
+        es_col = next((c for c in es_col_candidates if c in df.columns), None)
+        if es_col:
+            missing_es = pd.to_numeric(df[es_col], errors='coerce').isna()
+            n_es = df['spt_n_value'].clip(lower=1.0)
+            es_sand = 0.5 * (n_es + 15.0)
+            es_silt = 0.3 * (n_es + 6.0)
+            es_clay = 0.2 * n_es
+            es_fill = np.where(is_sand_es, es_sand,
+                               np.where(is_silt_es, es_silt, es_clay))
+            df.loc[missing_es, es_col] = es_fill[missing_es].round(2)
+            filled = missing_es.sum()
+            if filled:
+                print(f"      [FILL] Elastic modulus: {filled} rows computed "
+                      f"(Bowles 1988 SPT correlation, MN/m²)")
+
         return df
+
+    def fill_missing_by_borehole(self) -> bool:
+        """
+        Improve defaulted values using within-borehole context after all sheets
+        are concatenated.
+
+        - GWL: if any layer in the same borehole has a real measured value,
+               propagate its median to the layers that received the 5.0 fallback.
+        - PGA: same propagation strategy (default sentinel = 0.35 g).
+        - SPT N: linear interpolation across depth layers when ≥2 measured
+               values exist in the borehole; forward/back fill for edge layers.
+
+        Must run BEFORE calculate_csr_crr so that the improved values feed into
+        CSR/CRR/FS computations.
+        """
+        print("\n" + "="*80)
+        print("FILLING MISSING VALUES BY BOREHOLE (cross-depth propagation)")
+        print("="*80)
+
+        df = self.processed_data.copy()
+
+        # Identify borehole ID column
+        bh_col = None
+        for c in ['Borehole ID', 'borehole_id']:
+            if c in df.columns:
+                bh_col = c
+                break
+
+        if bh_col is None:
+            print("  [SKIP] No borehole ID column found — skipping cross-depth fill")
+            return True
+
+        df = df.sort_values([bh_col, 'depth_mid_m']).reset_index(drop=True)
+
+        # ── GWL propagation ───────────────────────────────────────────────────
+        gwl_updated = 0
+        if 'gwl_estimated' in df.columns and 'groundwater_depth_m' in df.columns:
+            for bh_id, grp in df.groupby(bh_col, sort=False):
+                real_mask = ~grp['gwl_estimated']
+                est_mask  =  grp['gwl_estimated']
+                if real_mask.any() and est_mask.any():
+                    real_gwl = grp.loc[real_mask, 'groundwater_depth_m'].median()
+                    df.loc[grp.index[est_mask], 'groundwater_depth_m'] = real_gwl
+                    df.loc[grp.index[est_mask], 'gwl_estimated'] = False
+                    gwl_updated += int(est_mask.sum())
+            print(f"  [FILL] GWL propagated within boreholes : {gwl_updated} rows updated")
+        else:
+            print("  [SKIP] GWL propagation: gwl_estimated flag column not present")
+
+        # ── PGA propagation ───────────────────────────────────────────────────
+        _DEFAULT_PGA = 0.35
+        pga_updated = 0
+        if 'pga_g' in df.columns:
+            for bh_id, grp in df.groupby(bh_col, sort=False):
+                real_mask = grp['pga_g'] != _DEFAULT_PGA
+                est_mask  = grp['pga_g'] == _DEFAULT_PGA
+                if real_mask.any() and est_mask.any():
+                    real_pga = grp.loc[real_mask, 'pga_g'].median()
+                    df.loc[grp.index[est_mask], 'pga_g'] = real_pga
+                    pga_updated += int(est_mask.sum())
+            print(f"  [FILL] PGA propagated within boreholes : {pga_updated} rows updated")
+
+        # ── SPT N interpolation ───────────────────────────────────────────────
+        _DEFAULT_SPT = 15.0
+        spt_updated = 0
+        if 'spt_n_value' in df.columns:
+            for bh_id, grp in df.groupby(bh_col, sort=False):
+                spt = grp['spt_n_value'].copy()
+                real_mask = spt != _DEFAULT_SPT
+                # Need ≥2 real measurements to interpolate meaningfully
+                if real_mask.sum() >= 2:
+                    spt_real = spt.where(real_mask)
+                    spt_interp = (spt_real
+                                  .interpolate(method='index')
+                                  .ffill()
+                                  .bfill()
+                                  .clip(lower=1.0, upper=100.0))
+                    default_idx = grp.index[~real_mask]
+                    if len(default_idx) > 0:
+                        df.loc[default_idx, 'spt_n_value'] = (
+                            spt_interp.loc[default_idx].round(1)
+                        )
+                        spt_updated += len(default_idx)
+            print(f"  [FILL] SPT N interpolated within boreholes: {spt_updated} rows updated")
+
+        self.processed_data = df
+        print(f"  [OK] Borehole-level fill complete")
+        return True
 
     def calculate_csr_crr(self) -> bool:
         """
@@ -1399,6 +1568,7 @@ class GeotechnicalPipeline:
         steps = [
             ("Load Excel", self.load_excel),
             ("Process and Validate", self.process_and_validate),
+            ("Fill Missing Values by Borehole", self.fill_missing_by_borehole),
             ("Calculate CSR/CRR + Magnitude", self.calculate_csr_crr),
             ("Bearing Capacity & Settlement (Bowles 1988)",
              self.calculate_bearing_bowles),
