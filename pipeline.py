@@ -795,40 +795,30 @@ class GeotechnicalPipeline:
 
         df = self.processed_data.copy()
 
-        B = 2.0
+        B = 3.0       # footing width (m) — matches thesis validation standard
         D = 1.5
         SI_ALLOW = 25.0
-        FS_DESIGN = 3.0
 
-        Kd = 1.0 + 0.33 * (D / B)
+        # Depth correction factor (Meyerhof 1956)
+        Kd = 1.0 + 0.33 * (D / B)   # = 1.165 for D=1.5 m, B=3.0 m
         df['foundation_kd'] = Kd
 
         N = df['spt_n160'].clip(lower=1.0)
 
-        phi_deg = (27.1 + 0.3 * N - 0.00054 * N **
-                   2).clip(lower=25.0, upper=45.0)
-        phi_rad = np.radians(phi_deg)
+        # Meyerhof (1956) SPT-based allowable bearing capacity
+        # For B > 1.2 m: qa = 8·N·((B+0.3)/B)²·Kd  [kPa, Si = 25 mm]
+        # Reference: Bowles (1988), Table 4-4
+        size_factor = ((B + 0.3) / B) ** 2          # = 1.21 for B = 3.0 m
+        Qa = (8.0 * N * size_factor * Kd).clip(lower=1.0)
 
-        Nq = np.exp(np.pi * np.tan(phi_rad)) * \
-            np.tan(np.radians(45) + phi_rad / 2) ** 2
-        Ng = 2.0 * (Nq + 1.0) * np.tan(phi_rad)
-
-        Fqs = 1.0 + np.tan(phi_rad)
-        Fgs = 0.6
-
-        q_overburden = df['unit_weight'] * D
-
-        Qu = q_overburden * Nq * Fqs + 0.5 * df['unit_weight'] * B * Ng * Fgs
-        df['bearing_qu_kpa'] = Qu.clip(lower=0.0)
-
-        Qa = Qu / FS_DESIGN
-        df['bearing_qa_kpa'] = Qa.clip(lower=1.0)
+        df['bearing_qa_kpa'] = Qa
+        df['bearing_qu_kpa'] = (Qa * 3.0).clip(lower=0.0)   # back-computed Qu (FS = 3)
 
         df['settlement_mm'] = (df['q_actual_kpa'] /
                                df['bearing_qa_kpa']) * SI_ALLOW
 
         print(
-            f"  Foundation: B={B}m, D={D}m, Kd={Kd:.4f}, FS_design={FS_DESIGN}")
+            f"  Foundation: B={B}m, D={D}m, Kd={Kd:.4f}, size_factor={size_factor:.4f}")
         print(
             f"  Qu  range : {df['bearing_qu_kpa'].min():.1f} – {df['bearing_qu_kpa'].max():.1f} kPa")
         print(

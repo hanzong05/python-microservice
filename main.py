@@ -1014,36 +1014,66 @@ async def predict(
                         risk_level, severity = "VERY LOW", "Very Low"
                     data_source = db_override['source']
 
-        # ── Bearing capacity (Meyerhof/Bowles using ANN-predicted B and D) ─────
-        MAX_PRACTICAL_B_M = 3.0   # maximum practical shallow foundation width (m)
-        MAX_PRACTICAL_D_M = 3.0   # maximum practical shallow foundation depth (m)
-        B = B_pred; D = D_pred; FS_DESIGN = 3.0; SI_ALLOW = 25.0
-        N  = max(1.0, spt_n60)
-        phi_deg = min(45.0, max(25.0, 27.1 + 0.3 * N - 0.00054 * N ** 2))
-        phi_rad = _math.radians(phi_deg)
-        Nq  = _math.exp(_math.pi * _math.tan(phi_rad)) * _math.tan(_math.radians(45) + phi_rad / 2) ** 2
-        Ng  = 2.0 * (Nq + 1.0) * _math.tan(phi_rad)
-        Fqs = 1.0 + _math.tan(phi_rad)
-        Fgs = 0.6
-        qu_site = unit_weight * D * Nq * Fqs + 0.5 * unit_weight * B * Ng * Fgs
-        qa_site = max(1.0, qu_site / FS_DESIGN)
+        # ── Bearing capacity (Meyerhof 1956, SPT-based, settlement-limited) ─────
+        # For B > 1.2 m: qa = 8·N·((B+0.3)/B)²·Kd  [kPa, Si = 25 mm]
+        # Reference: Bowles (1988), Table 4-4
+        MAX_PRACTICAL_B_M = 3.0
+        MAX_PRACTICAL_D_M = 3.0
+        B = B_pred; D = D_pred; SI_ALLOW = 25.0
+        N = max(1.0, spt_n60)
+        Kd = min(2.0, 1.0 + 0.33 * (D / max(B, 0.01)))
+        if B <= 1.2:
+            qa_site = 12.0 * N * Kd
+        else:
+            qa_site = 8.0 * N * ((B + 0.3) / B) ** 2 * Kd
+        qa_site = max(1.0, qa_site)
 
-        if qa_site < q_actual:
-            # Iterative width optimisation: step B by b_increment (m) until qa >= q_actual
-            B_iter = B
-            while B_iter <= MAX_PRACTICAL_B_M:
-                qu_iter = unit_weight * D * Nq * Fqs + 0.5 * unit_weight * B_iter * Ng * Fgs
-                qa_iter = max(1.0, qu_iter / FS_DESIGN)
-                if qa_iter >= q_actual:
-                    break
-                B_iter = round(B_iter + b_increment, 6)
-            B = B_iter
-            B_pred = B
-            qu_site = unit_weight * D * Nq * Fqs + 0.5 * unit_weight * B * Ng * Fgs
-            qa_site = max(1.0, qu_site / FS_DESIGN)
+        # ── Schmertmann (1978) elastic settlement ─────────────────────────────
+        # Se = C1·C2·qn·Σ(Iz/Es·Δz) for all layers within 2B influence depth
+        sigma_v0_found = unit_weight * D
+        u_found = max(0.0, (D - gwl) * 9.81) if D > gwl else 0.0
+        sigma_v0_eff_found = max(1.0, sigma_v0_found - u_found)
+        qn = max(0.0, q_actual - sigma_v0_eff_found)
 
-        # Pre-liquefaction settlement (Bowles)
-        pre_liq_settlement_cm = (q_actual / qa_site) * SI_ALLOW / 10.0  # cm
+        if qn > 1.0:
+            C1_schm = max(0.05, 1.0 - 0.5 * (sigma_v0_eff_found / qn))
+            t_elapsed = max(0.1, float(t_years) if t_years is not None else 1.0)
+            C2_schm = 1.0 + 0.2 * _math.log10(t_elapsed / 0.1)
+
+            z_peak = D + B / 2.0
+            sigma_peak = max(1.0, unit_weight * z_peak - max(0.0, (z_peak - gwl) * 9.81))
+            Izp = min(0.9, 0.5 + 0.1 * _math.sqrt(qn / sigma_peak))
+
+            z_influence = 2.0 * B
+            schm_sum = 0.0
+            for _lyr in interpolated_layers:
+                zt = float(_lyr.get('depth_from_m', 0))
+                zb = float(_lyr.get('depth_to_m', 0))
+                if zb <= D:
+                    continue
+                zt_eff = max(zt, D)
+                zb_eff = min(zb, D + z_influence)
+                if zb_eff <= zt_eff:
+                    continue
+                h_l = zb_eff - zt_eff
+                z_m = (zt_eff + zb_eff) / 2.0 - D
+                if z_m <= B / 2.0:
+                    Iz_l = 0.1 + (Izp - 0.1) * z_m / (B / 2.0)
+                else:
+                    Iz_l = Izp * (z_influence - z_m) / (z_influence - B / 2.0)
+                Iz_l = max(0.0, Iz_l)
+                Es_r = float(_lyr.get('elastic_modulus_es') or 0.0)
+                if Es_r <= 0:
+                    Es_kpa = 1500.0 * max(1.0, float(_lyr.get('spt_n_value', 10) or 10))
+                elif Es_r < 500:
+                    Es_kpa = Es_r * 1000.0   # stored as MPa/MN·m⁻², convert to kPa
+                else:
+                    Es_kpa = Es_r            # already in kPa
+                schm_sum += (Iz_l / Es_kpa) * h_l
+
+            pre_liq_settlement_cm = 1000.0 * C1_schm * C2_schm * qn * schm_sum / 10.0
+        else:
+            pre_liq_settlement_cm = 0.0
 
         # ── Per-layer Tokimatsu & Seed (1987) settlement ───────────────────────
         # Map DPWH 5-level DB classification → our 4-level scheme
@@ -1106,7 +1136,8 @@ async def predict(
         elif risk_level == "LOW":
             total_settlement_cm = max(total_settlement_cm, 1.5)
 
-        settlement_cm = round(total_settlement_cm, 2) if liquefiable_layers else pre_liq_settlement_cm
+        # Total = Schmertmann elastic + Tokimatsu-Seed volumetric (liquefied layers)
+        settlement_cm = round(pre_liq_settlement_cm + total_settlement_cm, 2)
 
         # ── Liquefaction Potential Index – Iwasaki et al. (1978) ──────────────
         # LPI = Σ F(z) · W(z) · h   for all layers with midpoint depth ≤ 20 m
@@ -1126,11 +1157,9 @@ async def predict(
         lpi = round(lpi, 2)
 
         if lpi == 0:
-            lpi_severity = "None"
-        elif lpi <= 2:
-            lpi_severity = "Low"
+            lpi_severity = "Very Low"
         elif lpi <= 5:
-            lpi_severity = "Moderate"
+            lpi_severity = "Low"
         elif lpi <= 15:
             lpi_severity = "High"
         else:
@@ -1226,7 +1255,7 @@ async def predict(
         if mitigation_required:
             recommendations.extend([
                 "⚠️ CRITICAL: Calculated settlement exceeds the 25 mm allowable limit and the foundation is "
-                "already at its maximum practical dimensions (width = 3 m, depth = 3 m). "
+                "already at its maximum practical dimensions (base = 3 m, depth = 3 m). "
                 "Conventional shallow foundations are insufficient — mitigation is required.",
                 "Mitigation Option 1 — Deep Foundations: Install driven or bored piles / drilled caissons "
                 "to transfer structural loads to deep, competent bearing strata below the liquefiable zone.",
@@ -1300,7 +1329,7 @@ async def predict(
                 "q_actual_kpa": q_actual,
                 "magnitude_mw": magnitude,
                 "msf": round(msf, 4),
-                "fs_design": FS_DESIGN,
+                "fs_design": 3.0,
                 "settlement_fs": round(settlement_fs, 2),
                 "b_increment_m": b_increment,
                 "t_years": t_years,
@@ -1470,7 +1499,7 @@ if __name__ == "__main__":
     port = int(os.getenv('PORT', 8000))
 
     uvicorn.run(
-        app,
+        "main:app",
         host="0.0.0.0",
         port=port,
         reload=True,
