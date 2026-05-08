@@ -1014,19 +1014,35 @@ async def predict(
                         risk_level, severity = "VERY LOW", "Very Low"
                     data_source = db_override['source']
 
-        # ── Bearing capacity (Meyerhof 1956, SPT-based, settlement-limited) ─────
-        # For B > 1.2 m: qa = 8·N·((B+0.3)/B)²·Kd  [kPa, Si = 25 mm]
-        # Reference: Bowles (1988), Table 4-4
+        # ── Bearing capacity (Meyerhof/Terzaghi, strength-based) ─────────────
+        # qu = γ·D·Nq·Fqs + 0.5·γ·B·Nγ·Fγs   →  qa = qu / FS
+        # qa increases with B (strength governs; settlement checked separately)
         MAX_PRACTICAL_B_M = 3.0
         MAX_PRACTICAL_D_M = 3.0
-        B = B_pred; D = D_pred; SI_ALLOW = 25.0
+        B = B_pred; D = D_pred; FS_DESIGN = 3.0; SI_ALLOW = 25.0
         N = max(1.0, spt_n60)
-        Kd = min(2.0, 1.0 + 0.33 * (D / max(B, 0.01)))
-        if B <= 1.2:
-            qa_site = 12.0 * N * Kd
-        else:
-            qa_site = 8.0 * N * ((B + 0.3) / B) ** 2 * Kd
-        qa_site = max(1.0, qa_site)
+        phi_deg = min(45.0, max(25.0, 27.1 + 0.3 * N - 0.00054 * N ** 2))
+        phi_rad = _math.radians(phi_deg)
+        Nq  = _math.exp(_math.pi * _math.tan(phi_rad)) * _math.tan(_math.radians(45) + phi_rad / 2) ** 2
+        Ng  = 2.0 * (Nq + 1.0) * _math.tan(phi_rad)
+        Fqs = 1.0 + _math.tan(phi_rad)
+        Fgs = 0.6
+        qu_site = unit_weight * D * Nq * Fqs + 0.5 * unit_weight * B * Ng * Fgs
+        qa_site = max(1.0, qu_site / FS_DESIGN)
+
+        if qa_site < q_actual:
+            # Increase B until qa meets q_actual (qa grows with B via 0.5·γ·B·Nγ term)
+            B_iter = B
+            while B_iter <= MAX_PRACTICAL_B_M:
+                qu_iter = unit_weight * D * Nq * Fqs + 0.5 * unit_weight * B_iter * Ng * Fgs
+                qa_iter = max(1.0, qu_iter / FS_DESIGN)
+                if qa_iter >= q_actual:
+                    break
+                B_iter = round(B_iter + b_increment, 6)
+            B = B_iter
+            B_pred = B
+            qu_site = unit_weight * D * Nq * Fqs + 0.5 * unit_weight * B * Ng * Fgs
+            qa_site = max(1.0, qu_site / FS_DESIGN)
 
         # ── Schmertmann (1978) elastic settlement ─────────────────────────────
         # Se = C1·C2·qn·Σ(Iz/Es·Δz) for all layers within 2B influence depth
