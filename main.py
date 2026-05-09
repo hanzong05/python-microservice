@@ -318,7 +318,8 @@ def get_borehole_all_layers(borehole_uuid: int) -> List[Dict]:
             'layer_number, depth_from_m, depth_to_m, '
             'spt_n_value, spt_n160, n1_60cs, unit_weight, fines_content, groundwater_depth_m, '
             'pga_g, csr, cyclic_strength_ratio, friction_angle, cohesion_kpa, '
-            'elastic_modulus_es, liquefaction_risk_level, liquefaction'
+            'elastic_modulus_es, liquefaction_risk_level, liquefaction, '
+            'bearing_qa_kpa, settlement_mm'          # ← ADD THESE TWO
         ).eq('borehole_id', borehole_uuid).order('layer_number').execute()
 
         layers = result.data if result.data else []
@@ -870,72 +871,63 @@ async def predict(
         fines_percent = float(interpolated_params.get('fines_content') or 10)
         fs_adjusted = critical_layer['fs']
 
-        # ── Bearing capacity (Meyerhof/Terzaghi strength-based) ───────────
-        MAX_B = 3.0
-        MAX_D = 3.0
-        FS_DESIGN = 3.0
+        # ── Bearing capacity — from pipeline DB values (FIX 12 corrected) ─
+        MAX_B = 5.0
+        MAX_D = 3.5
         SI_ALLOW = 25.0
-        B = B_pred
-        D = D_pred
-        N = max(1.0, spt_n60)
-        phi_deg = min(45.0, max(25.0, 27.1 + 0.3*N - 0.00054*N**2))
-        phi_rad = _math.radians(phi_deg)
-        Nq = _math.exp(_math.pi * _math.tan(phi_rad)) * \
-            _math.tan(_math.radians(45) + phi_rad/2)**2
-        Ng = 2.0 * (Nq + 1.0) * _math.tan(phi_rad)
-        Fqs = 1.0 + _math.tan(phi_rad)
-        Fgs = 0.6
-        qu_site = unit_weight * D * Nq * Fqs + 0.5 * unit_weight * B * Ng * Fgs
-        qa_site = max(1.0, qu_site / FS_DESIGN)
 
-        if qa_site < q_actual:
-            B_iter = B
-            while B_iter <= MAX_B:
-                qu_i = unit_weight*D*Nq*Fqs + 0.5*unit_weight*B_iter*Ng*Fgs
-                if max(1.0, qu_i/FS_DESIGN) >= q_actual:
-                    break
-                B_iter = round(B_iter + b_increment, 6)
-            B = B_iter
-            B_pred = B
-            qu_site = unit_weight*D*Nq*Fqs + 0.5*unit_weight*B*Ng*Fgs
-            qa_site = max(1.0, qu_site/FS_DESIGN)
+        # IDW-interpolate bearing_qa_kpa from DB (already ANN-corrected by pipeline)
+        def idw_bearing(layer_num, key):
+            vals = []
+            for bd in borehole_data:
+                lyr = next(
+                    (l for l in bd['layers'] if l['layer_number'] == layer_num), None)
+                if lyr and lyr.get(key) is not None:
+                    try:
+                        vals.append((float(lyr[key]), bd['norm_weight']))
+                    except (TypeError, ValueError):
+                        pass
+            if not vals:
+                return None
+            total_w = sum(w for _, w in vals)
+            return sum(v * w for v, w in vals) / total_w if total_w > 0 else None
 
+        # Pull bearing_qa_kpa for the critical layer number
+        crit_ln = critical_layer['layer_number']
+        qa_from_db = idw_bearing(crit_ln, 'bearing_qa_kpa')
+
+        if qa_from_db and qa_from_db > 1.0:
+            qa_site = qa_from_db
+            qu_site = qa_site * 3.0
+            B = B_pred
+            D = D_pred
+            print(
+                f"[INFO] Bearing capacity from DB (FIX 12): qa={qa_site:.1f} kPa")
+        else:
+            # Fallback: Meyerhof SPT-based (Bowles 1988) — same formula as pipeline
+            B = B_pred
+            D = D_pred
+            N = max(1.0, spt_n60)
+            Kd = 1.0 + 0.33 * (D / B)
+            size_factor = ((B + 0.3) / B) ** 2
+            qa_site = max(1.0, 8.0 * N * size_factor * Kd)
+            qu_site = qa_site * 3.0
+            print(
+                f"[INFO] Bearing capacity fallback (Meyerhof SPT): qa={qa_site:.1f} kPa")
         # ── Schmertmann (1978) elastic settlement ─────────────────────────
-        sigma_v0 = unit_weight * D
-        u_found = max(0.0, (D - gwl) * 9.81) if D > gwl else 0.0
-        se_found = max(1.0, sigma_v0 - u_found)
-        qn = max(0.0, q_actual - se_found)
+        # ── Settlement — from pipeline DB values (FIX 12 corrected) ──────
+        settle_from_db = idw_bearing(crit_ln, 'settlement_mm')
 
-        pre_liq_settlement_cm = 0.0
-        if qn > 1.0:
-            C1 = max(0.05, 1.0 - 0.5 * (se_found / qn))
-            t_el = max(0.1, float(t_years) if t_years else 1.0)
-            C2 = 1.0 + 0.2 * _math.log10(t_el / 0.1)
-            z_peak = D + B / 2.0
-            sp = max(1.0, unit_weight * z_peak -
-                     max(0.0, (z_peak - gwl) * 9.81))
-            Izp = min(0.9, 0.5 + 0.1 * _math.sqrt(qn / sp))
-            z_inf = 2.0 * B
-            schm_sum = 0.0
-            for _lyr in interpolated_layers:
-                zt = float(_lyr.get('depth_from_m', 0))
-                zb = float(_lyr.get('depth_to_m', 0))
-                if zb <= D:
-                    continue
-                zt_e = max(zt, D)
-                zb_e = min(zb, D + z_inf)
-                if zb_e <= zt_e:
-                    continue
-                h_l = zb_e - zt_e
-                z_m = (zt_e + zb_e) / 2.0 - D
-                Iz_l = (0.1 + (Izp - 0.1) * z_m / (B / 2.0)) if z_m <= B / 2.0 \
-                    else Izp * (z_inf - z_m) / (z_inf - B / 2.0)
-                Iz_l = max(0.0, Iz_l)
-                Es_r = float(_lyr.get('elastic_modulus_es') or 0.0)
-                Es_kpa = (Es_r * 1000.0 if Es_r < 500 else Es_r) if Es_r > 0 \
-                    else 1500.0 * max(1.0, float(_lyr.get('spt_n_value', 10) or 10))
-                schm_sum += (Iz_l / Es_kpa) * h_l
-            pre_liq_settlement_cm = 1000.0 * C1 * C2 * qn * schm_sum / 10.0
+        if settle_from_db and settle_from_db > 0:
+            # DB settlement is already in mm — convert to cm for internal consistency
+            pre_liq_settlement_cm = settle_from_db / 10.0
+            print(
+                f"[INFO] Settlement from DB (FIX 12): {settle_from_db:.1f} mm")
+        else:
+            # Fallback: simple Bowles estimate
+            pre_liq_settlement_cm = (q_actual / max(1.0, qa_site)) * 2.5
+            print(
+                f"[INFO] Settlement fallback: {pre_liq_settlement_cm:.1f} cm")
 
         # ── Tokimatsu & Seed (1987) volumetric settlement ─────────────────
         _DPWH_TO_4 = {'VERY HIGH': 'VERY HIGH', 'HIGH': 'HIGH', 'MEDIUM': 'LOW',
