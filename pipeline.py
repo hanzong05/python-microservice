@@ -1019,7 +1019,7 @@ class GeotechnicalPipeline:
         and severely underestimated settlement (0.9 mm instead of ~13 mm).
 
         After this step:
-          - foundation_B_m  : per-layer footing width  [1.0, 5.0] m
+          - foundation_b_m  : per-layer footing width  [1.0, 5.0] m
           - foundation_D_m  : per-layer footing depth  [1.0, 3.5] m
           - bearing_qa_kpa  : corrected allowable bearing capacity
           - bearing_qu_kpa  : corrected ultimate bearing capacity
@@ -1053,10 +1053,10 @@ class GeotechnicalPipeline:
             except Exception:
                 return 1.5
 
-        df['foundation_B_m'] = df.apply(_B, axis=1)
+        df['foundation_b_m'] = df.apply(_B, axis=1)
         df['foundation_D_m'] = df.apply(_D, axis=1)
 
-        B = df['foundation_B_m']
+        B = df['foundation_b_m']
         D = df['foundation_D_m']
         N = df['spt_n160'].clip(lower=1.0)
         SI = 25.0   # allowable settlement (mm)
@@ -1140,7 +1140,7 @@ class GeotechnicalPipeline:
             'effective_overburden_pressure', 'total_overburden_pressure',
             'factor_of_safety', 'liquefaction_probability', 'liquefaction',
             'liquefaction_risk_level', 'liquefaction_status',
-            'foundation_B_m', 'foundation_D_m',
+            'foundation_b_m', 'foundation_D_m',
             'bearing_qa_kpa', 'bearing_qu_kpa', 'settlement_mm',
             'is_core_sample', 'is_rock',
             'magnitude_mw', 'msf', 'lpi_weighing_factor', 'lpi_severity_factor',
@@ -1285,7 +1285,7 @@ class GeotechnicalPipeline:
           factor_of_safety, liquefaction_probability, liquefaction_status,
           spt_is_refusal, spt_is_imputed, is_core_sample, is_rock
 
-        FIX 12 — foundation_B_m, foundation_D_m stored;
+        FIX 12 — foundation_b_m, foundation_D_m stored;
           bearing_qa_kpa / settlement_mm now use ANN-derived dimensions.
 
         Run this SQL before first pipeline run if columns are missing:
@@ -1298,7 +1298,7 @@ class GeotechnicalPipeline:
             ADD COLUMN IF NOT EXISTS spt_is_imputed           BOOLEAN DEFAULT FALSE,
             ADD COLUMN IF NOT EXISTS is_core_sample           SMALLINT DEFAULT 0,
             ADD COLUMN IF NOT EXISTS is_rock                  SMALLINT DEFAULT 0,
-            ADD COLUMN IF NOT EXISTS foundation_B_m           FLOAT,
+            ADD COLUMN IF NOT EXISTS foundation_b_m           FLOAT,
             ADD COLUMN IF NOT EXISTS foundation_D_m           FLOAT;
         """
         print("\n  Step 7.3: Storing soil layers...")
@@ -1350,8 +1350,8 @@ class GeotechnicalPipeline:
                 'is_core_sample':           int(row.get('is_core_sample', 0)),
                 'is_rock':                  int(row.get('is_rock', 0)),
                 # ── FIX 12 — ANN-derived foundation dimensions ────────────
-                'foundation_B_m':   self.safe_float(row.get('foundation_B_m')),
-                'foundation_D_m':   self.safe_float(row.get('foundation_D_m')),
+                'foundation_b_m':   self.safe_float(row.get('foundation_b_m')),
+                'foundation_d_m':   self.safe_float(row.get('foundation_D_m')),
                 # ── Thesis analysis columns ───────────────────────────────
                 'n1_60cs':           self.safe_float(row.get('n1_60cs')),
                 'magnitude_mw':      self.safe_float(row.get('magnitude_mw')),
@@ -1413,7 +1413,7 @@ class GeotechnicalPipeline:
         print(f"    [OK] FIX 11: factor_of_safety, liquefaction_probability, "
               f"liquefaction_status, spt_is_refusal, spt_is_imputed, "
               f"is_core_sample, is_rock — all populated")
-        print(f"    [OK] FIX 12: foundation_B_m, foundation_D_m, "
+        print(f"    [OK] FIX 12: foundation_b_m, foundation_D_m, "
               f"bearing_qa_kpa, settlement_mm — ANN-corrected values stored")
         return True
 
@@ -1434,7 +1434,7 @@ class GeotechnicalPipeline:
 
             print("\n" + "─" * 80)
             print(
-                "  Run this SQL if foundation_B_m / foundation_D_m columns are missing:")
+                "  Run this SQL if foundation_b_m / foundation_D_m columns are missing:")
             print("""
   ALTER TABLE soil_layers
     ADD COLUMN IF NOT EXISTS factor_of_safety        FLOAT,
@@ -1444,8 +1444,8 @@ class GeotechnicalPipeline:
     ADD COLUMN IF NOT EXISTS spt_is_imputed           BOOLEAN DEFAULT FALSE,
     ADD COLUMN IF NOT EXISTS is_core_sample           SMALLINT DEFAULT 0,
     ADD COLUMN IF NOT EXISTS is_rock                  SMALLINT DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS foundation_B_m           FLOAT,
-    ADD COLUMN IF NOT EXISTS foundation_D_m           FLOAT;
+    ADD COLUMN IF NOT EXISTS foundation_b_m           FLOAT,
+    ADD COLUMN IF NOT EXISTS foundation_d_m           FLOAT;
 """)
             print("─" * 80)
             return True
