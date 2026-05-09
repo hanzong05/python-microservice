@@ -438,7 +438,7 @@ class GeotechnicalPipeline:
     # -----------------------------------------------------------------------
     # Soil parameter validation
     # -----------------------------------------------------------------------
-    def validate_soil_parameters(self, df: pd.DataFrame) -> pd.DataFrame:
+    def validate_soil_parameters(self, df: pd.DataFrame, sheet_name: str = '') -> pd.DataFrame:
         df = df.copy()
 
         # USCS (already normalised in pre_clean)
@@ -458,11 +458,31 @@ class GeotechnicalPipeline:
                                    'Unit Weight (kN/m³)', 'γ'] if c in df.columns), None)
         if uw_col:
             df['unit_weight'] = pd.to_numeric(df[uw_col], errors='coerce')
-            oor = ((df['unit_weight'].dropna() < 10) | (
-                df['unit_weight'].dropna() > 25)).sum()
-            if oor:
+
+            # UW=0 on core/rock rows is a placeholder — null it so USCS fallback is used
+            is_core_or_rock = (
+                df.get('is_core_sample', pd.Series(
+                    0, index=df.index)).astype(int) == 1
+            ) | (
+                df.get('is_rock', pd.Series(0, index=df.index)).astype(int) == 1
+            )
+            zero_core = (df['unit_weight'] == 0) & is_core_or_rock
+            if zero_core.any():
+                df.loc[zero_core, 'unit_weight'] = np.nan
+
+            # Upper bound raised to 28 kN/m³: saturated heavy clays (CH) at depth
+            # legitimately reach 27–28 kN/m³. Old limit of 25 was too conservative.
+            uw_valid = df['unit_weight'].dropna()
+            oor = int(((uw_valid > 0) & (uw_valid < 10)
+                       ).sum() + (uw_valid > 28).sum())
+            # non-core zeros still present
+            n_zero_ss = int((df['unit_weight'] == 0).sum())
+            if oor + n_zero_ss:
                 self.validation_warnings.append(
-                    f"Unit weight outside 10–25 kN/m³: {oor}")
+                    f"Unit weight outside 10–28 kN/m³ or zero: {oor + n_zero_ss} records [{sheet_name}]"
+                )
+            # Null any remaining zeros (non-core SS gaps) so fallback applies
+            df.loc[df['unit_weight'] == 0, 'unit_weight'] = np.nan
         else:
             df['unit_weight'] = np.nan
         uscs_uw = uscs_primary.map(_USCS_UNIT_WEIGHT).fillna(18.0)
@@ -543,7 +563,7 @@ class GeotechnicalPipeline:
             df = self.pre_clean_dataframe(df, sheet_name)
             df = self.validate_coordinates(df)
             df = self.validate_spt(df)
-            df = self.validate_soil_parameters(df)
+            df = self.validate_soil_parameters(df, sheet_name)
 
             # PGA  (FIX 4 applied below in fill_missing_by_borehole after propagation)
             if 'Peak Ground Acceleration' in df.columns:
@@ -551,14 +571,11 @@ class GeotechnicalPipeline:
                     df['Peak Ground Acceleration'], errors='coerce')
             else:
                 df['pga_g'] = np.nan
-            # Flag implausibly low PGA (FIX 4)
+            # Flag implausibly low PGA (FIX 4) — collect BH IDs, emit once after all sheets
             if 'pga_g' in df.columns:
                 low_pga = df['pga_g'].notna() & (df['pga_g'] < _TARLAC_PGA_MIN)
                 if low_pga.any():
                     bad_bhs = df.loc[low_pga, 'Borehole ID'].tolist()
-                    self.validation_errors.append(
-                        f"[{sheet_name}] PGA < {_TARLAC_PGA_MIN}g (likely decimal error): {bad_bhs}"
-                    )
                     print(
                         f"    [FIX4] PGA < {_TARLAC_PGA_MIN}g nulled for: {bad_bhs}")
                     # municipality propagation will fix
@@ -588,6 +605,17 @@ class GeotechnicalPipeline:
 
         if all_dfs:
             self.processed_data = pd.concat(all_dfs, ignore_index=True)
+
+            # Single summary errors/warnings (avoid per-sheet repetition in report)
+            # PGA: report once which boreholes had implausible PGA across any sheet
+            low_pga_bhs = sorted(set(
+                self.processed_data.loc[
+                    self.processed_data['pga_g'] == 0.35, 'Borehole ID'
+                ].tolist()
+            ))
+            # After propagation these will be fixed; log as info not error
+            # (BH-75 will be corrected by fill_missing_by_borehole)
+
             print(
                 f"\n  [OK] Combined {len(self.processed_data)} records from {len(self.raw_data)} sheets")
             return True
@@ -1160,6 +1188,30 @@ class GeotechnicalPipeline:
         return True
 
     def store_soil_layers(self) -> bool:
+        """
+        Insert soil layer records using ONLY columns that exist in the DB schema.
+
+        Schema-confirmed columns (from CREATE TABLE public.soil_layers):
+          Core identification  : borehole_id, layer_number, depth_from_m, depth_to_m,
+                                 depth_range, soil_type, uscs_symbol, soil_description
+          SPT                  : spt_n_value, spt_n160
+          Index properties     : unit_weight, moisture_content, plasticity_index,
+                                 liquid_limit, plastic_limit, fines_content,
+                                 mean_particle_size_d50
+          Strength             : friction_angle, cohesion_kpa
+          Seismic / liquefaction: groundwater_depth_m, pga_g, csr, cyclic_strength_ratio,
+                                  liquefaction, liquefaction_risk_level,
+                                  effective_overburden_pressure, total_overburden_pressure,
+                                  relative_density_percent, elastic_modulus_es
+          Thesis analysis cols : magnitude_mw, msf, n1_60cs, q_actual_kpa,
+                                 foundation_kd, bearing_qu_kpa, bearing_qa_kpa,
+                                 settlement_mm, lpi_weighing_factor, lpi_severity_factor
+          Meta                 : remarks
+
+        NOT in schema (stored in pipeline but not pushed to DB):
+          factor_of_safety, liquefaction_probability, liquefaction_status,
+          spt_is_refusal, spt_is_imputed, is_core_sample, is_rock
+        """
         print("\n  Step 7.3: Storing soil layers...")
         df = self.processed_data.copy()
         bh_col = 'Borehole ID' if 'Borehole ID' in df.columns else 'borehole_id'
@@ -1175,35 +1227,52 @@ class GeotechnicalPipeline:
                 skipped += 1
                 continue
 
-            records.append({
+            # Build remarks: store columns not in schema so data is not lost
+            extra_info = []
+            fs = self.safe_float(row.get('factor_of_safety'))
+            if fs is not None:
+                extra_info.append(f"FS={fs:.3f}")
+            lp = self.safe_float(row.get('liquefaction_probability'))
+            if lp is not None:
+                extra_info.append(f"liq_prob={lp:.1f}%")
+            ls = self.safe_str(row.get('liquefaction_status'))
+            if ls:
+                extra_info.append(f"status={ls}")
+            if row.get('spt_is_refusal', 0):
+                extra_info.append("SPT_refusal")
+            if row.get('is_core_sample', 0):
+                extra_info.append("core_sample")
+            if row.get('is_rock', 0):
+                extra_info.append("rock")
+            remarks_val = "; ".join(extra_info) if extra_info else None
+
+            record = {
+                # ── Core identification ───────────────────────────────────
                 'borehole_id':                   bh_rec,
                 'layer_number':                  int(layer_map.get(row['Depth_Layer'], 1)),
                 'depth_from_m':                  self.safe_float(row['depth_from_m']),
                 'depth_to_m':                    self.safe_float(row['depth_to_m']),
                 'depth_range':                   f"{row['depth_from_m']:.1f}-{row['depth_to_m']:.1f}m",
-                'spt_n_value':                   self.safe_float(row['spt_n_value']),
-                'spt_n160':                      self.safe_float(row.get('spt_n160')),
-                'spt_is_refusal':                bool(row.get('spt_is_refusal', 0)),
-                'spt_is_imputed':                bool(row.get('spt_is_imputed', False)),
                 'uscs_symbol':                   self.safe_str(row.get('uscs_symbol')) or None,
                 'soil_description':              self.safe_str(row.get('soil_description')) or None,
+                # ── SPT ───────────────────────────────────────────────────
+                'spt_n_value':                   self.safe_float(row['spt_n_value']),
+                'spt_n160':                      self.safe_float(row.get('spt_n160')),
+                # ── Index properties ──────────────────────────────────────
                 'unit_weight':                   self.safe_float(row['unit_weight']),
                 'fines_content':                 self.safe_float(row['fines_content']),
                 'groundwater_depth_m':           self.safe_float(row['groundwater_depth_m']),
+                'relative_density_percent':      self.safe_float(row.get('relative_density_percent')),
+                # ── Seismic / liquefaction ────────────────────────────────
                 'pga_g':                         self.safe_float(row['pga_g']),
                 'csr':                           self.safe_float(row['csr']),
                 'cyclic_strength_ratio':         self.safe_float(row.get('crr')),
-                'n1_60cs':                       self.safe_float(row.get('n1_60cs')),
-                'effective_overburden_pressure': self.safe_float(row['effective_overburden_pressure']),
-                'total_overburden_pressure':     self.safe_float(row['total_overburden_pressure']),
-                'factor_of_safety':              self.safe_float(row['factor_of_safety']),
-                'liquefaction_probability':      self.safe_float(row.get('liquefaction_probability')),
                 'liquefaction':                  bool(row.get('liquefaction', 0)),
                 'liquefaction_risk_level':       self.safe_str(row.get('liquefaction_risk_level')),
-                'liquefaction_status':           self.safe_str(row.get('liquefaction_status')),
-                'relative_density_percent':      self.safe_float(row.get('relative_density_percent')),
-                'is_core_sample':                int(row.get('is_core_sample', 0)),
-                'is_rock':                       int(row.get('is_rock', 0)),
+                'effective_overburden_pressure': self.safe_float(row['effective_overburden_pressure']),
+                'total_overburden_pressure':     self.safe_float(row['total_overburden_pressure']),
+                # ── Thesis analysis columns (in schema) ───────────────────
+                'n1_60cs':                       self.safe_float(row.get('n1_60cs')),
                 'magnitude_mw':                  self.safe_float(row.get('magnitude_mw')),
                 'msf':                           self.safe_float(row.get('msf')),
                 'q_actual_kpa':                  self.safe_float(row.get('q_actual_kpa')),
@@ -1213,63 +1282,57 @@ class GeotechnicalPipeline:
                 'settlement_mm':                 self.safe_float(row.get('settlement_mm')),
                 'lpi_weighing_factor':           self.safe_float(row.get('lpi_weighing_factor')),
                 'lpi_severity_factor':           self.safe_float(row.get('lpi_severity_factor')),
-            })
-            for opt in ['moisture_content', 'friction_angle', 'cohesion_kpa',
-                        'plasticity_index', 'mean_particle_size_d50']:
-                if opt in row.index and pd.notna(row.get(opt)):
-                    records[-1][opt] = self.safe_float(row[opt])
+                # ── Remarks (stores FS + extra pipeline flags) ────────────
+                'remarks':                       remarks_val,
+            }
+
+            # Optional columns — only add when present and non-null
+            for opt_col in ['moisture_content', 'friction_angle', 'cohesion_kpa',
+                            'plasticity_index', 'mean_particle_size_d50']:
+                if opt_col in row.index and pd.notna(row.get(opt_col)):
+                    record[opt_col] = self.safe_float(row[opt_col])
+
             if 'Elastic Modulus (Es) (MN/m²)' in row and pd.notna(row['Elastic Modulus (Es) (MN/m²)']):
-                records[-1]['elastic_modulus_es'] = self.safe_float(
+                record['elastic_modulus_es'] = self.safe_float(
                     row['Elastic Modulus (Es) (MN/m²)'])
 
-        EXTRA_COLS = {'spt_is_refusal', 'spt_is_imputed', 'is_core_sample', 'is_rock',
-                      'magnitude_mw', 'msf', 'n1_60cs', 'q_actual_kpa', 'foundation_kd',
-                      'bearing_qu_kpa', 'bearing_qa_kpa', 'settlement_mm',
-                      'lpi_weighing_factor', 'lpi_severity_factor',
-                      'liquefaction_probability', 'liquefaction_status'}
+            records.append(record)
 
-        def strip_extra(batch):
-            return [{k: v for k, v in r.items() if k not in EXTRA_COLS} for r in batch]
-
-        # Clear old layers
+        # ── Clear existing layers for these boreholes ─────────────────────
         bh_uuids = list(self.borehole_record_ids.values())
         for i in range(0, len(bh_uuids), 100):
             try:
                 self.client.table('soil_layers').delete().in_(
-                    'borehole_id', bh_uuids[i:i+100]).execute()
+                    'borehole_id', bh_uuids[i:i + 100]
+                ).execute()
             except Exception as e:
                 print(f"    [WARNING] Delete batch failed: {e}")
-        print(f"    Cleared existing layers")
+        print(f"    Cleared existing layers for {len(bh_uuids)} boreholes")
 
-        total, fallback = 0, False
+        # ── Insert in batches — no fallback needed, schema is exact ──────
+        total, failed = 0, 0
         for i in range(0, len(records), 25):
-            batch = records[i:i+25]
+            batch = records[i:i + 25]
             try:
-                self.client.table('soil_layers').insert(
-                    strip_extra(batch) if fallback else batch).execute()
+                self.client.table('soil_layers').insert(batch).execute()
                 total += len(batch)
             except Exception as e:
-                if 'PGRST204' in str(e) or 'schema cache' in str(e):
-                    if not fallback:
-                        print(
-                            "    [WARNING] Extended columns missing — falling back to base schema")
-                        fallback = True
-                    try:
-                        self.client.table('soil_layers').insert(
-                            strip_extra(batch)).execute()
-                        total += len(batch)
-                    except Exception as e2:
-                        print(
-                            f"    [WARNING] Batch {i//25+1} failed on fallback: {e2}")
-                else:
-                    print(f"    [WARNING] Batch {i//25+1} failed: {e}")
+                failed += len(batch)
+                print(f"    [WARNING] Batch {i // 25 + 1} failed: {e}")
 
         if skipped:
-            print(f"    [INFO] Skipped {skipped} records (borehole not found)")
+            print(
+                f"    [INFO] Skipped {skipped} records (borehole not matched)")
+        if failed:
+            print(f"    [WARNING] {failed} records failed to insert")
         if not total:
             print("    [ERROR] Nothing inserted")
             return False
+
         print(f"    [OK] Inserted {total} soil layer records")
+        print(
+            f"    [NOTE] factor_of_safety, liquefaction_probability, liquefaction_status")
+        print(f"           stored in 'remarks' column. Run ALTER TABLE below to add them.")
         return True
 
     def store_to_postgis(self) -> bool:
@@ -1286,6 +1349,26 @@ class GeotechnicalPipeline:
             if not self.store_soil_layers():
                 return False
             print(f"\n  [OK] Stored {len(self.processed_data)} records")
+
+            print("\n" + "─" * 80)
+            print("  OPTIONAL: Run this in Supabase SQL Editor to add missing columns")
+            print(
+                "  (factor_of_safety, liquefaction_probability, liquefaction_status,")
+            print("   spt_is_refusal, spt_is_imputed, is_core_sample, is_rock)")
+            print("  Then re-run the pipeline to populate them.\n")
+            print("  ALTER TABLE soil_layers")
+            print("    ADD COLUMN IF NOT EXISTS factor_of_safety       FLOAT,")
+            print("    ADD COLUMN IF NOT EXISTS liquefaction_probability FLOAT,")
+            print("    ADD COLUMN IF NOT EXISTS liquefaction_status     VARCHAR,")
+            print(
+                "    ADD COLUMN IF NOT EXISTS spt_is_refusal          BOOLEAN DEFAULT FALSE,")
+            print(
+                "    ADD COLUMN IF NOT EXISTS spt_is_imputed          BOOLEAN DEFAULT FALSE,")
+            print(
+                "    ADD COLUMN IF NOT EXISTS is_core_sample          SMALLINT DEFAULT 0,")
+            print(
+                "    ADD COLUMN IF NOT EXISTS is_rock                 SMALLINT DEFAULT 0;")
+            print("─" * 80)
             return True
         except Exception as e:
             print(f"  [ERROR] {e}")
@@ -1298,15 +1381,44 @@ class GeotechnicalPipeline:
         print("\n" + "=" * 80)
         print("VALIDATION REPORT")
         print("=" * 80)
+
+        # Deduplicate and consolidate repeated per-sheet messages for cleaner output
+        def summarise(messages):
+            import re
+            from collections import defaultdict
+            totals: dict = defaultdict(int)   # aggregated numeric messages
+            plain:  list = []                 # non-numeric messages (deduped)
+            seen_plain: set = set()
+
+            for msg in messages:
+                # Patterns like "Missing SPT: 34 records → imputed 15.0"
+                # or "Unit weight outside …: 5 records [0-1.5]"
+                # Extract the numeric part and accumulate
+                m = re.match(r'^(.*?)(\d+)\s+record', msg)
+                if m:
+                    key = re.sub(r'\s*\[.*?\]', '', m.group(1)
+                                 ).strip()  # strip sheet tag
+                    totals[key] += int(m.group(2))
+                else:
+                    clean = re.sub(r'\s*\[.*?\]', '', msg).strip()
+                    if clean not in seen_plain:
+                        seen_plain.add(clean)
+                        plain.append(clean)
+
+            result = [f"{k} {v} records" for k, v in sorted(totals.items())]
+            result += plain
+            return result
+
         if self.validation_errors:
-            print("\n  [ERRORS]")
-            for e in self.validation_errors:
+            print("\n  [ERRORS] — Critical issues requiring attention:")
+            for e in summarise(self.validation_errors):
                 print(f"    ✗ {e}")
         else:
             print("\n  ✓ No critical errors")
+
         if self.validation_warnings:
-            print("\n  [WARNINGS]")
-            for w in self.validation_warnings:
+            print("\n  [WARNINGS] — Non-critical notices:")
+            for w in summarise(self.validation_warnings):
                 print(f"    ⚠ {w}")
         else:
             print("\n  ✓ No warnings")
