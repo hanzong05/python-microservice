@@ -34,6 +34,11 @@ BUG D  (API — IDW) — idw_field default for 'cyclic_strength_ratio' was 0.0.
   no CRR data instead of using the 0.3 sentinel. Per-layer FS is only computed
   when both CSR and CRR are available from IDW; otherwise the DB risk level
   drives the layer's LPI contribution directly via _DB_RISK_TO_FS proxy.
+
+BUG E  (API — borehole_data scope) — idw_bearing() inside predict() referenced
+  borehole_data from interpolate_soil_parameters() inner scope — NameError at runtime.
+  FIX: interpolate_soil_parameters() now returns (layers, info, borehole_data).
+  idw_bearing() accepts borehole_data as an explicit parameter.
 """
 
 import os
@@ -177,28 +182,17 @@ _RISK_PROB = {'VERY HIGH': 90.0, 'HIGH': 75.0,
               'MEDIUM': 45.0, 'LOW': 15.0, 'VERY LOW': 5.0}
 
 # ── LPI → Risk Level (single authoritative mapping, used everywhere) ───────
-# Thresholds from Iwasaki et al. (1978) as adopted by DPWH BSDS (2013).
-#
-#   LPI = 0           → VERY LOW   (no or negligible liquefaction damage)
-#   0  < LPI <  2     → LOW        (minor surficial effects)
-#   2  ≤ LPI <  5     → MEDIUM     (moderate damage, some ground disruption)
-#   5  ≤ LPI < 15     → HIGH       (severe damage, significant ground failure)
-#   LPI ≥ 15          → VERY HIGH  (very severe / widespread ground failure)
-#
-# These thresholds are the ONLY input to risk_level throughout the API.
-# No probability blend, no DB override, no ANN output can change risk_level.
-
 _LPI_THRESHOLDS = [
     (15.0, "VERY HIGH", "Very High"),
-    (5.0, "HIGH",      "High"),
-    (2.0, "MEDIUM",    "Medium"),
-    (0.1, "LOW",       "Low"),
-    (0.0, "VERY LOW",  "Very Low"),
+    (5.0,  "HIGH",      "High"),
+    (2.0,  "MEDIUM",    "Medium"),
+    (0.1,  "LOW",       "Low"),
+    (0.0,  "VERY LOW",  "Very Low"),
 ]
 
 
 def _lpi_to_risk(lpi: float) -> tuple:
-    """Return (risk_level, severity) — the single source of truth for risk classification."""
+    """Return (risk_level, severity) — single source of truth for risk classification."""
     for threshold, level, sev in _LPI_THRESHOLDS:
         if lpi >= threshold:
             return level, sev
@@ -206,19 +200,17 @@ def _lpi_to_risk(lpi: float) -> tuple:
 
 
 def _lpi_severity_label(lpi: float) -> str:
-    """LPI severity label for the settlement section — always consistent with _lpi_to_risk."""
     _, sev = _lpi_to_risk(lpi)
     return sev
 
 
 # FS proxy for per-layer LPI when only DB risk classification is available
 _DB_RISK_TO_FS = {
-    'VERY HIGH': 0.60,
-    'HIGH':      0.90,
-    'MEDIUM':    1.10,
-    'LOW':       1.35,
-    'VERY LOW':  2.00,
-    # BUG B FIX — NOT APPLICABLE must NOT contribute to LPI
+    'VERY HIGH':     0.60,
+    'HIGH':          0.90,
+    'MEDIUM':        1.10,
+    'LOW':           1.35,
+    'VERY LOW':      2.00,
     'NOT APPLICABLE': 2.00,
 }
 
@@ -319,7 +311,7 @@ def get_borehole_all_layers(borehole_uuid: int) -> List[Dict]:
             'spt_n_value, spt_n160, n1_60cs, unit_weight, fines_content, groundwater_depth_m, '
             'pga_g, csr, cyclic_strength_ratio, friction_angle, cohesion_kpa, '
             'elastic_modulus_es, liquefaction_risk_level, liquefaction, '
-            'bearing_qa_kpa, settlement_mm'          # ← ADD THESE TWO
+            'bearing_qa_kpa, settlement_mm'
         ).eq('borehole_id', borehole_uuid).order('layer_number').execute()
 
         layers = result.data if result.data else []
@@ -333,23 +325,30 @@ def get_borehole_all_layers(borehole_uuid: int) -> List[Dict]:
         excluded = len(layers) - len(soil_layers)
         if excluded:
             print(
-                f"    [FIX A] Excluded {excluded} non-soil layers (NOT APPLICABLE) from borehole {borehole_uuid}")
+                f"    [FIX A] Excluded {excluded} non-soil layers from borehole {borehole_uuid}")
         return soil_layers
     except Exception as e:
         print(f"[WARNING] get_borehole_all_layers({borehole_uuid}): {e}")
         return []
 
 
-def interpolate_soil_parameters(latitude, longitude, depth_m=None, n_boreholes=5):
+def interpolate_soil_parameters(
+    latitude, longitude, depth_m=None, n_boreholes=5
+) -> Tuple[Optional[List[Dict]], Optional[Dict], Optional[List[Dict]]]:
     """
     IDW interpolation of soil parameters per layer.
-    BUG D FIX: idw_field now returns None for missing numeric fields instead of 0.0.
-    Layers with no CSR or CRR data are excluded from per-layer FS computation;
-    their LPI contribution comes from the DB risk proxy only.
+
+    BUG D FIX: idw_field returns None for missing numeric fields.
+    BUG E FIX: returns borehole_data as third element so predict() can use it
+               in idw_bearing() without relying on closed-over scope.
+
+    Returns:
+        (interpolated_layers, interpolation_info, borehole_data)
+        All three are None on failure.
     """
     nearest = find_nearest_boreholes(latitude, longitude, n=n_boreholes)
     if not nearest:
-        return None, None
+        return None, None, None
 
     borehole_data = []
     for bh, dist in nearest:
@@ -367,16 +366,16 @@ def interpolate_soil_parameters(latitude, longitude, depth_m=None, n_boreholes=5
         weight = 1.0 / max(dist, 0.001) ** 2
 
         borehole_data.append({
-            'borehole_id':    bh_label,
-            'borehole_uuid':  bh_uuid,
-            'distance_km':    dist,
-            'weight':         weight,
-            'layers':         layers,
+            'borehole_id':      bh_label,
+            'borehole_uuid':    bh_uuid,
+            'distance_km':      dist,
+            'weight':           weight,
+            'layers':           layers,
             'risk_probability': _RISK_PROB.get(worst_risk, 5.0),
         })
 
     if not borehole_data:
-        return None, None
+        return None, None, None
 
     total_weight = sum(bd['weight'] for bd in borehole_data)
     for bd in borehole_data:
@@ -390,14 +389,11 @@ def interpolate_soil_parameters(latitude, longitude, depth_m=None, n_boreholes=5
     ))
 
     def idw_field(layer_num, key, default=None):
-        """
-        BUG D FIX — default is None, not 0.0.
-        Callers must handle None explicitly instead of silently using a safe sentinel.
-        """
+        """BUG D FIX — default is None, not 0.0."""
         vals = []
         for bd in borehole_data:
             lyr = next((l for l in bd['layers']
-                       if l['layer_number'] == layer_num), None)
+                        if l['layer_number'] == layer_num), None)
             if lyr and lyr.get(key) is not None:
                 try:
                     vals.append((float(lyr[key]), bd['norm_weight']))
@@ -412,7 +408,7 @@ def interpolate_soil_parameters(latitude, longitude, depth_m=None, n_boreholes=5
     for ln in all_layer_nums:
         depth_from = idw_field(
             ln, 'depth_from_m', (ln - 1) * 1.5) or (ln-1)*1.5
-        depth_to = idw_field(ln, 'depth_to_m',   ln * 1.5) or ln*1.5
+        depth_to = idw_field(ln, 'depth_to_m',    ln * 1.5) or ln*1.5
         thickness = max(0.1, depth_to - depth_from)
 
         layer_risks = [
@@ -427,9 +423,9 @@ def interpolate_soil_parameters(latitude, longitude, depth_m=None, n_boreholes=5
         worst_layer_risk = max(layer_risks, key=lambda r: _RISK_ORDER.get(
             r, 0)) if layer_risks else 'VERY LOW'
 
-        # BUG D FIX: default None
+        # BUG D FIX: None default
         crr_idw = idw_field(ln, 'cyclic_strength_ratio')
-        # BUG D FIX: default None
+        # BUG D FIX: None default
         csr_idw = idw_field(ln, 'csr')
 
         interpolated_layers.append({
@@ -444,9 +440,9 @@ def interpolate_soil_parameters(latitude, longitude, depth_m=None, n_boreholes=5
             'fines_content':         idw_field(ln, 'fines_content', 10),
             'groundwater_depth_m':   idw_field(ln, 'groundwater_depth_m', 5),
             'pga_g':                 idw_field(ln, 'pga_g', 0.3),
-            'csr':                   csr_idw,     # may be None
-            'crr':                   crr_idw,     # may be None
-            'cyclic_strength_ratio': crr_idw,     # may be None
+            'csr':                   csr_idw,
+            'crr':                   crr_idw,
+            'cyclic_strength_ratio': crr_idw,
             'friction_angle':        idw_field(ln, 'friction_angle', 30.0),
             'cohesion_kpa':          idw_field(ln, 'cohesion_kpa', 0.0),
             'elastic_modulus_es':    idw_field(ln, 'elastic_modulus_es', 10000),
@@ -482,7 +478,9 @@ def interpolate_soil_parameters(latitude, longitude, depth_m=None, n_boreholes=5
 
     print(
         f"[INFO] Interpolated {len(interpolated_layers)} layers from {len(borehole_data)} boreholes")
-    return interpolated_layers, interpolation_info
+
+    # BUG E FIX — return borehole_data so predict() can pass it to idw_bearing()
+    return interpolated_layers, interpolation_info, borehole_data
 
 
 def calculate_interpolation_confidence(nearest_km, n_boreholes):
@@ -511,8 +509,7 @@ def calculate_interpolation_confidence(nearest_km, n_boreholes):
 def get_nearest_borehole_db_risk(borehole_uuid, borehole_label: str) -> Optional[Dict]:
     """
     BUG B FIX: filters out NOT APPLICABLE layers before computing worst risk.
-    If a CS-1 borehole has only NOT APPLICABLE layers, returns None so the
-    db_override block in predict() is skipped entirely.
+    Returns None if no valid soil layers exist.
     """
     RISK_TO_ML = {'VERY HIGH': 'HIGH', 'HIGH': 'HIGH',
                   'MEDIUM': 'MEDIUM',
@@ -571,20 +568,25 @@ def engineer_features_from_interpolated(interpolated_params, latitude, longitude
     gwl = float(interpolated_params.get("groundwater_depth_m") or 5.0)
 
     derived = {
-        "spt_n_value": spt, "spt_n60": spt60, "spt_n160": spt160,
-        "unit_weight": uw, "fines_content": fc,
+        "spt_n_value":    spt,
+        "spt_n60":        spt60,
+        "spt_n160":       spt160,
+        "unit_weight":    uw,
+        "fines_content":  fc,
         "friction_angle": float(interpolated_params.get("friction_angle") or 30.0),
-        "depth_mid_m": target_depth,
-        "depth_from_m": float(interpolated_params.get("depth_from_m") or target_depth - 0.75),
-        "depth_to_m":   float(interpolated_params.get("depth_to_m") or target_depth + 0.75),
+        "depth_mid_m":    target_depth,
+        "depth_from_m":   float(interpolated_params.get("depth_from_m") or target_depth - 0.75),
+        "depth_to_m":     float(interpolated_params.get("depth_to_m") or target_depth + 0.75),
         "groundwater_depth_m": gwl,
-        "moisture_content": float(interpolated_params.get("moisture_content") or fc),
-        "plasticity_index": float(interpolated_params.get("plasticity_index") or 0.0),
+        "moisture_content":    float(interpolated_params.get("moisture_content") or fc),
+        "plasticity_index":    float(interpolated_params.get("plasticity_index") or 0.0),
         "mean_particle_size_d50": float(interpolated_params.get("mean_particle_size_d50") or 0.1),
-        "relative_density_percent": float(interpolated_params.get("relative_density_percent")
-                                          or min(100.0, max(0.0, (spt60 / 60.0) * 100.0))),
+        "relative_density_percent": float(
+            interpolated_params.get("relative_density_percent")
+            or min(100.0, max(0.0, (spt60 / 60.0) * 100.0))
+        ),
         "elastic_modulus_es": float(interpolated_params.get("elastic_modulus_es") or 10000.0),
-        "pga_g": float(interpolated_params.get("pga_g") or 0.3),
+        "pga_g":              float(interpolated_params.get("pga_g") or 0.3),
     }
     features = {f: derived.get(f, 0.0) for f in EXPECTED_FEATURES}
     return pd.DataFrame([features], columns=EXPECTED_FEATURES)
@@ -712,16 +714,16 @@ async def pipeline_and_train_start(bg: BackgroundTasks, _: None = Depends(verify
 @app.post("/predict", response_model=PredictionResponse)
 @app.get("/predict-by-location", response_model=PredictionResponse)
 async def predict(
-    request: Optional[PredictionRequest] = None,
-    latitude:    Optional[float] = Query(None, ge=-90,  le=90),
-    longitude:   Optional[float] = Query(None, ge=-180, le=180),
-    depth:       Optional[float] = Query(None, ge=0,    le=100),
+    request:      Optional[PredictionRequest] = None,
+    latitude:     Optional[float] = Query(None, ge=-90,   le=90),
+    longitude:    Optional[float] = Query(None, ge=-180,  le=180),
+    depth:        Optional[float] = Query(None, ge=0,     le=100),
     municipality: Optional[str] = Query(None),
-    n_boreholes: Optional[int] = Query(5, ge=1, le=10),
-    q_actual:    Optional[float] = Query(50.0,  ge=0),
-    magnitude:   Optional[float] = Query(6.5,   ge=0),
-    b_increment: Optional[float] = Query(0.1, ge=0.05, le=0.5),
-    t_years:     Optional[float] = Query(None, ge=0, le=200),
+    n_boreholes:  Optional[int] = Query(5,    ge=1,     le=10),
+    q_actual:     Optional[float] = Query(50.0, ge=0),
+    magnitude:    Optional[float] = Query(6.5,  ge=0),
+    b_increment:  Optional[float] = Query(0.1,  ge=0.05,  le=0.5),
+    t_years:      Optional[float] = Query(None, ge=0,     le=200),
     _: None = Depends(verify_api_key),
 ):
     """Predict liquefaction using spatial interpolation from multiple boreholes."""
@@ -757,7 +759,8 @@ async def predict(
 
         scaler, multi_model, *_ = load_model()
 
-        interpolated_layers, interpolation_info = interpolate_soil_parameters(
+        # BUG E FIX — unpack borehole_data from interpolate_soil_parameters
+        interpolated_layers, interpolation_info, borehole_data = interpolate_soil_parameters(
             lat, lon, depth_m, n_boreholes=n_boreholes)
 
         if not interpolated_layers:
@@ -768,8 +771,6 @@ async def predict(
         msf = (10 ** 2.24) / (_mw ** 2.56)
 
         # ── Per-layer FS ───────────────────────────────────────────────────
-        # BUG D FIX: only compute FS when BOTH CSR and CRR are available from IDW.
-        # If either is None, set fs = _DB_RISK_TO_FS proxy (risk-driven fallback).
         for lyr in interpolated_layers:
             crr_l = lyr.get('cyclic_strength_ratio') or lyr.get('crr')
             csr_l = lyr.get('csr')
@@ -777,12 +778,11 @@ async def predict(
                 lyr['fs'] = (float(crr_l) * msf) / (float(csr_l) + 1e-9)
                 lyr['fs_source'] = 'computed'
             else:
-                # Fall back to DB risk proxy FS — no IDW data available
                 db_risk = lyr.get('liquefaction_risk_level', 'VERY LOW')
                 lyr['fs'] = _DB_RISK_TO_FS.get(db_risk, 2.0)
                 lyr['fs_source'] = 'db_proxy'
 
-        # Critical layer = lowest FS (most liquefiable)
+        # Critical layer = lowest FS
         critical_layer = min(interpolated_layers, key=lambda l: l['fs'])
         interpolated_params = critical_layer
 
@@ -793,16 +793,7 @@ async def predict(
               f"({critical_layer['depth_from_m']}–{critical_layer['depth_to_m']} m) "
               f"FS={critical_layer['fs']:.3f} source={critical_layer.get('fs_source')}")
 
-        # ── LPI — Iwasaki et al. (1978) ──────────────────────────────────────
-        # LPI is computed first. Risk Level, probability, and severity ALL
-        # derive from LPI — nothing downstream can override the risk_level label.
-        #
-        # LPI thresholds (Iwasaki et al. 1978):
-        #   LPI = 0          → VERY LOW  (negligible)
-        #   0  < LPI < 2     → LOW       (minor damage expected)
-        #   2  ≤ LPI < 5     → MEDIUM    (moderate damage)
-        #   5  ≤ LPI < 15    → HIGH      (severe damage)
-        #   LPI ≥ 15         → VERY HIGH (very severe / ground failure)
+        # ── LPI — Iwasaki et al. (1978) ───────────────────────────────────
         lpi = 0.0
         for lyr in interpolated_layers:
             z_mid = (float(lyr.get('depth_from_m', 0)) +
@@ -825,10 +816,7 @@ async def predict(
         print(
             f"[INFO] LPI = {lpi:.2f} ({lpi_severity})  →  Risk Level = {risk_level}")
 
-        # ── DB source label (for transparency, does NOT change risk_level) ──
-        # When the nearest borehole is within 5 km and has real soil data,
-        # we update the data_source label and log the comparison.
-        # Risk level and probability remain LPI-driven regardless.
+        # ── DB source label (transparency only — does NOT change risk_level) ─
         data_source = "IDW Interpolation + LPI (Iwasaki 1978)"
         nearest_dist_km = interpolation_info.get('nearest_distance_km', 999)
         if nearest_dist_km < 5.0:
@@ -841,7 +829,7 @@ async def predict(
                     db_risk_ord = _RISK_ORDER.get(db_check['db_risk_level'], 0)
                     lpi_risk_ord = _RISK_ORDER.get(risk_level, 0)
                     agreement = "AGREE" if db_risk_ord == lpi_risk_ord else \
-                                f"DB={db_check['db_risk_level']} vs LPI={risk_level}"
+                        f"DB={db_check['db_risk_level']} vs LPI={risk_level}"
                     print(
                         f"[INFO] DB cross-check ({bh_label}): {agreement} — LPI classification used")
 
@@ -871,13 +859,13 @@ async def predict(
         fines_percent = float(interpolated_params.get('fines_content') or 10)
         fs_adjusted = critical_layer['fs']
 
-        # ── Bearing capacity — from pipeline DB values (FIX 12 corrected) ─
+        # ── Bearing capacity ───────────────────────────────────────────────
         MAX_B = 5.0
         MAX_D = 3.5
         SI_ALLOW = 25.0
 
-        # IDW-interpolate bearing_qa_kpa from DB (already ANN-corrected by pipeline)
-        def idw_bearing(layer_num, key):
+        # BUG E FIX — idw_bearing now receives borehole_data explicitly
+        def idw_bearing(layer_num: int, key: str, borehole_data: List[Dict]) -> Optional[float]:
             vals = []
             for bd in borehole_data:
                 lyr = next(
@@ -892,9 +880,8 @@ async def predict(
             total_w = sum(w for _, w in vals)
             return sum(v * w for v, w in vals) / total_w if total_w > 0 else None
 
-        # Pull bearing_qa_kpa for the critical layer number
         crit_ln = critical_layer['layer_number']
-        qa_from_db = idw_bearing(crit_ln, 'bearing_qa_kpa')
+        qa_from_db = idw_bearing(crit_ln, 'bearing_qa_kpa', borehole_data)
 
         if qa_from_db and qa_from_db > 1.0:
             qa_site = qa_from_db
@@ -904,7 +891,6 @@ async def predict(
             print(
                 f"[INFO] Bearing capacity from DB (FIX 12): qa={qa_site:.1f} kPa")
         else:
-            # Fallback: Meyerhof SPT-based (Bowles 1988) — same formula as pipeline
             B = B_pred
             D = D_pred
             N = max(1.0, spt_n60)
@@ -914,24 +900,22 @@ async def predict(
             qu_site = qa_site * 3.0
             print(
                 f"[INFO] Bearing capacity fallback (Meyerhof SPT): qa={qa_site:.1f} kPa")
-        # ── Schmertmann (1978) elastic settlement ─────────────────────────
-        # ── Settlement — from pipeline DB values (FIX 12 corrected) ──────
-        settle_from_db = idw_bearing(crit_ln, 'settlement_mm')
+
+        # ── Settlement ─────────────────────────────────────────────────────
+        settle_from_db = idw_bearing(crit_ln, 'settlement_mm', borehole_data)
 
         if settle_from_db and settle_from_db > 0:
-            # DB settlement is already in mm — convert to cm for internal consistency
             pre_liq_settlement_cm = settle_from_db / 10.0
             print(
                 f"[INFO] Settlement from DB (FIX 12): {settle_from_db:.1f} mm")
         else:
-            # Fallback: simple Bowles estimate
             pre_liq_settlement_cm = (q_actual / max(1.0, qa_site)) * 2.5
             print(
                 f"[INFO] Settlement fallback: {pre_liq_settlement_cm:.1f} cm")
 
         # ── Tokimatsu & Seed (1987) volumetric settlement ─────────────────
-        _DPWH_TO_4 = {'VERY HIGH': 'VERY HIGH', 'HIGH': 'HIGH', 'MEDIUM': 'LOW',
-                      'LOW': 'VERY LOW', 'VERY LOW': 'VERY LOW'}
+        _DPWH_TO_4 = {'VERY HIGH': 'VERY HIGH', 'HIGH': 'HIGH',
+                      'MEDIUM': 'LOW', 'LOW': 'VERY LOW', 'VERY LOW': 'VERY LOW'}
         total_settle_cm = 0.0
         liquefiable_layers = []
         for lyr in interpolated_layers:
@@ -951,15 +935,18 @@ async def predict(
                 N_l = max(1.0, float(lyr.get('spt_n_value', 20) or 20))
                 csr_l = float(lyr.get('csr') or 0.2) or 0.2
                 thick = float(lyr.get('layer_thickness', 1.5))
-                ev_max = {N_l < 5: 4.0, N_l < 10: 3.0, N_l <
-                          15: 2.0, N_l < 20: 1.0}.get(True, 0.5)
+                ev_max = {N_l < 5: 4.0, N_l < 10: 3.0, N_l < 15: 2.0,
+                          N_l < 20: 1.0}.get(True, 0.5)
                 ev = max(0.0, min(ev_max, ev_max *
                          min(csr_l / 0.3, 1.0) * (1.0 - fs_settle)))
                 lyr_s = round((ev / 100.0) * thick * 100.0, 2)
                 total_settle_cm += lyr_s
                 liquefiable_layers.append({
-                    'layer': lyr['layer_number'], 'depth': f"{lyr['depth_from_m']}–{lyr['depth_to_m']} m",
-                    'spt_n': round(N_l, 1), 'fs': round(fs_lyr, 3), 'settlement_cm': lyr_s,
+                    'layer':        lyr['layer_number'],
+                    'depth':        f"{lyr['depth_from_m']}–{lyr['depth_to_m']} m",
+                    'spt_n':        round(N_l, 1),
+                    'fs':           round(fs_lyr, 3),
+                    'settlement_cm': lyr_s,
                 })
 
         # BUG C FIX — minimum settlement floors driven by LPI-based risk_level
@@ -1020,7 +1007,6 @@ async def predict(
                 "Monitor soil conditions during construction",
             ])
 
-        # LPI note
         if lpi_severity in ("Very High", "High"):
             recommendations.append(
                 f"LPI = {lpi:.2f} ({lpi_severity}) — incorporate LPI in structural design and risk assessment."
@@ -1058,17 +1044,18 @@ async def predict(
 
         result = PredictionResponse(
             location={
-                "latitude": lat, "longitude": lon,
+                "latitude":  lat,
+                "longitude": lon,
                 "nearest_borehole_distance_km": round(nearest_dist_km, 2),
                 "municipality": munic or "Unknown",
             },
             risk_assessment={
-                "risk_level":     risk_level,
-                "probability":    round(liquefaction_prob, 1),
-                "severity":       severity,
+                "risk_level":       risk_level,
+                "probability":      round(liquefaction_prob, 1),
+                "severity":         severity,
                 "factor_of_safety": round(fs_adjusted, 3),
-                "confidence":     confidence,
-                "data_source":    data_source,
+                "confidence":       confidence,
+                "data_source":      data_source,
             },
             soil_parameters={
                 "spt_n60":       round(spt_n60, 1),
@@ -1090,18 +1077,21 @@ async def predict(
                 "capacity_reduction_percent":     round(cap_reduction, 1),
             },
             foundation_recommendation={
-                "base_m":                round(B_pred, 2),
-                "depth_m":               round(D_pred, 2),
-                "mitigation_required":   mitigation,
-                "settlement_mm":         round(settlement_mm, 1),
+                "base_m":                  round(B_pred, 2),
+                "depth_m":                 round(D_pred, 2),
+                "mitigation_required":     mitigation,
+                "settlement_mm":           round(settlement_mm, 1),
                 "allowable_settlement_mm": SI_ALLOW,
             },
             recommendations=recommendations,
             analysis_parameters={
-                "q_actual_kpa": q_actual, "magnitude_mw": magnitude,
-                "msf": round(msf, 4), "fs_design": 3.0,
+                "q_actual_kpa":  q_actual,
+                "magnitude_mw":  magnitude,
+                "msf":           round(msf, 4),
+                "fs_design":     3.0,
                 "settlement_fs": round(settle_fs, 2),
-                "b_increment_m": b_increment, "t_years": t_years,
+                "b_increment_m": b_increment,
+                "t_years":       t_years,
             },
             interpolation_info=interpolation_info,
         )
@@ -1152,11 +1142,12 @@ async def get_boreholes(
                 break
             offset += 1000
 
-        RISK_ORDER = _RISK_ORDER
-        COLOR_MAP = {'VERY HIGH': 'red', 'HIGH': 'red',
-                     'MEDIUM': 'orange', 'LOW': 'green', 'VERY LOW': 'green'}
+        COLOR_MAP = {'VERY HIGH': 'red',    'HIGH': 'red',
+                     'MEDIUM': 'orange',
+                     'LOW': 'green',         'VERY LOW': 'green'}
         STATUS_MAP = {'VERY HIGH': 'LIQUEFIABLE', 'HIGH': 'LIQUEFIABLE',
-                      'MEDIUM': 'MARGINAL', 'LOW': 'NON-LIQUEFIABLE', 'VERY LOW': 'NON-LIQUEFIABLE'}
+                      'MEDIUM': 'MARGINAL',
+                      'LOW': 'NON-LIQUEFIABLE',   'VERY LOW': 'NON-LIQUEFIABLE'}
 
         from collections import defaultdict
         layers_by_bh = defaultdict(list)
@@ -1169,25 +1160,26 @@ async def get_boreholes(
 
         borehole_risk = {}
         for bh_id, layers in layers_by_bh.items():
-            # BUG B FIX — exclude NOT APPLICABLE from worst-risk computation
+            # BUG B FIX — exclude NOT APPLICABLE
             soil_levels = [l.get('liquefaction_risk_level') for l in layers
                            if l.get('liquefaction_risk_level')
                            and l.get('liquefaction_risk_level') != 'NOT APPLICABLE']
-            worst = max(soil_levels, key=lambda r: RISK_ORDER.get(
-                r, 0), default=None) if soil_levels else None
+            worst = max(soil_levels, key=lambda r: _RISK_ORDER.get(r, 0),
+                        default=None) if soil_levels else None
             borehole_risk[bh_id] = {
-                'risk_level':        worst or 'UNKNOWN',
-                'marker_color':      COLOR_MAP.get(worst, 'gray'),
+                'risk_level':          worst or 'UNKNOWN',
+                'marker_color':        COLOR_MAP.get(worst, 'gray'),
                 'liquefaction_status': STATUS_MAP.get(worst, 'UNKNOWN'),
-                'layer_count':       len(layers),
-                'liquefiable_layers': sum(1 for l in layers if l.get('liquefaction')),
-                'avg_csr':  _avg([l.get('csr') for l in layers]),
-                'avg_crr':  _avg([l.get('cyclic_strength_ratio') for l in layers]),
-                'avg_spt_n': _avg([l.get('spt_n_value') for l in layers]),
+                'layer_count':         len(layers),
+                'liquefiable_layers':  sum(1 for l in layers if l.get('liquefaction')),
+                'avg_csr':             _avg([l.get('csr') for l in layers]),
+                'avg_crr':             _avg([l.get('cyclic_strength_ratio') for l in layers]),
+                'avg_spt_n':           _avg([l.get('spt_n_value') for l in layers]),
             }
 
-        NO_DATA = {'risk_level': 'NO DATA', 'marker_color': 'gray', 'liquefaction_status': 'NO DATA',
-                   'layer_count': 0, 'liquefiable_layers': 0, 'avg_csr': None, 'avg_crr': None, 'avg_spt_n': None}
+        NO_DATA = {'risk_level': 'NO DATA', 'marker_color': 'gray',
+                   'liquefaction_status': 'NO DATA', 'layer_count': 0,
+                   'liquefiable_layers': 0, 'avg_csr': None, 'avg_crr': None, 'avg_spt_n': None}
 
         features = []
         for bh in boreholes:
@@ -1215,12 +1207,13 @@ async def get_boreholes(
             cc[f['marker_color']] += 1
 
         return {
-            "boreholes": features, "total": len(features),
+            "boreholes": features,
+            "total": len(features),
             "legend": {
                 "red":    {"label": "LIQUEFIABLE",     "risk_levels": ["HIGH", "VERY HIGH"], "count": cc['red']},
-                "orange": {"label": "MARGINAL",         "risk_levels": ["MEDIUM"],          "count": cc['orange']},
+                "orange": {"label": "MARGINAL",         "risk_levels": ["MEDIUM"],           "count": cc['orange']},
                 "green":  {"label": "NON-LIQUEFIABLE",  "risk_levels": ["LOW", "VERY LOW"],  "count": cc['green']},
-                "gray":   {"label": "NO DATA",          "risk_levels": [],                  "count": cc['gray']},
+                "gray":   {"label": "NO DATA",          "risk_levels": [],                   "count": cc['gray']},
             },
         }
     except Exception as e:
