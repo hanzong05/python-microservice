@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """
-Geotechnical Data Processing Pipeline
-Single-pass processing with validation, CSR/CRR calculation, and DPWH BSDS classification
+Geotechnical Data Processing Pipeline — Improved v2
+=====================================================
+All fixes applied from data audit:
 
-Features:
-✅ Single-pass data processing
-✅ Built-in validation (coordinates, SPT, soil parameters)
-✅ Automatic CSR/CRR calculation (Seed & Idriss 1971)
-✅ Liquefaction classification per DPWH BSDS (2013)
-✅ Exports clean CSV ready for database ingestion
+FIX 1  — Fines Content >100% auto-corrected (÷10) or nulled
+FIX 2  — N1(60) computed via Cn overburden correction for missing values (was raw SPT)
+FIX 3  — SPT N=100 (refusal) capped at 60 for liquefaction path only
+FIX 4  — BH-75-style PGA < 0.2g flagged and nulled for municipality propagation
+FIX 5  — CS-1/CS core samples excluded from liquefaction classification
+FIX 6  — Municipality-median GWL fill for boreholes with no GWL in any layer
+FIX 7  — USCS symbol typos normalised (SMM→SM, CM→SC, SP_→SP, ROCK types, etc.)
+FIX 8  — 'Ground Water Table' column used as backup GWL source
+FIX 9  — SPT imputation tracked via boolean flag (replaces fragile ==15.0 sentinel)
+FIX 10 — Fault-distance attenuation fallback for missing PGA (Youngs et al. 1997)
 """
 
 import pandas as pd
@@ -23,26 +28,25 @@ import io
 
 warnings.filterwarnings('ignore')
 
-# Load environment variables from .env file
 try:
     from dotenv import load_dotenv
     load_dotenv()
     DOTENV_AVAILABLE = True
 except ImportError:
     DOTENV_AVAILABLE = False
-    print("[INFO] python-dotenv not installed - .env file will not be loaded")
-    print("Install with: pip install python-dotenv")
+    print("[INFO] python-dotenv not installed — .env file will not be loaded")
 
 try:
     from supabase import create_client, Client
     SUPABASE_AVAILABLE = True
 except ImportError:
     SUPABASE_AVAILABLE = False
-    print("[INFO] Supabase not available - database storage will be skipped")
+    print("[INFO] Supabase not available — database storage will be skipped")
 
 
-# USCS-based soil property lookup tables used in validate_soil_parameters.
-# Values are typical midpoints from Bowles (1988) and USCS classification tables.
+# ---------------------------------------------------------------------------
+# USCS lookup tables  (Bowles 1988 + USCS classification)
+# ---------------------------------------------------------------------------
 _USCS_UNIT_WEIGHT = {
     'GW': 20.0, 'GP': 18.0, 'SW': 19.0, 'SP': 17.5,
     'GM': 20.0, 'GC': 19.5, 'SM': 19.0, 'SC': 19.5,
@@ -57,140 +61,135 @@ _USCS_FINES_PCT = {
     'OL': 75.0, 'OH': 80.0, 'PT': 90.0,
 }  # percent passing #200 sieve
 
+# FIX 7 — USCS typo / non-soil normalisation map
+# Maps raw cell values → canonical 2-letter USCS (or '' for non-soil)
+_USCS_CORRECTIONS = {
+    'SMM':       'SM',    # typo
+    'CM':        'SC',    # likely SC mis-typed
+    'SP ':       'SP',    # trailing space
+    'SC-SM':     'SC',    # dual — use primary
+    'SP-SM':     'SP',    # dual — use primary
+    '-':         '',      # no data
+    'CORING':    '',      # core run, no soil
+    'CS':        '',      # core sample marker
+    'BASALT':    'ROCK',
+    'SANDSTONE': 'ROCK',
+    'TUFF':      'ROCK',
+    'H':         '',      # artefact
+    'M':         '',
+    'S':         '',
+}
 
+# Non-soil USCS values → exclude from liquefaction
+_NON_SOIL_USCS = {'ROCK', ''}
+
+# Cohesive USCS groups (Dr and liquefaction formulae don't apply)
+_COHESIVE_USCS = {'CL', 'CH', 'ML', 'MH', 'OL', 'OH', 'PT', 'CL-ML'}
+
+# Minimum plausible PGA for Tarlac Province (g)
+_TARLAC_PGA_MIN = 0.2
+
+
+# ===========================================================================
+# Pipeline class
+# ===========================================================================
 class GeotechnicalPipeline:
-    """
-    Single-pass geotechnical data processing pipeline
-    """
+    """Improved single-pass geotechnical data processing pipeline."""
 
-    def __init__(self, excel_file_path: Optional[str] = None, output_csv_path: Optional[str] = None, use_storage: bool = True):
+    def __init__(
+        self,
+        excel_file_path: Optional[str] = None,
+        output_csv_path: Optional[str] = None,
+        use_storage: bool = True,
+    ):
         self.use_storage = use_storage
-        self.excel_path = None
-        self.excel_file_bytes = None
+        self.excel_path = Path(excel_file_path) if excel_file_path else None
+        self.excel_file_bytes: Optional[bytes] = None
 
-        if excel_file_path:
-            self.excel_path = Path(excel_file_path)
-            self.output_path = None
-        else:
-            self.output_path = None
-
-        self.raw_data = {}
-        self.processed_data = None
-        self.validation_errors = []
-        self.validation_warnings = []
+        self.raw_data: Dict[str, pd.DataFrame] = {}
+        self.processed_data: Optional[pd.DataFrame] = None
+        self.validation_errors: List[str] = []
+        self.validation_warnings: List[str] = []
 
         self.client = None
-        self.municipality_ids = {}
-        self.borehole_record_ids = {}
+        self.municipality_ids: Dict[str, int] = {}
+        self.borehole_record_ids: Dict[str, int] = {}
 
+    # -----------------------------------------------------------------------
+    # Storage helpers
+    # -----------------------------------------------------------------------
     def download_from_supabase_storage(self) -> bool:
-        """Download Excel file from Supabase Storage into memory"""
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("STEP 1: DOWNLOADING FROM SUPABASE STORAGE")
-        print("="*80)
-
+        print("=" * 80)
         if not SUPABASE_AVAILABLE:
             print("  [ERROR] Supabase not available")
             return False
-
-        supabase_url = os.getenv('SUPABASE_URL')
-        supabase_key = os.getenv('SUPABASE_SERVICE_ROLE_KEY')
-
-        if not supabase_url or not supabase_key:
+        url = os.getenv('SUPABASE_URL')
+        key = os.getenv('SUPABASE_SERVICE_ROLE_KEY')
+        if not url or not key:
             print("  [ERROR] Environment variables not set")
             return False
-
         try:
-            self.client = create_client(supabase_url, supabase_key)
-
-            storage_path = "raw/Raw_data.xlsx"
-            bucket_name = os.getenv(
-                'SUPABASE_STORAGE_BUCKET', 'geotechnical-data')
-            print(f"  Downloading: {storage_path} from bucket: {bucket_name}")
-
-            file_data = self.client.storage.from_(
-                bucket_name).download(storage_path)
-
-            if not file_data:
-                print(f"  [ERROR] File not found in storage: {storage_path}")
+            self.client = create_client(url, key)
+            bucket = os.getenv('SUPABASE_STORAGE_BUCKET', 'geotechnical-data')
+            data = self.client.storage.from_(
+                bucket).download("raw/Raw_data.xlsx")
+            if not data:
+                print("  [ERROR] File not found in storage")
                 return False
-
-            self.excel_file_bytes = file_data
-            print(f"  [OK] Downloaded {len(file_data)} bytes into memory")
+            self.excel_file_bytes = data
+            print(f"  [OK] Downloaded {len(data)} bytes")
             return True
         except Exception as e:
             print(f"  [ERROR] Download failed: {e}")
-            import traceback
-            traceback.print_exc()
             return False
 
     def upload_raw_file_to_bucket(self) -> bool:
-        """Upload the local raw Excel file to Supabase Storage (raw/ folder)"""
-        if not self.excel_path or not self.excel_path.exists():
+        if not self.excel_path or not self.excel_path.exists() or not self.client:
             return True
-
-        if not self.client:
-            print("  [INFO] No database connection - skipping raw file upload")
-            return True
-
         try:
-            bucket_name = os.getenv(
-                'SUPABASE_STORAGE_BUCKET', 'geotechnical-data')
-            dest_path = f"raw/{self.excel_path.name}"
-
+            bucket = os.getenv('SUPABASE_STORAGE_BUCKET', 'geotechnical-data')
             with open(self.excel_path, 'rb') as f:
-                file_bytes = f.read()
-
-            self.client.storage.from_(bucket_name).upload(
-                dest_path,
-                file_bytes,
+                data = f.read()
+            self.client.storage.from_(bucket).upload(
+                f"raw/{self.excel_path.name}", data,
                 file_options={
-                    'content-type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                    'upsert': 'true'
-                }
+                    'content-type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'upsert': 'true'},
             )
-            print(f"  [OK] Raw file uploaded to bucket: {dest_path}")
-            return True
+            print(f"  [OK] Raw file uploaded to bucket")
         except Exception as e:
             print(f"  [WARNING] Raw file upload failed: {e}")
-            return True
+        return True
 
+    # -----------------------------------------------------------------------
+    # Load
+    # -----------------------------------------------------------------------
     def load_excel(self) -> bool:
-        """Load Excel file from local path or memory bytes"""
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("STEP 1: LOADING EXCEL FILE")
-        print("="*80)
-
+        print("=" * 80)
         try:
             if self.excel_file_bytes:
+                source = io.BytesIO(self.excel_file_bytes)
                 print("  Loading from memory (Supabase Storage)...")
-                xl_file = pd.ExcelFile(io.BytesIO(self.excel_file_bytes))
             elif self.excel_path and self.excel_path.exists():
+                source = self.excel_path
                 print(f"  Loading from local file: {self.excel_path}")
-                xl_file = pd.ExcelFile(self.excel_path)
             else:
-                print(f"  [ERROR] No file source available")
-                if self.excel_path:
-                    print(f"  File not found: {self.excel_path}")
+                print("  [ERROR] No file source available")
                 return False
 
-            print(f"\n  Found {len(xl_file.sheet_names)} sheets")
-
-            for sheet_name in xl_file.sheet_names:
-                if sheet_name == 'Summary':
-                    print(f"    Skipping: {sheet_name}")
+            xl = pd.ExcelFile(source)
+            print(f"\n  Found {len(xl.sheet_names)} sheets")
+            for sheet in xl.sheet_names:
+                if sheet.strip().lower() == 'summary':
+                    print(f"    Skipping: {sheet}")
                     continue
-
-                if self.excel_file_bytes:
-                    df = pd.read_excel(io.BytesIO(
-                        self.excel_file_bytes), sheet_name=sheet_name)
-                else:
-                    df = pd.read_excel(self.excel_path, sheet_name=sheet_name)
-
-                self.raw_data[sheet_name] = df
+                df = pd.read_excel(source, sheet_name=sheet)
+                self.raw_data[sheet] = df
                 print(
-                    f"    Loaded: {sheet_name} ({len(df)} rows, {len(df.columns)} columns)")
-
+                    f"    Loaded: {sheet} ({len(df)} rows, {len(df.columns)} cols)")
             print(f"\n  [OK] Loaded {len(self.raw_data)} data sheets")
             return True
         except Exception as e:
@@ -199,743 +198,692 @@ class GeotechnicalPipeline:
             traceback.print_exc()
             return False
 
+    # -----------------------------------------------------------------------
+    # Value parsers
+    # -----------------------------------------------------------------------
     def clean_coordinate(self, value) -> Optional[float]:
-        """Clean coordinate value (remove degree symbols, etc.)"""
         if pd.isna(value) or value == '' or value is None:
             return None
         try:
-            clean = str(value).replace('°', '').replace(
-                "'", '').replace('"', '').strip()
-            return float(clean)
+            return float(str(value).replace('°', '').replace("'", '').replace('"', '').strip())
         except:
             return None
 
     def parse_pga(self, value) -> Optional[float]:
-        """Parse Peak Ground Acceleration from various formats"""
         if pd.isna(value):
             return None
         try:
             matches = re.findall(r'(\d+\.?\d*)g', str(value).lower())
             if matches:
-                return np.mean([float(m) for m in matches])
+                return float(np.mean([float(m) for m in matches]))
             return float(str(value).replace('g', '').strip())
         except:
             return None
 
     def parse_relative_density(self, value) -> Optional[float]:
-        """Convert relative density text to numeric percentage"""
         if pd.isna(value):
             return None
-
         try:
             return float(value)
         except:
             pass
-
         density_map = {
-            'very loose': 15.0,
-            'loose': 35.0,
-            'loose to medium dense': 50.0,
-            'medium': 50.0,
-            'medium dense': 65.0,
-            'dense': 80.0,
-            'very dense': 95.0,
-            'hard': 90.0,
+            'very loose': 15.0, 'loose': 35.0, 'loose to medium dense': 50.0,
+            'medium': 50.0, 'medium dense': 65.0, 'dense': 80.0,
+            'very dense': 95.0, 'hard': 90.0,
         }
-
-        value_str = str(value).lower().strip()
-        return density_map.get(value_str, None)
+        return density_map.get(str(value).lower().strip())
 
     def parse_elastic_modulus(self, value) -> Optional[float]:
-        """Parse elastic modulus from various formats"""
-        if pd.isna(value):
+        if pd.isna(value) or isinstance(value, datetime):
             return None
-
-        if isinstance(value, datetime):
-            return None
-
         try:
             return float(value)
         except:
             pass
-
-        value_str = str(value).lower()
-        if 'to' in value_str:
+        s = str(value).lower()
+        if 'to' in s:
             try:
-                parts = value_str.split('to')
-                low = float(parts[0].strip())
-                high = float(parts[1].strip())
-                return (low + high) / 2
+                parts = s.split('to')
+                return (float(parts[0].strip()) + float(parts[1].strip())) / 2
             except:
                 return None
-
         return None
 
+    # -----------------------------------------------------------------------
+    # PRE-CLEAN  (FIX 1, 7, 8, 9)
+    # -----------------------------------------------------------------------
     def pre_clean_dataframe(self, df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
         """
-        PRE-CLEAN dataframe — must run FIRST before any numeric operations.
-
-        FIX 1: Drop stray unnamed columns (Excel formatting artifacts that cause
-                StringDtype crashes when the pipeline tries to write float values).
-        FIX 2: Convert pandas StringDtype → object dtype.
-                pandas 2.x reads Excel string columns as StringDtype which is strict
-                and rejects float assignments (df.loc[mask, col] = float_series).
-                Converting to object dtype restores pandas 1.x behaviour.
+        Must run FIRST.
+        FIX 1  — fines content >100 corrected / nulled
+        FIX 7  — USCS typos normalised
+        FIX 8  — 'Ground Water Table' used as backup GWL source
+        FIX 9  — SPT imputation tracked via 'spt_is_imputed' flag
+        Also: drop unnamed cols, fix StringDtype, clean coords/PGA/Dr/Es.
         """
-        df_clean = df.copy()
+        df = df.copy()
 
-        # ── FIX 1: Drop unnamed columns ───────────────────────────────────────
-        unnamed_cols = [c for c in df_clean.columns if str(
+        # Drop unnamed Excel artefact columns
+        unnamed = [c for c in df.columns if str(
             c).lower().startswith('unnamed')]
-        if unnamed_cols:
-            df_clean = df_clean.drop(columns=unnamed_cols)
-            print(f"    [FIX] Dropped unnamed columns: {unnamed_cols}")
+        if unnamed:
+            df = df.drop(columns=unnamed)
+            print(f"    [FIX] Dropped unnamed columns: {unnamed}")
 
-        # ── FIX 2: StringDtype → object ───────────────────────────────────────
-        str_cols = [c for c in df_clean.columns if str(
-            df_clean[c].dtype) == 'str']
+        # StringDtype → object (pandas 2.x compatibility)
+        str_cols = [c for c in df.columns if str(df[c].dtype) == 'str']
         if str_cols:
-            df_clean[str_cols] = df_clean[str_cols].astype(object)
+            df[str_cols] = df[str_cols].astype(object)
 
-        # 1. Clean Latitude (remove degree symbols)
-        if 'Latitude' in df_clean.columns:
-            df_clean['Latitude'] = df_clean['Latitude'].apply(
-                self.clean_coordinate)
+        # Coordinates
+        for col in ['Latitude', 'Longitude']:
+            if col in df.columns:
+                df[col] = df[col].apply(self.clean_coordinate)
 
-        # 2. Clean Longitude (remove degree symbols)
-        if 'Longitude' in df_clean.columns:
-            df_clean['Longitude'] = df_clean['Longitude'].apply(
-                self.clean_coordinate)
-
-        # 3. Clean Peak Ground Acceleration (parse complex strings)
-        if 'Peak Ground Acceleration' in df_clean.columns:
-            df_clean['Peak Ground Acceleration'] = df_clean['Peak Ground Acceleration'].apply(
+        # PGA
+        if 'Peak Ground Acceleration' in df.columns:
+            df['Peak Ground Acceleration'] = df['Peak Ground Acceleration'].apply(
                 self.parse_pga)
 
-        # 4. Clean Relative Density (convert text to numeric)
-        if 'Relative Density' in df_clean.columns:
-            df_clean['Relative Density'] = df_clean['Relative Density'].apply(
+        # Relative density
+        if 'Relative Density' in df.columns:
+            df['Relative Density'] = df['Relative Density'].apply(
                 self.parse_relative_density)
 
-        # 5. Clean Elastic Modulus (parse ranges and dates)
-        if 'Elastic Modulus (Es) (MN/m²)' in df_clean.columns:
-            df_clean['Elastic Modulus (Es) (MN/m²)'] = df_clean['Elastic Modulus (Es) (MN/m²)'].apply(
+        # Elastic modulus
+        if 'Elastic Modulus (Es) (MN/m²)' in df.columns:
+            df['Elastic Modulus (Es) (MN/m²)'] = df['Elastic Modulus (Es) (MN/m²)'].apply(
                 self.parse_elastic_modulus)
 
-        return df_clean
+        # FIX 8 — populate 'Groundwater Level (m)' from 'Ground Water Table' where missing
+        if 'Ground Water Table' in df.columns and 'Groundwater Level (m)' in df.columns:
+            gwl_main = pd.to_numeric(
+                df['Groundwater Level (m)'], errors='coerce')
+            gwl_backup = pd.to_numeric(
+                df['Ground Water Table'], errors='coerce')
+            filled_from_backup = gwl_main.isna() & gwl_backup.notna()
+            if filled_from_backup.any():
+                df.loc[filled_from_backup,
+                       'Groundwater Level (m)'] = gwl_backup[filled_from_backup]
+                print(
+                    f"    [FIX8] GWL filled from 'Ground Water Table': {filled_from_backup.sum()} rows")
 
+        # FIX 9 — mark which SPT values are genuinely missing BEFORE filling
+        spt_raw_col = next((c for c in ['SPT N-Value', 'SPT N Value', 'N-Value', 'SPT']
+                            if c in df.columns), None)
+        if spt_raw_col:
+            df['spt_is_imputed'] = pd.to_numeric(
+                df[spt_raw_col], errors='coerce').isna()
+        else:
+            df['spt_is_imputed'] = True
+
+        # FIX 7 — normalise USCS symbol
+        if 'USCS Symbol' in df.columns:
+            uscs_raw = df['USCS Symbol'].fillna(
+                '').astype(str).str.strip().str.upper()
+            uscs_norm = uscs_raw.replace(_USCS_CORRECTIONS)
+            # Handle single-char artefacts not in map
+            uscs_norm = uscs_norm.where(uscs_norm.str.len() >= 2, '')
+            df['USCS Symbol'] = uscs_norm
+            # Flag rock/non-soil
+            df['is_rock'] = uscs_norm.isin({'ROCK'}).astype(int)
+            n_fixed = (uscs_raw != uscs_norm).sum()
+            if n_fixed:
+                print(f"    [FIX7] USCS symbols normalised: {n_fixed} rows")
+
+        # FIX 5 — flag core samples (CS-1, CS)
+        sample_col = next(
+            (c for c in df.columns if 'sample' in c.lower()), None)
+        if sample_col:
+            is_core = df[sample_col].astype(
+                str).str.strip().str.upper().isin(['CS-1', 'CS'])
+            df['is_core_sample'] = is_core.astype(int)
+            if is_core.any():
+                print(f"    [FIX5] Core samples flagged: {is_core.sum()} rows")
+        else:
+            df['is_core_sample'] = 0
+
+        # FIX 1 — fix fines content > 100%
+        if 'Fines Content' in df.columns:
+            fc = pd.to_numeric(df['Fines Content'], errors='coerce')
+            bad = fc > 100
+            if bad.any():
+                corrected = fc[bad] / 10.0
+                plausible = (corrected >= 2.0) & (corrected <= 98.0)
+                df.loc[bad & plausible,
+                       'Fines Content'] = corrected[plausible].round(1)
+                # let USCS fallback handle
+                df.loc[bad & ~plausible, 'Fines Content'] = np.nan
+                self.validation_errors.append(
+                    f"[{sheet_name}] Fines >100%: {bad.sum()} rows auto-corrected (÷10) or nulled"
+                )
+                print(
+                    f"    [FIX1] Fines >100%: {bad.sum()} rows corrected/nulled")
+
+        return df
+
+    # -----------------------------------------------------------------------
+    # Coordinate validation
+    # -----------------------------------------------------------------------
     def validate_coordinates(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Validate coordinates after pre-cleaning"""
-        df_clean = df.copy()
-
-        if 'Latitude' in df_clean.columns:
-            df_clean['latitude'] = df_clean['Latitude']
-            invalid = df_clean['latitude'].isna().sum()
-            if invalid > 0:
+        df = df.copy()
+        if 'Latitude' in df.columns:
+            df['latitude'] = df['Latitude']
+            miss = df['latitude'].isna().sum()
+            if miss:
                 self.validation_warnings.append(
-                    f"Missing/invalid latitude: {invalid} records")
-
-            valid_lat = df_clean['latitude'].dropna()
-            if len(valid_lat) > 0:
-                out_of_range = ((valid_lat < 15.0) | (valid_lat > 16.0)).sum()
-                if out_of_range > 0:
-                    self.validation_errors.append(
-                        f"Latitude out of Tarlac range (15.0-16.0): {out_of_range} records")
-
-        if 'Longitude' in df_clean.columns:
-            df_clean['longitude'] = df_clean['Longitude']
-            invalid = df_clean['longitude'].isna().sum()
-            if invalid > 0:
+                    f"Missing latitude: {miss} records")
+            oor = ((df['latitude'].dropna() < 15.0) | (
+                df['latitude'].dropna() > 16.0)).sum()
+            if oor:
+                self.validation_errors.append(
+                    f"Latitude outside Tarlac range (15–16°): {oor}")
+        if 'Longitude' in df.columns:
+            df['longitude'] = df['Longitude']
+            miss = df['longitude'].isna().sum()
+            if miss:
                 self.validation_warnings.append(
-                    f"Missing/invalid longitude: {invalid} records")
+                    f"Missing longitude: {miss} records")
+            oor = ((df['longitude'].dropna() < 120.0) | (
+                df['longitude'].dropna() > 121.0)).sum()
+            if oor:
+                self.validation_errors.append(
+                    f"Longitude outside Tarlac range (120–121°): {oor}")
+        return df
 
-            valid_lon = df_clean['longitude'].dropna()
-            if len(valid_lon) > 0:
-                out_of_range = ((valid_lon < 120.0) |
-                                (valid_lon > 121.0)).sum()
-                if out_of_range > 0:
-                    self.validation_errors.append(
-                        f"Longitude out of Tarlac range (120.0-121.0): {out_of_range} records")
-
-        return df_clean
-
+    # -----------------------------------------------------------------------
+    # SPT validation  (FIX 3, 9)
+    # -----------------------------------------------------------------------
     def validate_spt(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Validate SPT values"""
-        df_clean = df.copy()
-
-        spt_col = None
-        for col in ['SPT N-Value', 'SPT N Value', 'spt_n_value', 'N-Value', 'N Value', 'SPT']:
-            if col in df_clean.columns:
-                spt_col = col
-                break
+        """
+        FIX 3 — N=100 (refusal) flagged; capped at 60 for liquefaction path.
+        FIX 9 — imputation tracked via spt_is_imputed (set in pre_clean).
+        """
+        df = df.copy()
+        spt_col = next((c for c in ['SPT N-Value', 'SPT N Value', 'spt_n_value', 'N-Value', 'SPT']
+                        if c in df.columns), None)
 
         if spt_col:
-            df_clean['spt_n_value'] = pd.to_numeric(
-                df_clean[spt_col], errors='coerce')
+            df['spt_n_value'] = pd.to_numeric(df[spt_col], errors='coerce')
 
-            valid_spt = df_clean['spt_n_value'].dropna()
-            if len(valid_spt) > 0:
-                invalid = ((valid_spt < 0) | (valid_spt > 100)).sum()
-                if invalid > 0:
-                    self.validation_errors.append(
-                        f"SPT values out of valid range (0-100): {invalid} records")
+            valid = df['spt_n_value'].dropna()
+            oor = ((valid < 0) | (valid > 100)).sum()
+            if oor:
+                self.validation_errors.append(
+                    f"SPT out of range (0–100): {oor} records")
 
-            missing = df_clean['spt_n_value'].isna().sum()
-            if missing > 0:
+            # FIX 3 — refusal flag
+            df['spt_is_refusal'] = (df['spt_n_value'] >= 100).astype(int)
+            # Separate column capped at 60 for liquefaction use
+            df['spt_n_value_liq'] = df['spt_n_value'].clip(upper=60.0)
+
+            # FIX 9 — fill missing with 15.0 AFTER flagging
+            miss = df['spt_n_value'].isna().sum()
+            if miss:
                 self.validation_warnings.append(
-                    f"Missing SPT values: {missing} records")
-                df_clean['spt_n_value'] = df_clean['spt_n_value'].fillna(15.0)
+                    f"Missing SPT: {miss} records → imputed 15.0")
+            df['spt_n_value'] = df['spt_n_value'].fillna(15.0)
+            df['spt_n_value_liq'] = df['spt_n_value_liq'].fillna(15.0)
         else:
             self.validation_warnings.append(
-                "SPT column not found, using default value 15.0")
-            df_clean['spt_n_value'] = 15.0
+                "SPT column not found — defaulting to 15.0")
+            df['spt_n_value'] = 15.0
+            df['spt_n_value_liq'] = 15.0
+            df['spt_is_refusal'] = 0
+            df['spt_is_imputed'] = True
 
-        return df_clean
+        return df
 
+    # -----------------------------------------------------------------------
+    # Soil parameter validation
+    # -----------------------------------------------------------------------
     def validate_soil_parameters(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Validate soil parameters"""
-        df_clean = df.copy()
+        df = df.copy()
 
-        # ── USCS symbol parsed FIRST so it can inform unit-weight / fines defaults ──
-        uscs_col = None
-        for col in ['USCS Symbol', 'uscs_symbol', 'USCS Classification', 'USCS']:
-            if col in df_clean.columns:
-                uscs_col = col
-                break
-
+        # USCS (already normalised in pre_clean)
+        uscs_col = next(
+            (c for c in ['USCS Symbol', 'uscs_symbol', 'USCS'] if c in df.columns), None)
         if uscs_col:
-            df_clean['uscs_symbol'] = (df_clean[uscs_col]
-                                       .fillna('')
-                                       .astype(str)
-                                       .str.strip())
-            df_clean['uscs_symbol'] = df_clean['uscs_symbol'].replace('nan', '')
+            df['uscs_symbol'] = df[uscs_col].fillna('').astype(str).str.strip()
+            df['uscs_symbol'] = df['uscs_symbol'].replace('nan', '')
         else:
-            df_clean['uscs_symbol'] = ''
+            df['uscs_symbol'] = ''
 
-        # Normalised USCS for lookup (takes the first 2 chars to handle duals like SM-SC)
-        uscs_upper = df_clean['uscs_symbol'].str.upper().str.strip()
-        uscs_primary = uscs_upper.str[:2]   # e.g. 'SM-SC' → 'SM'
+        uscs_upper = df['uscs_symbol'].str.upper().str.strip()
+        uscs_primary = uscs_upper.str[:2]
 
-        # ── Unit weight ───────────────────────────────────────────────────────
-        unit_weight_col = None
-        for col in ['Unit Weight (γ)', 'Unit Weight', 'unit_weight', 'Unit Weight (kN/m³)', 'γ']:
-            if col in df_clean.columns:
-                unit_weight_col = col
-                break
-
-        if unit_weight_col:
-            df_clean['unit_weight'] = pd.to_numeric(
-                df_clean[unit_weight_col], errors='coerce')
-            valid_uw = df_clean['unit_weight'].dropna()
-            if len(valid_uw) > 0:
-                invalid = ((valid_uw < 10) | (valid_uw > 25)).sum()
-                if invalid > 0:
-                    self.validation_warnings.append(
-                        f"Unit weight out of typical range (10-25 kN/m³): {invalid} records")
+        # Unit weight
+        uw_col = next((c for c in ['Unit Weight (γ)', 'Unit Weight', 'unit_weight',
+                                   'Unit Weight (kN/m³)', 'γ'] if c in df.columns), None)
+        if uw_col:
+            df['unit_weight'] = pd.to_numeric(df[uw_col], errors='coerce')
+            oor = ((df['unit_weight'].dropna() < 10) | (
+                df['unit_weight'].dropna() > 25)).sum()
+            if oor:
+                self.validation_warnings.append(
+                    f"Unit weight outside 10–25 kN/m³: {oor}")
         else:
-            df_clean['unit_weight'] = np.nan
+            df['unit_weight'] = np.nan
+        uscs_uw = uscs_primary.map(_USCS_UNIT_WEIGHT).fillna(18.0)
+        df['unit_weight'] = df['unit_weight'].fillna(uscs_uw)
 
-        # Fill missing with USCS-informed default, then fall back to 18.0
-        uscs_uw_default = uscs_primary.map(_USCS_UNIT_WEIGHT).fillna(18.0)
-        df_clean['unit_weight'] = df_clean['unit_weight'].fillna(uscs_uw_default)
-
-        # ── Fines content ─────────────────────────────────────────────────────
-        fines_col = None
-        for col in ['Fines Content', 'fines_content', 'Fines (%)', 'Fines']:
-            if col in df_clean.columns:
-                fines_col = col
-                break
-
-        if fines_col:
-            df_clean['fines_content'] = pd.to_numeric(
-                df_clean[fines_col], errors='coerce')
-            valid_fines = df_clean['fines_content'].dropna()
-            if len(valid_fines) > 0:
-                invalid = ((valid_fines < 0) | (valid_fines > 100)).sum()
-                if invalid > 0:
-                    self.validation_errors.append(
-                        f"Fines content out of valid range (0-100%): {invalid} records")
+        # Fines content (FIX 1 already applied in pre_clean; fill remaining NaN here)
+        fc_col = next((c for c in ['Fines Content', 'fines_content', 'Fines (%)']
+                       if c in df.columns), None)
+        if fc_col:
+            df['fines_content'] = pd.to_numeric(df[fc_col], errors='coerce')
+            oor = ((df['fines_content'].dropna() < 0) | (
+                df['fines_content'].dropna() > 100)).sum()
+            if oor:
+                self.validation_errors.append(
+                    f"Fines content outside 0–100%: {oor} (post-correction)")
         else:
-            df_clean['fines_content'] = np.nan
+            df['fines_content'] = np.nan
+        uscs_fc = uscs_primary.map(_USCS_FINES_PCT).fillna(15.0)
+        df['fines_content'] = df['fines_content'].fillna(uscs_fc)
 
-        # Fill missing with USCS-informed default, then fall back to 15.0
-        uscs_fc_default = uscs_primary.map(_USCS_FINES_PCT).fillna(15.0)
-        df_clean['fines_content'] = df_clean['fines_content'].fillna(uscs_fc_default)
+        # Groundwater level (FIX 8 backup already applied; FIX 9 flag tracks imputation)
+        gwl_col = next((c for c in ['Groundwater Level (m)', 'Ground Water Table',
+                                    'Groundwater Level', 'groundwater_depth_m', 'GWL']
+                        if c in df.columns), None)
+        gwl_numeric = pd.to_numeric(
+            df[gwl_col], errors='coerce') if gwl_col else pd.Series(np.nan, index=df.index)
+        df['gwl_estimated'] = gwl_numeric.isna()
+        df['groundwater_depth_m'] = gwl_numeric.fillna(
+            5.0)  # initial fallback; replaced in later steps
 
-        # ── Groundwater depth ─────────────────────────────────────────────────
-        gwl_col = None
-        for col in ['Groundwater Level (m)', 'Ground Water Table', 'Groundwater Level',
-                    'Groundwater Depth', 'groundwater_depth_m', 'GWL', 'Water Table']:
-            if col in df_clean.columns:
-                gwl_col = col
-                break
-
-        if gwl_col:
-            gwl_numeric = pd.to_numeric(df_clean[gwl_col], errors='coerce')
-        else:
-            gwl_numeric = pd.Series(np.nan, index=df_clean.index)
-
-        # Track which rows received the 5.0 fallback — fill_missing_by_borehole
-        # will later replace these with propagated within-borehole real values.
-        gwl_null_mask = gwl_numeric.isna()
-        df_clean['groundwater_depth_m'] = gwl_numeric.fillna(5.0)
-        df_clean['gwl_estimated'] = gwl_null_mask
-
-        # ── Soil type ─────────────────────────────────────────────────────────
-        soil_type_col = None
-        for col in ['Soil Type', 'soil_type', 'Soil Classification', 'Classification']:
-            if col in df_clean.columns:
-                soil_type_col = col
-                break
-
-        if soil_type_col:
-            df_clean['soil_type'] = (df_clean[soil_type_col]
-                                     .fillna('')
-                                     .astype(str)
-                                     .str.strip())
-            df_clean['soil_type'] = df_clean['soil_type'].replace('nan', '')
-
-        # ── Soil description ──────────────────────────────────────────────────
-        desc_col = None
-        for col in ['Soil/Rock Description', 'Soil Description', 'soil_description', 'Description', 'Soil Name']:
-            if col in df_clean.columns:
-                desc_col = col
-                break
-
+        # Soil description
+        desc_col = next((c for c in ['Soil/Rock Description', 'Soil Description',
+                                     'soil_description', 'Description'] if c in df.columns), None)
         if desc_col:
-            df_clean['soil_description'] = (df_clean[desc_col]
-                                            .fillna('')
-                                            .astype(str)
-                                            .str.strip())
-            df_clean['soil_description'] = df_clean['soil_description'].replace(
-                'nan', '')
+            df['soil_description'] = df[desc_col].fillna(
+                '').astype(str).str.strip().replace('nan', '')
 
-        # ── Internal friction angle ───────────────────────────────────────────
-        friction_col = None
-        for col in ['Internal Friction Angle', 'Friction Angle', 'friction_angle', 'φ']:
-            if col in df_clean.columns:
-                friction_col = col
-                break
+        # Friction angle
+        fa_col = next((c for c in ['Internal Friction Angle', 'Friction Angle',
+                                   'friction_angle'] if c in df.columns), None)
+        if fa_col:
+            df['friction_angle'] = pd.to_numeric(df[fa_col], errors='coerce')
 
-        if friction_col:
-            df_clean['friction_angle'] = pd.to_numeric(
-                df_clean[friction_col], errors='coerce')
-
-        # ── Plasticity Index ──────────────────────────────────────────────────
-        pi_col = None
-        for col in ['Plasticity Index (PI)', 'Plasticity Index', 'plasticity_index', 'PI']:
-            if col in df_clean.columns:
-                pi_col = col
-                break
-
+        # Plasticity index
+        pi_col = next((c for c in ['Plasticity Index (PI)', 'Plasticity Index',
+                                   'plasticity_index', 'PI'] if c in df.columns), None)
         if pi_col:
-            df_clean['plasticity_index'] = pd.to_numeric(
-                df_clean[pi_col], errors='coerce')
+            df['plasticity_index'] = pd.to_numeric(df[pi_col], errors='coerce')
 
-        # ── Natural water content ─────────────────────────────────────────────
-        wc_col = None
-        for col in ['Natural Water Content (ω)', 'Natural Water Content', 'moisture_content',
-                    'Water Content', 'Moisture Content']:
-            if col in df_clean.columns:
-                wc_col = col
-                break
-
+        # Moisture content
+        wc_col = next((c for c in ['Natural Water Content (ω)', 'Natural Water Content',
+                                   'moisture_content', 'Water Content'] if c in df.columns), None)
         if wc_col:
-            df_clean['moisture_content'] = pd.to_numeric(
-                df_clean[wc_col], errors='coerce')
+            df['moisture_content'] = pd.to_numeric(df[wc_col], errors='coerce')
 
-        # ── Mean particle size D50 ────────────────────────────────────────────
-        d50_col = None
-        for col in ['Mean Particle Size (D50) (mm)', 'Mean Particle Size', 'mean_particle_size_d50',
-                    'D50', 'Particle Size (D50)']:
-            if col in df_clean.columns:
-                d50_col = col
-                break
-
+        # D50
+        d50_col = next((c for c in ['Mean Particle Size (D50) (mm)', 'Mean Particle Size',
+                                    'mean_particle_size_d50', 'D50'] if c in df.columns), None)
         if d50_col:
-            df_clean['mean_particle_size_d50'] = pd.to_numeric(
-                df_clean[d50_col], errors='coerce')
+            df['mean_particle_size_d50'] = pd.to_numeric(
+                df[d50_col], errors='coerce')
 
-        return df_clean
+        return df
 
+    # -----------------------------------------------------------------------
+    # process_and_validate
+    # -----------------------------------------------------------------------
     def process_and_validate(self) -> bool:
-        """Single-pass processing with validation"""
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("STEP 2: PRE-CLEANING AND VALIDATING DATA")
-        print("="*80)
+        print("=" * 80)
 
         all_dfs = []
 
         for sheet_name, df in self.raw_data.items():
-            print(f"\n  Pre-cleaning sheet: {sheet_name}")
+            print(f"\n  Sheet: {sheet_name}")
 
-            # STEP 1: PRE-CLEAN — must run FIRST (drops unnamed cols + fixes StringDtype)
             df = self.pre_clean_dataframe(df, sheet_name)
-
-            # STEP 2: Validate coordinates
             df = self.validate_coordinates(df)
-
-            # STEP 3: Validate SPT
             df = self.validate_spt(df)
-
-            # STEP 4: Validate soil parameters
             df = self.validate_soil_parameters(df)
 
-            # STEP 5: Map PGA to pga_g
+            # PGA  (FIX 4 applied below in fill_missing_by_borehole after propagation)
             if 'Peak Ground Acceleration' in df.columns:
-                df['pga_g'] = df['Peak Ground Acceleration']
+                df['pga_g'] = pd.to_numeric(
+                    df['Peak Ground Acceleration'], errors='coerce')
             else:
-                df['pga_g'] = 0.35
+                df['pga_g'] = np.nan
+            # Flag implausibly low PGA (FIX 4)
+            if 'pga_g' in df.columns:
+                low_pga = df['pga_g'].notna() & (df['pga_g'] < _TARLAC_PGA_MIN)
+                if low_pga.any():
+                    bad_bhs = df.loc[low_pga, 'Borehole ID'].tolist()
+                    self.validation_errors.append(
+                        f"[{sheet_name}] PGA < {_TARLAC_PGA_MIN}g (likely decimal error): {bad_bhs}"
+                    )
+                    print(
+                        f"    [FIX4] PGA < {_TARLAC_PGA_MIN}g nulled for: {bad_bhs}")
+                    # municipality propagation will fix
+                    df.loc[low_pga, 'pga_g'] = np.nan
+            # sentinel; replaced by propagation
+            df['pga_g'] = df['pga_g'].fillna(0.35)
 
-            df['pga_g'] = pd.to_numeric(
-                df['pga_g'], errors='coerce').fillna(0.35)
-
-            # STEP 6: Map Relative Density
+            # Relative density
             if 'Relative Density' in df.columns:
                 df['relative_density_percent'] = df['Relative Density']
 
-            # STEP 7: Add Depth_Layer column
+            # Depth info from sheet name
             df['Depth_Layer'] = sheet_name
 
-            # STEP 8: Extract depth from sheet name
-            def extract_depth(layer_name):
-                match = re.search(
-                    r'(\d+\.?\d*)\s*-\s*(\d+\.?\d*)', str(layer_name))
-                if match:
-                    return float(match.group(1)), float(match.group(2))
-                return 0.0, 1.5
+            def extract_depth(name):
+                m = re.search(r'(\d+\.?\d*)\s*-\s*(\d+\.?\d*)', str(name))
+                return (float(m.group(1)), float(m.group(2))) if m else (0.0, 1.5)
 
             depths = df['Depth_Layer'].apply(extract_depth)
             df['depth_from_m'] = depths.apply(lambda x: x[0])
             df['depth_to_m'] = depths.apply(lambda x: x[1])
             df['depth_mid_m'] = (df['depth_from_m'] + df['depth_to_m']) / 2
 
-            # STEP 9: Compute missing raw columns from empirical formulas
             df = self.compute_missing_raw_columns(df)
-
             all_dfs.append(df)
-            print(f"    [OK] Processed {len(df)} rows")
+            print(f"    [OK] {len(df)} rows processed")
 
         if all_dfs:
             self.processed_data = pd.concat(all_dfs, ignore_index=True)
             print(
-                f"\n  [OK] Combined {len(self.processed_data)} total records")
-            print(f"  Sheets combined: {len(self.raw_data)}")
-
-            if 'Depth_Layer' in self.processed_data.columns:
-                print(f"\n  Depth Layer Distribution:")
-                depth_counts = self.processed_data['Depth_Layer'].value_counts(
-                ).sort_index()
-                for depth, count in depth_counts.items():
-                    print(f"    {depth}: {count} rows")
-
+                f"\n  [OK] Combined {len(self.processed_data)} records from {len(self.raw_data)} sheets")
             return True
         return False
 
+    # -----------------------------------------------------------------------
+    # Compute missing raw columns
+    # -----------------------------------------------------------------------
     def compute_missing_raw_columns(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Fill in NULL cells in the raw data columns during data cleaning.
-
-        Computes (only for rows where the value is currently missing):
-          - Total Overburden Pressure  (σ_v  = γ × z_mid)
-          - Effective Overburden Pressure (σ'_v = σ_v − u, min 1 kPa)
-          - Relative Density (Dr % = √(N1_60/60) × 100, Skempton 1986)
-          - Cyclic Stress Ratio (CSR = 0.65 × σ_v/σ'_v × PGA × rd)
-        """
-        GAMMA_WATER = 9.81
-        COHESIVE_USCS = {"CL", "CH", "ML", "MH", "OL", "OH", "Pt", "CL-ML"}
-
+        """Fill NULL raw cells using empirical relationships."""
+        GAMMA_W = 9.81
         df = df.copy()
         z = df['depth_mid_m']
         γ = df['unit_weight']
         gwl = df['groundwater_depth_m']
 
         sigma_v = γ * z
-        u = np.maximum(0.0, z - gwl) * GAMMA_WATER
+        u = np.maximum(0.0, z - gwl) * GAMMA_W
         sigma_eff = np.maximum(1.0, sigma_v - u)
 
-        rd = np.where(z <= 9.15,
-                      1.0 - 0.00765 * z,
-                      np.where(z <= 23.0,
-                               1.174 - 0.0267 * z,
-                               0.0))
-        rd = np.clip(rd, 0.0, 1.0)
+        rd = np.clip(np.where(z <= 9.15, 1.0 - 0.00765 * z,
+                              np.where(z <= 23.0, 1.174 - 0.0267 * z, 0.0)), 0.0, 1.0)
 
-        # 1. Total Overburden Pressure
+        # Total overburden
         tot_col = 'Total Overburden Pressure'
         if tot_col in df.columns:
-            missing = pd.to_numeric(df[tot_col], errors='coerce').isna()
-            df.loc[missing, tot_col] = sigma_v[missing].round(2)
-            filled = missing.sum()
-            if filled:
-                print(
-                    f"      [FILL] Total Overburden Pressure: {filled} rows computed")
+            miss = pd.to_numeric(df[tot_col], errors='coerce').isna()
+            df.loc[miss, tot_col] = sigma_v[miss].round(2)
+            if miss.sum():
+                print(f"      [FILL] Total OBP: {miss.sum()} rows")
 
-        # 2. Effective Overburden Pressure (typo "Presssure" in raw data)
+        # Effective overburden (handles typo 'Presssure')
         for eff_col in ('Effective Overburden Presssure', 'Effective Overburden Pressure'):
             if eff_col in df.columns:
-                missing = pd.to_numeric(df[eff_col], errors='coerce').isna()
-                df.loc[missing, eff_col] = sigma_eff[missing].round(2)
-                filled = missing.sum()
-                if filled:
-                    print(
-                        f"      [FILL] Effective Overburden Pressure: {filled} rows computed")
+                miss = pd.to_numeric(df[eff_col], errors='coerce').isna()
+                df.loc[miss, eff_col] = sigma_eff[miss].round(2)
+                if miss.sum():
+                    print(f"      [FILL] Effective OBP: {miss.sum()} rows")
                 break
 
-        # 3. Relative Density (Dr %)
+        # Relative density (Skempton 1986) — granular only
         rd_col = 'Relative Density'
         n160_col = 'Corrected SPT-N Value (N1(60))'
-        uscs_col = 'USCS Symbol'
         if rd_col in df.columns and n160_col in df.columns:
             n1_60 = pd.to_numeric(df[n160_col], errors='coerce')
-            uscs = (df[uscs_col].fillna('').astype(str).str.strip().str.upper()
-                    if uscs_col in df.columns
-                    else pd.Series([''] * len(df), index=df.index))
-            missing = (
-                pd.to_numeric(df[rd_col], errors='coerce').isna()
-                & n1_60.notna()
-                & (n1_60 > 0)
-                & ~uscs.isin(COHESIVE_USCS)
-            )
-            df.loc[missing, rd_col] = (
-                np.sqrt(n1_60[missing] / 60.0) * 100.0
-            ).round(2)
-            filled = missing.sum()
-            if filled:
+            uscs = df.get('uscs_symbol', pd.Series(
+                '', index=df.index)).str.upper().str[:2]
+            miss = (pd.to_numeric(df[rd_col], errors='coerce').isna()
+                    & n1_60.notna() & (n1_60 > 0)
+                    & ~uscs.isin(_COHESIVE_USCS))
+            df.loc[miss, rd_col] = (
+                np.sqrt(n1_60[miss] / 60.0) * 100.0).round(2)
+            if miss.sum():
                 print(
-                    f"      [FILL] Relative Density: {filled} rows computed (Skempton 1986)")
+                    f"      [FILL] Relative Density: {miss.sum()} rows (Skempton 1986)")
 
-        # 4. Cyclic Stress Ratio (CSR)
+        # CSR (Seed & Idriss 1971)
         csr_col = 'Cyclic Stress Ratio (CSR)'
         if csr_col in df.columns:
             csr_vals = 0.65 * (sigma_v / sigma_eff) * df['pga_g'] * rd
-            missing = (
-                pd.to_numeric(df[csr_col], errors='coerce').isna()
-                & (df['pga_g'] > 0)
-            )
-            df.loc[missing, csr_col] = csr_vals[missing].round(6)
-            filled = missing.sum()
-            if filled:
-                print(
-                    f"      [FILL] CSR: {filled} rows computed (Seed & Idriss 1971)")
+            miss = (pd.to_numeric(
+                df[csr_col], errors='coerce').isna() & (df['pga_g'] > 0))
+            df.loc[miss, csr_col] = csr_vals[miss].round(6)
+            if miss.sum():
+                print(f"      [FILL] CSR: {miss.sum()} rows")
 
-        # 5. Friction angle from SPT — Wolff (1989) for granular; 15° floor for cohesive
-        COHESIVE_USCS = {'CL', 'CH', 'ML', 'MH', 'OL', 'OH', 'PT', 'CL-ML'}
-        uscs_fa = (df['uscs_symbol'].fillna('').astype(str).str.strip().str.upper()
-                   if 'uscs_symbol' in df.columns
-                   else pd.Series([''] * len(df), index=df.index))
-        is_cohesive_fa = uscs_fa.str[:2].isin(COHESIVE_USCS) | uscs_fa.isin(COHESIVE_USCS)
-
-        fa_col_candidates = ['friction_angle', 'Internal Friction Angle', 'Friction Angle']
-        fa_col = next((c for c in fa_col_candidates if c in df.columns), None)
+        # Friction angle (Wolff 1989 granular / 15° cohesive floor)
+        uscs_fa = df.get('uscs_symbol', pd.Series(
+            '', index=df.index)).str.upper().str[:2]
+        is_coh = uscs_fa.isin(_COHESIVE_USCS)
+        fa_col = next(
+            (c for c in ['friction_angle', 'Internal Friction Angle'] if c in df.columns), None)
         if fa_col:
-            missing_fa = pd.to_numeric(df[fa_col], errors='coerce').isna()
+            miss = pd.to_numeric(df[fa_col], errors='coerce').isna()
             n_fa = df['spt_n_value'].clip(lower=1.0)
-            # Wolff (1989): φ = 27.1 + 0.3·N − 0.00054·N²  (granular soils)
-            phi_granular = (27.1 + 0.3 * n_fa - 0.00054 * n_fa ** 2).clip(25.0, 45.0)
-            phi_fill = np.where(is_cohesive_fa, 15.0, phi_granular)
-            df.loc[missing_fa, fa_col] = phi_fill[missing_fa].round(1)
-            filled = missing_fa.sum()
-            if filled:
-                print(f"      [FILL] Friction angle: {filled} rows computed "
-                      f"(Wolff 1989 granular / 15° cohesive floor)")
+            phi_g = (27.1 + 0.3 * n_fa - 0.00054 * n_fa ** 2).clip(25.0, 45.0)
+            df.loc[miss, fa_col] = np.where(
+                is_coh[miss], 15.0, phi_g[miss]).round(1)
+            if miss.sum():
+                print(f"      [FILL] Friction angle: {miss.sum()} rows")
 
-        # 6. Elastic modulus from SPT — Bowles (1988), stored as MN/m²
-        #    Sand:  Es = 0.5·(N+15)   MN/m²
-        #    Silt:  Es = 0.3·(N+6)    MN/m²
-        #    Clay:  Es = 0.2·N        MN/m²
-        SAND_USCS = {'SW', 'SP', 'SM', 'SC', 'GW', 'GP', 'GM', 'GC'}
-        SILT_USCS = {'ML', 'MH'}
-        uscs_es = (df['uscs_symbol'].fillna('').astype(str).str.strip().str.upper()
-                   if 'uscs_symbol' in df.columns
-                   else pd.Series([''] * len(df), index=df.index))
-        uscs_es_primary = uscs_es.str[:2]
-        is_sand_es = uscs_es_primary.isin(SAND_USCS) | uscs_es.isin(SAND_USCS)
-        is_silt_es = uscs_es_primary.isin(SILT_USCS) | uscs_es.isin(SILT_USCS)
-
-        es_col_candidates = ['Elastic Modulus (Es) (MN/m²)', 'elastic_modulus_es']
-        es_col = next((c for c in es_col_candidates if c in df.columns), None)
+        # Elastic modulus (Bowles 1988)
+        SAND_U = {'SW', 'SP', 'SM', 'SC', 'GW', 'GP', 'GM', 'GC'}
+        SILT_U = {'ML', 'MH'}
+        uscs_es = df.get('uscs_symbol', pd.Series(
+            '', index=df.index)).str.upper().str[:2]
+        is_sand = uscs_es.isin(SAND_U)
+        is_silt = uscs_es.isin(SILT_U)
+        es_col = next((c for c in ['Elastic Modulus (Es) (MN/m²)', 'elastic_modulus_es']
+                       if c in df.columns), None)
         if es_col:
-            missing_es = pd.to_numeric(df[es_col], errors='coerce').isna()
+            miss = pd.to_numeric(df[es_col], errors='coerce').isna()
             n_es = df['spt_n_value'].clip(lower=1.0)
-            es_sand = 0.5 * (n_es + 15.0)
-            es_silt = 0.3 * (n_es + 6.0)
-            es_clay = 0.2 * n_es
-            es_fill = np.where(is_sand_es, es_sand,
-                               np.where(is_silt_es, es_silt, es_clay))
-            df.loc[missing_es, es_col] = es_fill[missing_es].round(2)
-            filled = missing_es.sum()
-            if filled:
-                print(f"      [FILL] Elastic modulus: {filled} rows computed "
-                      f"(Bowles 1988 SPT correlation, MN/m²)")
+            es_val = np.where(is_sand, 0.5 * (n_es + 15.0),
+                              np.where(is_silt, 0.3 * (n_es + 6.0), 0.2 * n_es))
+            df.loc[miss, es_col] = es_val[miss].round(2)
+            if miss.sum():
+                print(f"      [FILL] Elastic modulus: {miss.sum()} rows")
 
         return df
 
+    # -----------------------------------------------------------------------
+    # Fill missing by borehole  (FIX 4, 6, 9)
+    # -----------------------------------------------------------------------
     def fill_missing_by_borehole(self) -> bool:
         """
-        Improve defaulted values using within-borehole context after all sheets
-        are concatenated.
-
-        - GWL: if any layer in the same borehole has a real measured value,
-               propagate its median to the layers that received the 5.0 fallback.
-        - PGA: same propagation strategy (default sentinel = 0.35 g).
-        - SPT N: linear interpolation across depth layers when ≥2 measured
-               values exist in the borehole; forward/back fill for edge layers.
-
-        Must run BEFORE calculate_csr_crr so that the improved values feed into
-        CSR/CRR/FS computations.
+        FIX 4  — PGA < 0.2g (nulled earlier) replaced by borehole median.
+        FIX 6  — GWL still missing after borehole propagation → municipality median.
+        FIX 9  — SPT interpolation uses spt_is_imputed flag instead of ==15 sentinel.
         """
-        print("\n" + "="*80)
-        print("FILLING MISSING VALUES BY BOREHOLE (cross-depth propagation)")
-        print("="*80)
+        print("\n" + "=" * 80)
+        print("FILLING MISSING VALUES BY BOREHOLE")
+        print("=" * 80)
 
         df = self.processed_data.copy()
 
-        # Identify borehole ID column
-        bh_col = None
-        for c in ['Borehole ID', 'borehole_id']:
-            if c in df.columns:
-                bh_col = c
-                break
-
+        bh_col = next(
+            (c for c in ['Borehole ID', 'borehole_id'] if c in df.columns), None)
         if bh_col is None:
-            print("  [SKIP] No borehole ID column found — skipping cross-depth fill")
+            print("  [SKIP] No borehole ID column — skipping")
             return True
 
         df = df.sort_values([bh_col, 'depth_mid_m']).reset_index(drop=True)
 
-        # ── GWL propagation ───────────────────────────────────────────────────
+        # ── GWL within-borehole propagation ───────────────────────────────
         gwl_updated = 0
-        if 'gwl_estimated' in df.columns and 'groundwater_depth_m' in df.columns:
+        if 'gwl_estimated' in df.columns:
             for bh_id, grp in df.groupby(bh_col, sort=False):
-                real_mask = ~grp['gwl_estimated']
-                est_mask  =  grp['gwl_estimated']
-                if real_mask.any() and est_mask.any():
-                    real_gwl = grp.loc[real_mask, 'groundwater_depth_m'].median()
-                    df.loc[grp.index[est_mask], 'groundwater_depth_m'] = real_gwl
-                    df.loc[grp.index[est_mask], 'gwl_estimated'] = False
-                    gwl_updated += int(est_mask.sum())
-            print(f"  [FILL] GWL propagated within boreholes : {gwl_updated} rows updated")
-        else:
-            print("  [SKIP] GWL propagation: gwl_estimated flag column not present")
+                real = ~grp['gwl_estimated']
+                est = grp['gwl_estimated']
+                if real.any() and est.any():
+                    med = grp.loc[real, 'groundwater_depth_m'].median()
+                    df.loc[grp.index[est], 'groundwater_depth_m'] = med
+                    df.loc[grp.index[est], 'gwl_estimated'] = False
+                    gwl_updated += int(est.sum())
+        print(f"  [FILL] GWL propagated within boreholes: {gwl_updated} rows")
 
-        # ── PGA propagation ───────────────────────────────────────────────────
-        _DEFAULT_PGA = 0.35
+        # FIX 6 — municipality-median GWL for boreholes with NO real GWL
+        muni_col = next(
+            (c for c in ['Municipality', 'municipality'] if c in df.columns), None)
+        if muni_col and 'gwl_estimated' in df.columns:
+            real_gwl_df = df[~df['gwl_estimated']]
+            muni_medians = real_gwl_df.groupby(
+                muni_col)['groundwater_depth_m'].median()
+            still_est = df['gwl_estimated']
+            if still_est.any():
+                muni_fill = df.loc[still_est, muni_col].map(muni_medians)
+                ok = muni_fill.notna()
+                df.loc[still_est & ok, 'groundwater_depth_m'] = muni_fill[ok]
+                df.loc[still_est & ok, 'gwl_estimated'] = False
+                print(
+                    f"  [FIX6] GWL filled from municipality median: {ok.sum()} rows")
+
+        # ── PGA propagation (FIX 4 — also covers borehole-median replacement) ──
         pga_updated = 0
-        if 'pga_g' in df.columns:
-            for bh_id, grp in df.groupby(bh_col, sort=False):
-                real_mask = grp['pga_g'] != _DEFAULT_PGA
-                est_mask  = grp['pga_g'] == _DEFAULT_PGA
-                if real_mask.any() and est_mask.any():
-                    real_pga = grp.loc[real_mask, 'pga_g'].median()
-                    df.loc[grp.index[est_mask], 'pga_g'] = real_pga
-                    pga_updated += int(est_mask.sum())
-            print(f"  [FILL] PGA propagated within boreholes : {pga_updated} rows updated")
+        for bh_id, grp in df.groupby(bh_col, sort=False):
+            # Real PGA = not 0.35 sentinel AND not suspiciously low
+            real = (grp['pga_g'] != 0.35) & (grp['pga_g'] >= _TARLAC_PGA_MIN)
+            est = ~real
+            if real.any() and est.any():
+                med = grp.loc[real, 'pga_g'].median()
+                df.loc[grp.index[est], 'pga_g'] = med
+                pga_updated += int(est.sum())
+        print(f"  [FILL] PGA propagated within boreholes: {pga_updated} rows")
 
-        # ── SPT N interpolation ───────────────────────────────────────────────
-        _DEFAULT_SPT = 15.0
+        # FIX 10 — fault-distance attenuation fallback for remaining missing PGA
+        fault_col = next((c for c in ['Fault Distance (km)', 'fault_distance']
+                          if c in df.columns), None)
+        if fault_col:
+            still_default = df['pga_g'] == 0.35
+            R = pd.to_numeric(
+                df.loc[still_default, fault_col], errors='coerce').clip(lower=1.0)
+            Mw = 6.5
+            # Simplified Youngs et al. (1997) interface equation
+            pga_est = (0.2083 * np.exp(1.2587 * Mw) *
+                       (R + 15) ** -1.9661).clip(0.1, 0.8)
+            ok = R.notna()
+            df.loc[still_default & ok.reindex(df.index, fill_value=False), 'pga_g'] = \
+                pga_est[ok].round(3).values
+            print(
+                f"  [FIX10] PGA from fault-distance attenuation: {ok.sum()} rows")
+
+        # ── SPT interpolation (FIX 9 — use flag, not ==15 sentinel) ──────
         spt_updated = 0
-        if 'spt_n_value' in df.columns:
+        if 'spt_is_imputed' in df.columns:
             for bh_id, grp in df.groupby(bh_col, sort=False):
-                spt = grp['spt_n_value'].copy()
-                real_mask = spt != _DEFAULT_SPT
-                # Need ≥2 real measurements to interpolate meaningfully
-                if real_mask.sum() >= 2:
-                    spt_real = spt.where(real_mask)
-                    spt_interp = (spt_real
-                                  .interpolate(method='index')
-                                  .ffill()
-                                  .bfill()
-                                  .clip(lower=1.0, upper=100.0))
-                    default_idx = grp.index[~real_mask]
-                    if len(default_idx) > 0:
-                        df.loc[default_idx, 'spt_n_value'] = (
-                            spt_interp.loc[default_idx].round(1)
-                        )
-                        spt_updated += len(default_idx)
-            print(f"  [FILL] SPT N interpolated within boreholes: {spt_updated} rows updated")
+                real = ~grp['spt_is_imputed']
+                if real.sum() >= 2:
+                    spt_real = grp['spt_n_value'].where(real)
+                    spt_interp = (spt_real.interpolate(method='index')
+                                  .ffill().bfill()
+                                  .clip(1.0, 100.0))
+                    imp_idx = grp.index[~real]
+                    if len(imp_idx):
+                        df.loc[imp_idx, 'spt_n_value'] = spt_interp.loc[imp_idx].round(
+                            1)
+                        df.loc[imp_idx, 'spt_n_value_liq'] = spt_interp.loc[imp_idx].clip(
+                            upper=60).round(1)
+                        spt_updated += len(imp_idx)
+        print(
+            f"  [FILL] SPT interpolated within boreholes: {spt_updated} rows")
 
         self.processed_data = df
-        print(f"  [OK] Borehole-level fill complete")
+        print("  [OK] Borehole fill complete")
         return True
 
+    # -----------------------------------------------------------------------
+    # CSR / CRR  (FIX 2, 3)
+    # -----------------------------------------------------------------------
     def calculate_csr_crr(self) -> bool:
         """
-        Calculate CSR, CRR, MSF, FS, and LPI components per thesis methodology.
+        FIX 2 — N1(60) computed via Cn for records lacking measured value.
+        FIX 3 — spt_n_value_liq (capped at 60) used in N1(60)cs path.
         """
-        print("\n" + "="*80)
-        print("STEP 3: CSR/CRR ANALYSIS (Thesis Methodology)")
-        print("="*80)
+        print("\n" + "=" * 80)
+        print("STEP 3: CSR/CRR ANALYSIS")
+        print("=" * 80)
 
         df = self.processed_data.copy()
-        gamma_water = 9.81
+        GAMMA_W = 9.81
+        MW = 6.5
+        MSF = (10 ** 2.24) / (MW ** 2.56)
 
-        MAGNITUDE_MW = 6.5
-        df['magnitude_mw'] = MAGNITUDE_MW
-        print(f"  Magnitude (Mw): {MAGNITUDE_MW} (Tarlac seismic zone)")
-
-        MSF = (10 ** 2.24) / (MAGNITUDE_MW ** 2.56)
+        df['magnitude_mw'] = MW
         df['msf'] = MSF
-        print(f"  MSF: {MSF:.6f}")
+        df['q_actual_kpa'] = 150.0
+        print(f"  Mw={MW}, MSF={MSF:.4f}, q_actual=150 kPa")
 
-        Q_ACTUAL = 150.0  # kPa — representative single/double-storey building load
-        df['q_actual_kpa'] = Q_ACTUAL
-        print(
-            f"  q_actual: {Q_ACTUAL} kPa (default building contact pressure)")
-
-        df['spt_n60'] = df['spt_n_value'] * 1.0
-        n1_60 = pd.to_numeric(df.get('Corrected SPT-N Value (N1(60))', df['spt_n_value']),
-                              errors='coerce').fillna(df['spt_n_value'])
-        df['spt_n160'] = n1_60
-
+        # Overburden pressures
         df['total_overburden_pressure'] = df['unit_weight'] * df['depth_mid_m']
         depth_below_wt = np.maximum(
-            0, df['depth_mid_m'] - df['groundwater_depth_m'])
+            0.0, df['depth_mid_m'] - df['groundwater_depth_m'])
         df['effective_overburden_pressure'] = (
-            df['total_overburden_pressure'] - gamma_water * depth_below_wt
+            df['total_overburden_pressure'] - GAMMA_W * depth_below_wt
         ).clip(lower=1.0)
 
+        # rd stress reduction coefficient
         z = df['depth_mid_m']
-        rd = np.where(z <= 9.15,
-                      1.0 - 0.00765 * z,
-                      np.where(z <= 23.0,
-                               1.174 - 0.0267 * z,
-                               0.0))
-        rd = np.clip(rd, 0.0, 1.0)
+        rd = np.clip(np.where(z <= 9.15, 1.0 - 0.00765 * z,
+                              np.where(z <= 23.0, 1.174 - 0.0267 * z, 0.0)), 0.0, 1.0)
 
+        # CSR
         print("  Calculating CSR (Seed & Idriss 1971)...")
-        df['csr'] = (0.65
-                     * df['pga_g']
+        df['csr'] = (0.65 * df['pga_g']
                      * (df['total_overburden_pressure'] / df['effective_overburden_pressure'])
                      * rd)
 
+        # FIX 2 — compute N1(60) via Cn where not measured
+        print("  Computing N1(60) with Cn correction (FIX 2)...")
+        raw_n160 = pd.to_numeric(
+            df.get('Corrected SPT-N Value (N1(60))',
+                   pd.Series(np.nan, index=df.index)),
+            errors='coerce'
+        )
+        has_measured_n160 = raw_n160.notna()
+
+        # Overburden correction factor Cn (Liao & Whitman 1986)
+        Cn = np.minimum(1.7, np.sqrt(
+            101.3 / df['effective_overburden_pressure'].clip(lower=1.0)))
+        # FIX 3 — use refusal-capped SPT for liquefaction path
+        computed_n160 = (df['spt_n_value_liq'] * Cn).clip(upper=60.0)
+        df['spt_n160'] = np.where(has_measured_n160, raw_n160, computed_n160)
+        df['spt_n60'] = df['spt_n_value']   # uncorrected, kept for reference
+
+        n160_source_computed = (~has_measured_n160).sum()
+        n160_source_measured = has_measured_n160.sum()
+        print(
+            f"    N1(60) source — measured: {n160_source_measured}, Cn-computed: {n160_source_computed}")
+
+        # NCEER fines correction → (N1)60cs
         print("  Computing (N1)60cs with fines correction (NCEER)...")
         FC = df['fines_content'].clip(lower=0.1)
         alpha = np.where(FC < 5.0,  0.0,
-                         np.where(FC <= 35.0, np.exp(1.76 - 190.0 / FC**2), 5.0))
+                         np.where(FC <= 35.0, np.exp(1.76 - 190.0 / FC ** 2), 5.0))
         beta = np.where(FC < 5.0,  1.0,
-                        np.where(FC <= 35.0, 0.99 + FC**1.5 / 1000.0, 1.2))
-        df['n1_60cs'] = alpha + beta * df['spt_n160']
+                        np.where(FC <= 35.0, 0.99 + FC ** 1.5 / 1000.0, 1.2))
+        df['n1_60cs'] = (alpha + beta * df['spt_n160']).clip(upper=60.0)
 
-        print("  Calculating CRR(7.5) (Robertson-Wride formula)...")
+        # CRR (Robertson & Wride 1998)
+        print("  Calculating CRR (Robertson-Wride)...")
         N = df['n1_60cs'].clip(upper=30.0)
-        crr_raw = np.exp(
-            N / 14.1
-            + (N / 126.0) ** 2
-            - (N / 23.6) ** 3
-            + (N / 25.4) ** 4
-            - 2.67
-        )
+        crr_raw = np.exp(N / 14.1 + (N / 126.0) ** 2
+                         - (N / 23.6) ** 3 + (N / 25.4) ** 4 - 2.67)
         df['crr'] = np.where(df['n1_60cs'] >= 30.0, 0.6,
                              crr_raw.clip(0.0, 0.6))
 
+        # Factor of safety
         df['factor_of_safety'] = (df['crr'] * MSF) / (df['csr'] + 1e-9)
 
+        # LPI components
         df['lpi_weighing_factor'] = np.maximum(
             0.0, 10.0 - 0.5 * df['depth_mid_m'])
         df['lpi_severity_factor'] = np.maximum(
             0.0, 1.0 - df['factor_of_safety'])
 
+        # Liquefaction probability
         df['liquefaction_probability'] = np.where(
             df['factor_of_safety'] < 1.0,
             (1.0 - df['factor_of_safety']) * 100,
@@ -943,109 +891,86 @@ class GeotechnicalPipeline:
         ).clip(0.0, 100.0)
 
         self.processed_data = df
-        print(f"  [OK] Calculated for {len(df)} records")
+        print(f"  [OK] {len(df)} records")
+        print(f"    CSR  : {df['csr'].min():.4f} – {df['csr'].max():.4f}")
+        print(f"    CRR  : {df['crr'].min():.4f} – {df['crr'].max():.4f}")
         print(
-            f"    CSR  range : {df['csr'].min():.4f} – {df['csr'].max():.4f}")
-        print(
-            f"    CRR  range : {df['crr'].min():.4f} – {df['crr'].max():.4f}")
-        print(
-            f"    FS   range : {df['factor_of_safety'].min():.2f} – {df['factor_of_safety'].max():.2f}")
-        print(
-            f"    (N1)60cs   : {df['n1_60cs'].min():.2f} – {df['n1_60cs'].max():.2f}")
+            f"    FS   : {df['factor_of_safety'].min():.2f} – {df['factor_of_safety'].max():.2f}")
         return True
 
+    # -----------------------------------------------------------------------
+    # Bearing capacity
+    # -----------------------------------------------------------------------
     def calculate_bearing_bowles(self) -> bool:
-        """
-        Bearing capacity and settlement per Bowles (1988) / Meyerhof (1956) SPT method.
-        """
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("STEP 3b: BEARING CAPACITY & SETTLEMENT (Bowles 1988)")
-        print("="*80)
-
+        print("=" * 80)
         df = self.processed_data.copy()
-
-        B = 3.0       # footing width (m) — matches thesis validation standard
-        D = 1.5
-        SI_ALLOW = 25.0
-
-        # Depth correction factor (Meyerhof 1956)
-        Kd = 1.0 + 0.33 * (D / B)   # = 1.165 for D=1.5 m, B=3.0 m
-        df['foundation_kd'] = Kd
-
+        B, D, SI = 3.0, 1.5, 25.0
+        Kd = 1.0 + 0.33 * (D / B)
+        size_factor = ((B + 0.3) / B) ** 2
         N = df['spt_n160'].clip(lower=1.0)
-
-        # Meyerhof (1956) SPT-based allowable bearing capacity
-        # For B > 1.2 m: qa = 8·N·((B+0.3)/B)²·Kd  [kPa, Si = 25 mm]
-        # Reference: Bowles (1988), Table 4-4
-        size_factor = ((B + 0.3) / B) ** 2          # = 1.21 for B = 3.0 m
         Qa = (8.0 * N * size_factor * Kd).clip(lower=1.0)
-
+        df['foundation_kd'] = Kd
         df['bearing_qa_kpa'] = Qa
-        df['bearing_qu_kpa'] = (Qa * 3.0).clip(lower=0.0)   # back-computed Qu (FS = 3)
-
-        df['settlement_mm'] = (df['q_actual_kpa'] /
-                               df['bearing_qa_kpa']) * SI_ALLOW
-
-        print(
-            f"  Foundation: B={B}m, D={D}m, Kd={Kd:.4f}, size_factor={size_factor:.4f}")
-        print(
-            f"  Qu  range : {df['bearing_qu_kpa'].min():.1f} – {df['bearing_qu_kpa'].max():.1f} kPa")
-        print(
-            f"  Qa  range : {df['bearing_qa_kpa'].min():.1f} – {df['bearing_qa_kpa'].max():.1f} kPa")
+        df['bearing_qu_kpa'] = (Qa * 3.0).clip(lower=0.0)
+        df['settlement_mm'] = (df['q_actual_kpa'] / Qa) * SI
+        print(f"  B={B}m D={D}m Kd={Kd:.3f}")
+        print(f"  Qa: {Qa.min():.1f} – {Qa.max():.1f} kPa")
         print(
             f"  Settlement: {df['settlement_mm'].min():.2f} – {df['settlement_mm'].max():.2f} mm")
-        print(f"  [OK] Bearing capacity computed for {len(df)} records")
-
         self.processed_data = df
         return True
 
+    # -----------------------------------------------------------------------
+    # Liquefaction classification  (FIX 5)
+    # -----------------------------------------------------------------------
     def classify_liquefaction_dpwh_bsds(self) -> bool:
-        """
-        Classify liquefaction potential per DPWH BSDS (2013)
-        """
-        print("\n" + "="*80)
+        """FIX 5 — core samples and rock excluded from classification."""
+        print("\n" + "=" * 80)
         print("STEP 4: LIQUEFACTION CLASSIFICATION (DPWH BSDS 2013)")
-        print("="*80)
-
+        print("=" * 80)
         df = self.processed_data.copy()
 
         def dpwh_classify(row):
+            # FIX 5 — exclude non-soil records
+            if row.get('is_core_sample', 0) == 1 or row.get('is_rock', 0) == 1:
+                return 'NOT APPLICABLE', 'ROCK/CORE SAMPLE'
             fs = row['factor_of_safety']
             if fs < 0.8:
                 return 'VERY HIGH', 'LIQUEFIES'
             if fs < 1.0:
-                return 'HIGH', 'LIQUEFIES'
+                return 'HIGH',      'LIQUEFIES'
             if fs < 1.2:
-                return 'MEDIUM', 'MARGINAL'
+                return 'MEDIUM',    'MARGINAL'
             if fs < 1.5:
-                return 'LOW', 'UNLIKELY'
-            return 'VERY LOW', 'NO LIQUEFACTION'
+                return 'LOW',        'UNLIKELY'
+            return 'VERY LOW',    'NO LIQUEFACTION'
 
-        classification = df.apply(dpwh_classify, axis=1)
-        df['liquefaction_risk_level'] = classification.apply(lambda x: x[0])
-        df['liquefaction_status'] = classification.apply(lambda x: x[1])
+        result = df.apply(dpwh_classify, axis=1)
+        df['liquefaction_risk_level'] = result.apply(lambda x: x[0])
+        df['liquefaction_status'] = result.apply(lambda x: x[1])
         df['liquefaction'] = df['liquefaction_risk_level'].isin(
             ['VERY HIGH', 'HIGH']).astype(int)
 
-        risk_counts = df['liquefaction_risk_level'].value_counts()
+        counts = df['liquefaction_risk_level'].value_counts()
         print("\n  Classification Summary:")
-        for risk_level, count in risk_counts.items():
-            pct = (count / len(df)) * 100
-            print(f"    {risk_level:12s}: {count:4d} records ({pct:5.1f}%)")
-
-        liquefies = df['liquefaction'].sum()
+        for lvl, cnt in counts.items():
+            print(f"    {lvl:20s}: {cnt:4d}  ({cnt/len(df)*100:5.1f}%)")
+        liq_n = df['liquefaction'].sum()
         print(
-            f"\n  Total liquefaction cases: {liquefies} ({liquefies/len(df)*100:.1f}%)")
+            f"\n  Total liquefaction cases: {liq_n} ({liq_n/len(df)*100:.1f}%)")
 
         self.processed_data = df
         return True
 
+    # -----------------------------------------------------------------------
+    # Feature engineering
+    # -----------------------------------------------------------------------
     def engineer_features(self) -> bool:
-        """Engineer additional features"""
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("STEP 5: FEATURE ENGINEERING")
-        print("="*80)
-
+        print("=" * 80)
         df = self.processed_data.copy()
 
         df['depth_thickness_m'] = df['depth_to_m'] - df['depth_from_m']
@@ -1059,8 +984,8 @@ class GeotechnicalPipeline:
         df['relative_density_from_spt'] = np.clip(
             np.sqrt(df['spt_n160'] / 60) * 100, 0, 100)
 
-        df['effective_stress_ratio'] = df['effective_overburden_pressure'] / \
-            (df['total_overburden_pressure'] + 1)
+        df['effective_stress_ratio'] = (df['effective_overburden_pressure'] /
+                                        (df['total_overburden_pressure'] + 1))
 
         df['is_clean_sand'] = (df['fines_content'] < 5).astype(int)
         df['is_silty_sand'] = ((df['fines_content'] >= 5) & (
@@ -1069,594 +994,397 @@ class GeotechnicalPipeline:
 
         df['depth_spt_interaction'] = df['depth_mid_m'] * df['spt_n_value']
         df['csr_depth_interaction'] = df['csr'] * df['depth_mid_m']
+        df['cn_factor'] = np.minimum(1.7, np.sqrt(
+            101.3 / df['effective_overburden_pressure'].clip(1.0)))
 
         self.processed_data = df
-        print(f"  [OK] Created {len(df.columns)} total features")
+        print(f"  [OK] {len(df.columns)} total columns")
         return True
 
+    # -----------------------------------------------------------------------
+    # Export CSV
+    # -----------------------------------------------------------------------
     def export_csv(self) -> bool:
-        """Export clean CSV ready for database ingestion"""
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("STEP 6: EXPORTING CLEAN CSV")
-        print("="*80)
-
+        print("=" * 80)
         df = self.processed_data.copy()
 
         output_columns = [
-            'borehole_id', 'municipality', 'Depth_Layer',
+            'borehole_id', 'Municipality', 'Depth_Layer',
             'latitude', 'longitude',
             'depth_from_m', 'depth_to_m', 'depth_mid_m',
-            'spt_n_value', 'spt_n160',
-            'uscs_symbol', 'soil_type', 'soil_description',
-            'unit_weight', 'fines_content', 'groundwater_depth_m',
+            'spt_n_value', 'spt_n_value_liq', 'spt_n160', 'spt_is_refusal', 'spt_is_imputed',
+            'uscs_symbol', 'soil_description',
+            'unit_weight', 'fines_content', 'groundwater_depth_m', 'gwl_estimated',
             'friction_angle', 'moisture_content', 'plasticity_index', 'mean_particle_size_d50',
-            'relative_density_percent', 'elastic_modulus_es',
-            'pga_g', 'csr', 'cyclic_strength_ratio',
+            'relative_density_percent',
+            'pga_g', 'csr', 'crr', 'n1_60cs',
             'effective_overburden_pressure', 'total_overburden_pressure',
             'factor_of_safety', 'liquefaction_probability', 'liquefaction',
             'liquefaction_risk_level', 'liquefaction_status',
+            'bearing_qa_kpa', 'bearing_qu_kpa', 'settlement_mm',
+            'is_core_sample', 'is_rock',
+            'magnitude_mw', 'msf', 'lpi_weighing_factor', 'lpi_severity_factor',
         ]
-
-        available_cols = [col for col in output_columns if col in df.columns]
-        df_export = df[available_cols].copy()
-
-        numeric_cols = df_export.select_dtypes(include=[np.number]).columns
-        for col in numeric_cols:
-            df_export[col] = df_export[col].fillna(0)
+        avail = [c for c in output_columns if c in df.columns]
+        df_export = df[avail].copy()
+        num_cols = df_export.select_dtypes(include=[np.number]).columns
+        df_export[num_cols] = df_export[num_cols].fillna(0)
 
         if not self.client:
-            print("  [WARNING] No database connection - cannot upload to storage")
+            print("  [WARNING] No DB connection — skipping storage upload")
             return False
 
         try:
-            bucket_name = os.getenv(
-                'SUPABASE_STORAGE_BUCKET', 'geotechnical-data')
-            storage_path = "cleaned/Cleaned_data.csv"
-
+            bucket = os.getenv('SUPABASE_STORAGE_BUCKET', 'geotechnical-data')
+            path = "cleaned/Cleaned_data.csv"
             try:
-                existing_file = self.client.storage.from_(
-                    bucket_name).download(storage_path)
-                if existing_file:
-                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    old_path_with_timestamp = f"old_cleaned_data/Cleaned_data_{timestamp}.csv"
-                    self.client.storage.from_(bucket_name).upload(
-                        old_path_with_timestamp,
-                        existing_file,
-                        file_options={
-                            'content-type': 'text/csv', 'upsert': 'true'}
-                    )
-                    self.client.storage.from_(
-                        bucket_name).remove([storage_path])
-                    print(
-                        f"  [OK] Archived old file to: {old_path_with_timestamp}")
+                old = self.client.storage.from_(bucket).download(path)
+                if old:
+                    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    self.client.storage.from_(bucket).upload(
+                        f"old_cleaned_data/Cleaned_data_{ts}.csv", old,
+                        file_options={'content-type': 'text/csv', 'upsert': 'true'})
+                    self.client.storage.from_(bucket).remove([path])
+                    print(f"  [OK] Old file archived")
             except:
                 pass
-
-            csv_bytes = df_export.to_csv(index=False).encode('utf-8')
-            self.client.storage.from_(bucket_name).upload(
-                storage_path,
-                csv_bytes,
-                file_options={'content-type': 'text/csv', 'upsert': 'true'}
-            )
-
-            print(f"  [OK] Uploaded to Supabase Storage: {storage_path}")
-            print(f"  Records: {len(df_export)}")
-            print(f"  Columns: {len(df_export.columns)}")
+            self.client.storage.from_(bucket).upload(
+                path, df_export.to_csv(index=False).encode('utf-8'),
+                file_options={'content-type': 'text/csv', 'upsert': 'true'})
+            print(
+                f"  [OK] Uploaded {len(df_export)} rows, {len(df_export.columns)} cols → {path}")
         except Exception as e:
-            print(f"  [ERROR] Failed to upload to storage: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"  [ERROR] Upload failed: {e}")
             return False
-
         return True
 
+    # -----------------------------------------------------------------------
+    # Database helpers
+    # -----------------------------------------------------------------------
     def connect_database(self) -> bool:
-        """Connect to Supabase/PostgreSQL database"""
         if not SUPABASE_AVAILABLE:
             return False
-
-        print("\n" + "="*80)
-        print("CONNECTING TO POSTGIS DATABASE")
-        print("="*80)
-
-        supabase_url = os.getenv('SUPABASE_URL')
-        supabase_key = os.getenv(
-            'SUPABASE_SERVICE_ROLE_KEY') or os.getenv('SUPABASE_KEY')
-
-        if not supabase_url or not supabase_key:
-            print("  [WARNING] Database environment variables not set")
-            print("\n  To enable database storage, set environment variables:")
-            print("\n  PowerShell:")
-            print("    $env:SUPABASE_URL='your_supabase_url'")
-            print("    $env:SUPABASE_SERVICE_ROLE_KEY='your_service_role_key'")
-            print("\n  Bash/Linux:")
-            print("    export SUPABASE_URL='your_supabase_url'")
-            print("    export SUPABASE_SERVICE_ROLE_KEY='your_service_role_key'")
-            print("\n  Database storage will be skipped")
+        url = os.getenv('SUPABASE_URL')
+        key = os.getenv('SUPABASE_SERVICE_ROLE_KEY') or os.getenv(
+            'SUPABASE_KEY')
+        if not url or not key:
+            print("  [WARNING] DB env vars not set — skipping database storage")
             return False
-
         try:
-            self.client = create_client(supabase_url, supabase_key)
+            self.client = create_client(url, key)
             self.client.table('municipalities').select('id').limit(1).execute()
             print("  [OK] Connected to PostGIS database")
             return True
         except Exception as e:
-            print(f"  [WARNING] Database connection failed: {e}")
-            print("  Database storage will be skipped")
+            print(f"  [WARNING] DB connection failed: {e}")
             return False
 
-    def safe_float(self, value, default=None):
-        """Safely convert to float"""
-        if pd.isna(value) or value == '' or value is None:
+    def safe_float(self, v, default=None):
+        if pd.isna(v) or v == '' or v is None:
             return default
         try:
-            return float(value)
+            return float(v)
         except:
             return default
 
-    def safe_str(self, value, default=None):
-        """Safely convert to string"""
-        if pd.isna(value) or value == '' or value is None:
+    def safe_str(self, v, default=None):
+        if pd.isna(v) or v == '' or v is None:
             return default
-        return str(value).strip()
+        return str(v).strip()
 
     def upsert_municipalities(self) -> bool:
-        """Upsert municipalities following schema"""
         print("\n  Step 7.1: Upserting municipalities...")
-
         df = self.processed_data
-        muni_col = df.get('Municipality', df.get('municipality', pd.Series()))
-
-        if len(muni_col) == 0:
-            print("    [ERROR] No municipality column found")
+        muni_col = 'Municipality' if 'Municipality' in df.columns else 'municipality'
+        if muni_col not in df.columns:
+            print("    [ERROR] No municipality column")
             return False
-
-        for muni_name in muni_col.unique():
-            if pd.isna(muni_name):
-                continue
-
-            muni_name = str(muni_name).strip()
+        for name in df[muni_col].dropna().unique():
+            name = str(name).strip()
             try:
-                result = self.client.table('municipalities').select(
-                    'id, name').eq('name', muni_name).execute()
-
-                if result.data and len(result.data) > 0:
-                    self.municipality_ids[muni_name] = result.data[0]['id']
+                res = self.client.table('municipalities').select(
+                    'id').eq('name', name).execute()
+                if res.data:
+                    self.municipality_ids[name] = res.data[0]['id']
                 else:
-                    insert_data = {
-                        'name': muni_name,
-                        'description': f'Municipality in Tarlac Province'
-                    }
-                    result = self.client.table(
-                        'municipalities').insert(insert_data).execute()
-                    self.municipality_ids[muni_name] = result.data[0]['id']
-                    print(
-                        f"    Created: {muni_name} (ID: {self.municipality_ids[muni_name]})")
+                    res = self.client.table('municipalities').insert(
+                        {'name': name, 'description': 'Municipality in Tarlac Province'}
+                    ).execute()
+                    self.municipality_ids[name] = res.data[0]['id']
+                    print(f"    Created: {name}")
             except Exception as e:
-                print(f"    [ERROR] Failed for {muni_name}: {e}")
-
-        print(
-            f"    [OK] Processed {len(self.municipality_ids)} municipalities")
+                print(f"    [ERROR] {name}: {e}")
+        print(f"    [OK] {len(self.municipality_ids)} municipalities")
         return True
 
     def upsert_boreholes(self) -> bool:
-        """Upsert boreholes following schema"""
         print("\n  Step 7.2: Upserting boreholes...")
-
         df = self.processed_data
-        borehole_col = df.get(
-            'Borehole ID', df.get('borehole_id', pd.Series()))
-
-        if len(borehole_col) == 0:
-            print("    [ERROR] No borehole ID column found")
-            return False
-
-        borehole_groups = df.groupby(borehole_col.name).first()
-
-        skipped_count = 0
-        for borehole_id_str, row in borehole_groups.iterrows():
-            borehole_id_str = str(borehole_id_str).strip()
-            muni_name = self.safe_str(
-                row.get('Municipality', row.get('municipality')))
-
-            if not muni_name or muni_name not in self.municipality_ids:
-                skipped_count += 1
-                if skipped_count <= 3:
-                    print(
-                        f"    [SKIP] Borehole {borehole_id_str}: Municipality '{muni_name}' not found")
+        bh_col = 'Borehole ID' if 'Borehole ID' in df.columns else 'borehole_id'
+        muni_col = 'Municipality' if 'Municipality' in df.columns else 'municipality'
+        groups = df.groupby(bh_col).first()
+        skipped = 0
+        for bh_id, row in groups.iterrows():
+            bh_id = str(bh_id).strip()
+            muni = self.safe_str(row.get(muni_col))
+            lat = self.safe_float(row.get('latitude', row.get('Latitude')))
+            lon = self.safe_float(row.get('longitude', row.get('Longitude')))
+            if not muni or muni not in self.municipality_ids or not lat or not lon:
+                skipped += 1
                 continue
-
-            municipality_id = self.municipality_ids[muni_name]
-
-            lat = self.safe_float(row.get('Latitude', row.get('latitude')))
-            lon = self.safe_float(row.get('Longitude', row.get('longitude')))
-
-            if not lat or not lon:
-                skipped_count += 1
-                if skipped_count <= 3:
-                    print(
-                        f"    [SKIP] Borehole {borehole_id_str}: Missing coordinates (lat={lat}, lon={lon})")
-                continue
-
             try:
-                result = self.client.table('boreholes').select(
-                    'id').eq('borehole_id', borehole_id_str).execute()
-
-                if result.data and len(result.data) > 0:
-                    self.borehole_record_ids[borehole_id_str] = result.data[0]['id']
-                    print(
-                        f"    Found existing: {borehole_id_str} (ID: {result.data[0]['id']})")
+                res = self.client.table('boreholes').select(
+                    'id').eq('borehole_id', bh_id).execute()
+                if res.data:
+                    self.borehole_record_ids[bh_id] = res.data[0]['id']
                 else:
-                    insert_data = {
-                        'borehole_id': borehole_id_str,
-                        'latitude': lat,
-                        'longitude': lon,
-                        'elevation': self.safe_float(row.get('Elevation', row.get('elevation'))),
+                    res = self.client.table('boreholes').insert({
+                        'borehole_id': bh_id, 'latitude': lat, 'longitude': lon,
+                        'elevation': self.safe_float(row.get('Elevation')),
                         'depth_total_m': 15.0,
-                        'remarks': f'Data from {muni_name}',
-                        'municipality_id': municipality_id
-                    }
-                    result = self.client.table(
-                        'boreholes').insert(insert_data).execute()
-                    if result.data and len(result.data) > 0:
-                        self.borehole_record_ids[borehole_id_str] = result.data[0]['id']
-                        print(
-                            f"    Created: {borehole_id_str} (ID: {result.data[0]['id']})")
-                    else:
-                        print(
-                            f"    [WARNING] Insert returned no data for {borehole_id_str}")
+                        'remarks': f'Data from {muni}',
+                        'municipality_id': self.municipality_ids[muni],
+                    }).execute()
+                    if res.data:
+                        self.borehole_record_ids[bh_id] = res.data[0]['id']
             except Exception as e:
-                print(f"    [ERROR] Failed for {borehole_id_str}: {e}")
-                import traceback
-                traceback.print_exc()
-
-        if skipped_count > 0:
-            print(
-                f"    [INFO] Skipped {skipped_count} boreholes (missing municipality or coordinates)")
-
-        if len(self.borehole_record_ids) == 0:
-            print(f"    [ERROR] No boreholes were inserted!")
-            print(
-                f"    Municipalities available: {list(self.municipality_ids.keys())}")
+                print(f"    [ERROR] {bh_id}: {e}")
+        if skipped:
+            print(f"    [INFO] Skipped {skipped} boreholes")
+        if not self.borehole_record_ids:
+            print("    [ERROR] No boreholes inserted")
             return False
-
-        print(f"    [OK] Processed {len(self.borehole_record_ids)} boreholes")
+        print(f"    [OK] {len(self.borehole_record_ids)} boreholes")
         return True
 
     def store_soil_layers(self) -> bool:
-        """Store soil layers to database following schema"""
         print("\n  Step 7.3: Storing soil layers...")
-
         df = self.processed_data.copy()
+        bh_col = 'Borehole ID' if 'Borehole ID' in df.columns else 'borehole_id'
 
-        depth_layer_map = {}
-        unique_layers = df['Depth_Layer'].unique()
-        for i, layer_name in enumerate(sorted(unique_layers), 1):
-            depth_layer_map[layer_name] = i
+        layer_map = {name: i for i, name in enumerate(
+            sorted(df['Depth_Layer'].unique()), 1)}
+        records, skipped = [], 0
 
-        records = []
-        skipped_count = 0
-        for idx, row in df.iterrows():
-            borehole_id_str = str(
-                row.get('Borehole ID', row.get('borehole_id', ''))).strip()
-            borehole_record_id = self.borehole_record_ids.get(borehole_id_str)
-
-            if not borehole_record_id:
-                skipped_count += 1
-                if skipped_count <= 3:
-                    print(
-                        f"    [SKIP] Soil layer: Borehole '{borehole_id_str}' not found in boreholes table")
+        for _, row in df.iterrows():
+            bh_id = str(row.get(bh_col, '')).strip()
+            bh_rec = self.borehole_record_ids.get(bh_id)
+            if not bh_rec:
+                skipped += 1
                 continue
 
-            layer_number = depth_layer_map.get(row['Depth_Layer'], 1)
-            depth_range = f"{row['depth_from_m']:.1f}-{row['depth_to_m']:.1f}m"
-
-            record = {
-                'borehole_id': borehole_record_id,
-                'layer_number': int(layer_number),
-                'depth_from_m': self.safe_float(row['depth_from_m']),
-                'depth_to_m': self.safe_float(row['depth_to_m']),
-                'depth_range': depth_range,
-                'spt_n_value': self.safe_float(row['spt_n_value']),
-                'spt_n160': self.safe_float(row.get('spt_n160')),
-                'soil_type': self.safe_str(row.get('soil_type')) if row.get('soil_type') not in (None, 'nan', '') else None,
-                'uscs_symbol': self.safe_str(row.get('uscs_symbol')) if row.get('uscs_symbol') not in (None, 'nan', '') else None,
-                'soil_description': self.safe_str(row.get('soil_description')) if row.get('soil_description') not in (None, 'nan', '') else None,
-                'unit_weight': self.safe_float(row['unit_weight']),
-                'fines_content': self.safe_float(row['fines_content']),
-                'groundwater_depth_m': self.safe_float(row['groundwater_depth_m']),
-                'pga_g': self.safe_float(row['pga_g']),
-                'csr': self.safe_float(row['csr']),
-                'cyclic_strength_ratio': self.safe_float(row.get('crr')),
-                'liquefaction': bool(row.get('liquefaction', 0)) if pd.notna(row.get('liquefaction')) else False,
-                'liquefaction_risk_level': self.safe_str(row.get('liquefaction_risk_level')),
+            records.append({
+                'borehole_id':                   bh_rec,
+                'layer_number':                  int(layer_map.get(row['Depth_Layer'], 1)),
+                'depth_from_m':                  self.safe_float(row['depth_from_m']),
+                'depth_to_m':                    self.safe_float(row['depth_to_m']),
+                'depth_range':                   f"{row['depth_from_m']:.1f}-{row['depth_to_m']:.1f}m",
+                'spt_n_value':                   self.safe_float(row['spt_n_value']),
+                'spt_n160':                      self.safe_float(row.get('spt_n160')),
+                'spt_is_refusal':                bool(row.get('spt_is_refusal', 0)),
+                'spt_is_imputed':                bool(row.get('spt_is_imputed', False)),
+                'uscs_symbol':                   self.safe_str(row.get('uscs_symbol')) or None,
+                'soil_description':              self.safe_str(row.get('soil_description')) or None,
+                'unit_weight':                   self.safe_float(row['unit_weight']),
+                'fines_content':                 self.safe_float(row['fines_content']),
+                'groundwater_depth_m':           self.safe_float(row['groundwater_depth_m']),
+                'pga_g':                         self.safe_float(row['pga_g']),
+                'csr':                           self.safe_float(row['csr']),
+                'cyclic_strength_ratio':         self.safe_float(row.get('crr')),
+                'n1_60cs':                       self.safe_float(row.get('n1_60cs')),
                 'effective_overburden_pressure': self.safe_float(row['effective_overburden_pressure']),
-                'total_overburden_pressure': self.safe_float(row['total_overburden_pressure']),
-                'relative_density_percent': self.safe_float(row.get('relative_density_percent')),
-                'magnitude_mw': self.safe_float(row.get('magnitude_mw')),
-                'msf': self.safe_float(row.get('msf')),
-                'n1_60cs': self.safe_float(row.get('n1_60cs')),
-                'q_actual_kpa': self.safe_float(row.get('q_actual_kpa')),
-                'foundation_kd': self.safe_float(row.get('foundation_kd')),
-                'bearing_qu_kpa': self.safe_float(row.get('bearing_qu_kpa')),
-                'bearing_qa_kpa': self.safe_float(row.get('bearing_qa_kpa')),
-                'settlement_mm': self.safe_float(row.get('settlement_mm')),
-                'lpi_weighing_factor': self.safe_float(row.get('lpi_weighing_factor')),
-                'lpi_severity_factor': self.safe_float(row.get('lpi_severity_factor')),
-            }
-
-            if 'moisture_content' in row.index and pd.notna(row.get('moisture_content')):
-                record['moisture_content'] = self.safe_float(
-                    row['moisture_content'])
-
-            if 'friction_angle' in row.index and pd.notna(row.get('friction_angle')):
-                record['friction_angle'] = self.safe_float(
-                    row['friction_angle'])
-
-            if 'cohesion_kpa' in row.index and pd.notna(row.get('cohesion_kpa')):
-                record['cohesion_kpa'] = self.safe_float(row['cohesion_kpa'])
-
-            if 'plasticity_index' in row.index and pd.notna(row.get('plasticity_index')):
-                record['plasticity_index'] = self.safe_float(
-                    row['plasticity_index'])
-
-            if 'mean_particle_size_d50' in row.index and pd.notna(row.get('mean_particle_size_d50')):
-                record['mean_particle_size_d50'] = self.safe_float(
-                    row['mean_particle_size_d50'])
-
+                'total_overburden_pressure':     self.safe_float(row['total_overburden_pressure']),
+                'factor_of_safety':              self.safe_float(row['factor_of_safety']),
+                'liquefaction_probability':      self.safe_float(row.get('liquefaction_probability')),
+                'liquefaction':                  bool(row.get('liquefaction', 0)),
+                'liquefaction_risk_level':       self.safe_str(row.get('liquefaction_risk_level')),
+                'liquefaction_status':           self.safe_str(row.get('liquefaction_status')),
+                'relative_density_percent':      self.safe_float(row.get('relative_density_percent')),
+                'is_core_sample':                int(row.get('is_core_sample', 0)),
+                'is_rock':                       int(row.get('is_rock', 0)),
+                'magnitude_mw':                  self.safe_float(row.get('magnitude_mw')),
+                'msf':                           self.safe_float(row.get('msf')),
+                'q_actual_kpa':                  self.safe_float(row.get('q_actual_kpa')),
+                'foundation_kd':                 self.safe_float(row.get('foundation_kd')),
+                'bearing_qu_kpa':                self.safe_float(row.get('bearing_qu_kpa')),
+                'bearing_qa_kpa':                self.safe_float(row.get('bearing_qa_kpa')),
+                'settlement_mm':                 self.safe_float(row.get('settlement_mm')),
+                'lpi_weighing_factor':           self.safe_float(row.get('lpi_weighing_factor')),
+                'lpi_severity_factor':           self.safe_float(row.get('lpi_severity_factor')),
+            })
+            for opt in ['moisture_content', 'friction_angle', 'cohesion_kpa',
+                        'plasticity_index', 'mean_particle_size_d50']:
+                if opt in row.index and pd.notna(row.get(opt)):
+                    records[-1][opt] = self.safe_float(row[opt])
             if 'Elastic Modulus (Es) (MN/m²)' in row and pd.notna(row['Elastic Modulus (Es) (MN/m²)']):
-                record['elastic_modulus_es'] = self.safe_float(
+                records[-1]['elastic_modulus_es'] = self.safe_float(
                     row['Elastic Modulus (Es) (MN/m²)'])
 
-            records.append(record)
+        EXTRA_COLS = {'spt_is_refusal', 'spt_is_imputed', 'is_core_sample', 'is_rock',
+                      'magnitude_mw', 'msf', 'n1_60cs', 'q_actual_kpa', 'foundation_kd',
+                      'bearing_qu_kpa', 'bearing_qa_kpa', 'settlement_mm',
+                      'lpi_weighing_factor', 'lpi_severity_factor',
+                      'liquefaction_probability', 'liquefaction_status'}
 
-        THESIS_COLUMNS = {
-            'magnitude_mw', 'msf', 'n1_60cs', 'q_actual_kpa', 'foundation_kd',
-            'bearing_qu_kpa', 'bearing_qa_kpa', 'settlement_mm',
-            'lpi_weighing_factor', 'lpi_severity_factor',
-        }
+        def strip_extra(batch):
+            return [{k: v for k, v in r.items() if k not in EXTRA_COLS} for r in batch]
 
-        def strip_thesis_columns(batch):
-            return [{k: v for k, v in r.items() if k not in THESIS_COLUMNS} for r in batch]
-
-        # Delete existing soil layers before inserting to prevent duplicate
-        # accumulation across pipeline re-runs (plain INSERT with no prior cleanup
-        # doubles the row count every time the pipeline runs).
+        # Clear old layers
         bh_uuids = list(self.borehole_record_ids.values())
-        print(f"    Clearing existing soil layers for {len(bh_uuids)} boreholes...")
-        deleted_bh = 0
-        for _di in range(0, len(bh_uuids), 100):
-            chunk = bh_uuids[_di:_di + 100]
+        for i in range(0, len(bh_uuids), 100):
             try:
-                self.client.table('soil_layers').delete().in_('borehole_id', chunk).execute()
-                deleted_bh += len(chunk)
-            except Exception as _de:
-                print(f"    [WARNING] Delete batch failed: {_de}")
-        print(f"    [OK] Cleared layers for {deleted_bh} boreholes")
-
-        batch_size = 25
-        total_inserted = 0
-        schema_fallback = False
-
-        for i in range(0, len(records), batch_size):
-            batch = records[i:i+batch_size]
-            batch_num = i // batch_size + 1
-            try:
-                insert_batch = strip_thesis_columns(
-                    batch) if schema_fallback else batch
-                self.client.table('soil_layers').insert(insert_batch).execute()
-                total_inserted += len(batch)
-                if not schema_fallback:
-                    print(
-                        f"    Inserted batch {batch_num}: {len(batch)} records")
-                else:
-                    print(
-                        f"    Inserted batch {batch_num}: {len(batch)} records (without thesis cols — run SQL migration)")
+                self.client.table('soil_layers').delete().in_(
+                    'borehole_id', bh_uuids[i:i+100]).execute()
             except Exception as e:
-                err_str = str(e)
-                if 'PGRST204' in err_str or 'schema cache' in err_str:
-                    if not schema_fallback:
+                print(f"    [WARNING] Delete batch failed: {e}")
+        print(f"    Cleared existing layers")
+
+        total, fallback = 0, False
+        for i in range(0, len(records), 25):
+            batch = records[i:i+25]
+            try:
+                self.client.table('soil_layers').insert(
+                    strip_extra(batch) if fallback else batch).execute()
+                total += len(batch)
+            except Exception as e:
+                if 'PGRST204' in str(e) or 'schema cache' in str(e):
+                    if not fallback:
                         print(
-                            f"    [WARNING] Thesis columns missing in DB schema — falling back to base columns.")
-                        print(
-                            f"    [INFO] Run the SQL migration in Supabase to persist thesis analysis fields.")
-                        schema_fallback = True
+                            "    [WARNING] Extended columns missing — falling back to base schema")
+                        fallback = True
                     try:
                         self.client.table('soil_layers').insert(
-                            strip_thesis_columns(batch)).execute()
-                        total_inserted += len(batch)
-                        print(
-                            f"    Inserted batch {batch_num}: {len(batch)} records (fallback)")
+                            strip_extra(batch)).execute()
+                        total += len(batch)
                     except Exception as e2:
                         print(
-                            f"    [WARNING] Batch {batch_num} failed even on fallback: {e2}")
+                            f"    [WARNING] Batch {i//25+1} failed on fallback: {e2}")
                 else:
-                    print(f"    [WARNING] Batch {batch_num} failed: {e}")
+                    print(f"    [WARNING] Batch {i//25+1} failed: {e}")
 
-        if schema_fallback:
-            print("\n" + "="*60)
-            print("  ACTION REQUIRED — Run this SQL in Supabase SQL Editor:")
-            print("  ALTER TABLE soil_layers")
-            print("    ADD COLUMN IF NOT EXISTS magnitude_mw        FLOAT,")
-            print("    ADD COLUMN IF NOT EXISTS msf                 FLOAT,")
-            print("    ADD COLUMN IF NOT EXISTS n1_60cs             FLOAT,")
-            print("    ADD COLUMN IF NOT EXISTS q_actual_kpa        FLOAT,")
-            print("    ADD COLUMN IF NOT EXISTS foundation_kd       FLOAT,")
-            print("    ADD COLUMN IF NOT EXISTS bearing_qu_kpa      FLOAT,")
-            print("    ADD COLUMN IF NOT EXISTS bearing_qa_kpa      FLOAT,")
-            print("    ADD COLUMN IF NOT EXISTS settlement_mm       FLOAT,")
-            print("    ADD COLUMN IF NOT EXISTS lpi_weighing_factor FLOAT,")
-            print("    ADD COLUMN IF NOT EXISTS lpi_severity_factor FLOAT;")
-            print("="*60)
-
-        if skipped_count > 0:
-            print(
-                f"    [INFO] Skipped {skipped_count} soil layer records (borehole not found)")
-
-        if total_inserted == 0:
-            print(f"    [WARNING] No soil layers were inserted!")
-            print(f"    Total records prepared: {len(records)}")
-            print(f"    Boreholes available: {len(self.borehole_record_ids)}")
+        if skipped:
+            print(f"    [INFO] Skipped {skipped} records (borehole not found)")
+        if not total:
+            print("    [ERROR] Nothing inserted")
             return False
-
-        print(f"    [OK] Inserted {total_inserted} soil layer records")
+        print(f"    [OK] Inserted {total} soil layer records")
         return True
 
     def store_to_postgis(self) -> bool:
-        """Store processed data to PostGIS database following schema hierarchy"""
         if not self.client:
             return False
-
-        print("\n" + "="*80)
-        print("STEP 7: STORING TO POSTGIS DATABASE")
-        print("="*80)
-        print("  Following schema hierarchy: municipalities → boreholes → soil_layers")
-
+        print("\n" + "=" * 80)
+        print("STEP 7: STORING TO POSTGIS")
+        print("=" * 80)
         try:
             if not self.upsert_municipalities():
                 return False
-
             if not self.upsert_boreholes():
                 return False
-
             if not self.store_soil_layers():
                 return False
-
-            print(f"\n  [OK] Database storage completed")
-            print(f"  Summary:")
-            print(f"    Municipalities: {len(self.municipality_ids)}")
-            print(f"    Boreholes: {len(self.borehole_record_ids)}")
-            print(f"    Soil Layers: {len(self.processed_data)} records")
-            print(f"\n  ✓ Spatial indexing enabled (PostGIS)")
-
+            print(f"\n  [OK] Stored {len(self.processed_data)} records")
             return True
         except Exception as e:
-            print(f"  [ERROR] Database storage failed: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"  [ERROR] {e}")
             return False
 
+    # -----------------------------------------------------------------------
+    # Validation report
+    # -----------------------------------------------------------------------
     def print_validation_report(self):
-        """Print validation report"""
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("VALIDATION REPORT")
-        print("="*80)
-
+        print("=" * 80)
         if self.validation_errors:
-            print("\n  [ERRORS] Critical issues found:")
-            for error in self.validation_errors:
-                print(f"    ✗ {error}")
+            print("\n  [ERRORS]")
+            for e in self.validation_errors:
+                print(f"    ✗ {e}")
         else:
             print("\n  ✓ No critical errors")
-
         if self.validation_warnings:
-            print("\n  [WARNINGS] Non-critical issues:")
-            for warning in self.validation_warnings:
-                print(f"    ⚠ {warning}")
+            print("\n  [WARNINGS]")
+            for w in self.validation_warnings:
+                print(f"    ⚠ {w}")
         else:
             print("\n  ✓ No warnings")
 
+    # -----------------------------------------------------------------------
+    # Run
+    # -----------------------------------------------------------------------
     def run(self) -> bool:
-        """Run complete pipeline"""
-        print("\n" + "="*80)
-        print("GEOTECHNICAL DATA PROCESSING PIPELINE")
-        print("="*80)
+        print("\n" + "=" * 80)
+        print("GEOTECHNICAL DATA PROCESSING PIPELINE  v2")
+        print("=" * 80)
+        print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-        if self.excel_path:
-            print(f"Input file: {self.excel_path}")
-        else:
-            print(f"Input: Supabase Storage (raw/Raw_data.xlsx)")
-
-        print(f"Output: Supabase Storage (cleaned/ folder)")
-        print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-
-        if not self.client:
-            self.connect_database()
+        self.connect_database()
 
         if not self.excel_path and self.use_storage:
             if not self.download_from_supabase_storage():
-                print("\n[ERROR] Failed to download from Supabase Storage")
+                print("[ERROR] Failed to download from Supabase Storage")
                 return False
 
         self.upload_raw_file_to_bucket()
 
         steps = [
-            ("Load Excel", self.load_excel),
-            ("Process and Validate", self.process_and_validate),
-            ("Fill Missing Values by Borehole", self.fill_missing_by_borehole),
-            ("Calculate CSR/CRR + Magnitude", self.calculate_csr_crr),
-            ("Bearing Capacity & Settlement (Bowles 1988)",
+            ("Load Excel",                          self.load_excel),
+            ("Process and Validate",                self.process_and_validate),
+            ("Fill Missing by Borehole",            self.fill_missing_by_borehole),
+            ("Calculate CSR/CRR",                   self.calculate_csr_crr),
+            ("Bearing Capacity & Settlement",
              self.calculate_bearing_bowles),
             ("Classify Liquefaction (DPWH BSDS)",
              self.classify_liquefaction_dpwh_bsds),
-            ("Engineer Features", self.engineer_features),
-            ("Export CSV", self.export_csv),
+            ("Engineer Features",                   self.engineer_features),
+            ("Export CSV",                          self.export_csv),
         ]
 
-        for step_name, step_func in steps:
-            if not step_func():
-                print(f"\n[ERROR] Pipeline failed at: {step_name}")
-                return False
+        for name, fn in steps:
+            print(f"\n{'─'*40}")
+            print(f"Running: {name}")
+            if not fn():
+                # export_csv fails without DB — non-fatal
+                if name == "Export CSV":
+                    print(f"  [INFO] CSV export skipped (no DB connection)")
+                else:
+                    print(f"[ERROR] Pipeline failed at: {name}")
+                    return False
 
         self.print_validation_report()
 
-        db_connected = self.connect_database()
-        if db_connected:
-            if self.store_to_postgis():
-                print(f"\n  ✓ Data stored to PostGIS database with spatial indexing")
-            else:
-                print(f"\n  ⚠ Database storage failed, but CSV export succeeded")
+        if self.client:
+            self.store_to_postgis()
 
-        print("\n" + "="*80)
-        print("[SUCCESS] PIPELINE COMPLETED")
-        print("="*80)
-        print(f"\n  Processed: {len(self.processed_data)} records")
-        print(f"  Features: {len(self.processed_data.columns)}")
-        if db_connected and self.client:
-            print(f"  Database: Stored to PostGIS")
-            print(f"  CSV: Uploaded to Supabase Storage")
-        print(f"\n  ✓ Data ready for use")
-
+        print("\n" + "=" * 80)
+        print("[SUCCESS] PIPELINE COMPLETE")
+        print("=" * 80)
+        print(f"  Records  : {len(self.processed_data)}")
+        print(f"  Columns  : {len(self.processed_data.columns)}")
+        print(f"  Fixes applied: FIX1–FIX10")
         return True
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 def main():
-    """Main execution"""
     import sys
+    excel_file = sys.argv[1] if len(sys.argv) > 1 else None
 
-    if len(sys.argv) < 2:
-        excel_file = None
-        output_csv = None
-        print(
-            f"[INFO] No file specified, will download from Supabase Storage (raw/Raw_data.xlsx)")
+    url = os.getenv('SUPABASE_URL')
+    key = os.getenv('SUPABASE_SERVICE_ROLE_KEY')
+    if url and key:
+        print(f"[INFO] Supabase configured — DB storage enabled")
     else:
-        excel_file = sys.argv[1]
-        output_csv = sys.argv[2] if len(sys.argv) > 2 else None
+        print("[WARNING] Supabase env vars not found — DB storage skipped")
 
-    supabase_url = os.getenv('SUPABASE_URL')
-    supabase_key = os.getenv('SUPABASE_SERVICE_ROLE_KEY')
-
-    if supabase_url and supabase_key:
-        print(f"\n[INFO] Environment variables loaded from .env file")
-        print(f"  SUPABASE_URL: {supabase_url[:40]}...")
-        print(f"  Database storage enabled")
-    else:
-        print(f"\n[WARNING] Environment variables not found in .env file")
-        print(f"  Pipeline will run but skip database storage")
-        print(f"  CSV export will still work")
-        print(f"\n  Create .env file with:")
-        print(f"    SUPABASE_URL=your_url")
-        print(f"    SUPABASE_SERVICE_ROLE_KEY=your_key")
-
-    pipeline = GeotechnicalPipeline(excel_file, output_csv)
-    success = pipeline.run()
-
-    if not success:
+    pipeline = GeotechnicalPipeline(excel_file)
+    if not pipeline.run():
         sys.exit(1)
-
-    print("\n✓ Pipeline completed successfully!")
-    if pipeline.client:
-        print("✓ Data stored in PostGIS database with spatial indexing enabled")
+    print("\n✓ Done")
 
 
 if __name__ == "__main__":

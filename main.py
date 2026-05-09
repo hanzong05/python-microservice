@@ -395,7 +395,7 @@ def interpolate_soil_parameters(
             'depth_to_m':            round(depth_to, 2),
             'layer_thickness':       round(thickness, 2),
             'spt_n_value':           idw_field(ln, 'spt_n_value', 20),
-            'spt_n60':               idw_field(ln, 'spt_n160', 20),
+            'spt_n60':               idw_field(ln, 'spt_n_value', 20),
             'n1_60cs':               idw_field(ln, 'n1_60cs', 20),
             'unit_weight':           idw_field(ln, 'unit_weight', 18),
             'fines_content':         idw_field(ln, 'fines_content', 10),
@@ -1347,7 +1347,7 @@ async def predict(
                 "lpi_severity": lpi_severity,
             },
             bearing_capacity={
-                "allowable_bearing_capacity_kpa": round(pre_bearing, 0),
+                "allowable_bearing_capacity_kpa": round(post_bearing, 0),
                 "capacity_reduction_percent": round(capacity_reduction, 1)
             },
             foundation_recommendation={
