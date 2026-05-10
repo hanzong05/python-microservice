@@ -143,7 +143,7 @@ except ImportError as e:
 app = FastAPI(
     title="Geotechnical Prediction API - Spatial Interpolation",
     description="API with multi-borehole spatial interpolation",
-    version="2.6.0"
+    version="2.7.0"
 )
 
 app.add_middleware(
@@ -214,8 +214,8 @@ class PredictionRequest(BaseModel):
     depth_m: Optional[float] = None
     municipality: Optional[str] = None
     q_actual: Optional[float] = 50.0
-    magnitude: Optional[float] = 6.5   # 0 = static/no-earthquake case (MSF=1.0)
-    pga_g: Optional[float] = None      # override DB PGA (e.g. 0.4). None = use DB value
+    # 0 = static/no-earthquake case (MSF=1.0)
+    magnitude: Optional[float] = 6.5
     t_years: Optional[float] = None
 
 
@@ -233,8 +233,8 @@ class PredictionResponse(BaseModel):
 
 # ── RISK CONSTANTS ─────────────────────────────────────────────────────────
 _RISK_ORDER = {'VERY HIGH': 5, 'HIGH': 4, 'MEDIUM': 3, 'LOW': 2, 'VERY LOW': 1}
-_RISK_PROB  = {'VERY HIGH': 90.0, 'HIGH': 75.0,
-               'MEDIUM': 45.0,    'LOW': 15.0,  'VERY LOW': 5.0}
+_RISK_PROB = {'VERY HIGH': 90.0, 'HIGH': 75.0,
+              'MEDIUM': 45.0,    'LOW': 15.0,  'VERY LOW': 5.0}
 
 # ── LPI → Risk Level (single authoritative mapping, used everywhere) ───────
 _LPI_THRESHOLDS = [
@@ -434,9 +434,9 @@ def interpolate_soil_parameters(
 
     borehole_data = []
     for bh, dist in nearest:
-        bh_uuid  = bh.get('id')
+        bh_uuid = bh.get('id')
         bh_label = bh.get('borehole_id')
-        layers   = get_borehole_all_layers(bh_uuid)
+        layers = get_borehole_all_layers(bh_uuid)
         if not layers:
             continue
 
@@ -460,7 +460,7 @@ def interpolate_soil_parameters(
         return None, None, None
 
     nearest_distance = borehole_data[0]['distance_km']
-    primary_bh       = borehole_data[0]
+    primary_bh = borehole_data[0]
 
     # ── DIRECT USE — nearest borehole < 0.5 km ────────────────────────────
     # When the site is on top of or immediately adjacent to a borehole,
@@ -494,13 +494,14 @@ def interpolate_soil_parameters(
 
         interpolated_layers = []
         for ln in all_layer_nums:
-            lyr = next((l for l in direct_layers if l['layer_number'] == ln), None)
+            lyr = next(
+                (l for l in direct_layers if l['layer_number'] == ln), None)
             if lyr is None:
                 continue
 
             depth_from = float(lyr.get('depth_from_m') or (ln - 1) * 1.5)
-            depth_to   = float(lyr.get('depth_to_m')   or  ln * 1.5)
-            thickness  = max(1.0, depth_to - depth_from)
+            depth_to = float(lyr.get('depth_to_m') or ln * 1.5)
+            thickness = max(1.0, depth_to - depth_from)
 
             risk_lv = lyr.get('liquefaction_risk_level') or 'VERY LOW'
             if risk_lv == 'NOT APPLICABLE':
@@ -511,19 +512,19 @@ def interpolate_soil_parameters(
                 'depth_from_m':          round(depth_from, 2),
                 'depth_to_m':            round(depth_to, 2),
                 'layer_thickness':       round(thickness, 2),
-                'spt_n_value':           lyr.get('spt_n_value')         or 15,
-                'spt_n60':               lyr.get('spt_n_value')         or 15,
-                'n1_60cs':               lyr.get('n1_60cs')             or 15,
-                'unit_weight':           lyr.get('unit_weight')         or 18,
-                'fines_content':         lyr.get('fines_content')       or 10,
+                'spt_n_value':           lyr.get('spt_n_value') or 15,
+                'spt_n60':               lyr.get('spt_n_value') or 15,
+                'n1_60cs':               lyr.get('n1_60cs') or 15,
+                'unit_weight':           lyr.get('unit_weight') or 18,
+                'fines_content':         lyr.get('fines_content') or 10,
                 'groundwater_depth_m':   lyr.get('groundwater_depth_m') or 5,
-                'pga_g':                 lyr.get('pga_g')               or 0.3,
+                'pga_g':                 lyr.get('pga_g') or 0.3,
                 'csr':                   lyr.get('csr'),
                 'crr':                   lyr.get('cyclic_strength_ratio'),
                 'cyclic_strength_ratio': lyr.get('cyclic_strength_ratio'),
-                'friction_angle':        lyr.get('friction_angle')      or 30.0,
-                'cohesion_kpa':          lyr.get('cohesion_kpa')        or 0.0,
-                'elastic_modulus_es':    lyr.get('elastic_modulus_es')  or 10000,
+                'friction_angle':        lyr.get('friction_angle') or 30.0,
+                'cohesion_kpa':          lyr.get('cohesion_kpa') or 0.0,
+                'elastic_modulus_es':    lyr.get('elastic_modulus_es') or 10000,
                 'liquefaction_risk_level': risk_lv,
                 'risk_probability':        site_risk_prob,
                 'lpi_severity_factor':   lyr.get('lpi_severity_factor'),
@@ -547,7 +548,8 @@ def interpolate_soil_parameters(
             '_nearest_borehole_label': primary_bh['borehole_id'],
         }
 
-        print(f"[INFO] Direct use: {len(interpolated_layers)} layers from {primary_bh['borehole_id']}")
+        print(
+            f"[INFO] Direct use: {len(interpolated_layers)} layers from {primary_bh['borehole_id']}")
         return interpolated_layers, interpolation_info, borehole_data
 
     # ── IDW BLEND — nearest borehole ≥ 0.5 km ─────────────────────────────
@@ -580,8 +582,9 @@ def interpolate_soil_parameters(
 
     interpolated_layers = []
     for ln in all_layer_nums:
-        depth_from = idw_field(ln, 'depth_from_m', (ln - 1) * 1.5) or (ln-1)*1.5
-        depth_to   = idw_field(ln, 'depth_to_m',    ln * 1.5)       or  ln * 1.5
+        depth_from = idw_field(
+            ln, 'depth_from_m', (ln - 1) * 1.5) or (ln-1)*1.5
+        depth_to = idw_field(ln, 'depth_to_m',    ln * 1.5) or ln * 1.5
 
         # LPI FIX 3 — floor thickness at 1.0 m so near-zero IDW depths don't
         # suppress LPI to negligible values for genuinely liquefiable profiles.
@@ -598,7 +601,8 @@ def interpolate_soil_parameters(
                 None
             )
             if lyr_match:
-                ord_val = _RISK_ORDER.get(lyr_match['liquefaction_risk_level'], 0)
+                ord_val = _RISK_ORDER.get(
+                    lyr_match['liquefaction_risk_level'], 0)
                 layer_risk_weighted.append((ord_val, bd['norm_weight']))
 
         if layer_risk_weighted:
@@ -606,7 +610,8 @@ def interpolate_soil_parameters(
             avg_ord = sum(o * w for o, w in layer_risk_weighted) / total_w_risk
             worst_layer_risk = next(
                 (label for label, ord_threshold in
-                 [('VERY HIGH', 4.5), ('HIGH', 3.5), ('MEDIUM', 2.5), ('LOW', 1.5)]
+                 [('VERY HIGH', 4.5), ('HIGH', 3.5),
+                  ('MEDIUM', 2.5), ('LOW', 1.5)]
                  if avg_ord >= ord_threshold),
                 'VERY LOW'
             )
@@ -614,10 +619,10 @@ def interpolate_soil_parameters(
             worst_layer_risk = 'VERY LOW'
 
         # BUG D FIX — None default (not 0.0)
-        crr_idw    = idw_field(ln, 'cyclic_strength_ratio')
-        csr_idw    = idw_field(ln, 'csr')
+        crr_idw = idw_field(ln, 'cyclic_strength_ratio')
+        csr_idw = idw_field(ln, 'csr')
         lpi_sf_idw = idw_field(ln, 'lpi_severity_factor')
-        fs_db_idw  = idw_field(ln, 'factor_of_safety')
+        fs_db_idw = idw_field(ln, 'factor_of_safety')
 
         interpolated_layers.append({
             'layer_number':          ln,
@@ -668,7 +673,8 @@ def interpolate_soil_parameters(
         '_nearest_borehole_label': primary_bh['borehole_id'],
     }
 
-    print(f"[INFO] IDW: {len(interpolated_layers)} layers from {len(borehole_data)} boreholes")
+    print(
+        f"[INFO] IDW: {len(interpolated_layers)} layers from {len(borehole_data)} boreholes")
     return interpolated_layers, interpolation_info, borehole_data
 
 
@@ -703,9 +709,9 @@ def get_nearest_borehole_db_risk(borehole_uuid, borehole_label: str) -> Optional
     RISK_TO_ML = {'VERY HIGH': 'HIGH', 'HIGH': 'HIGH',
                   'MEDIUM': 'MEDIUM',
                   'LOW': 'LOW', 'VERY LOW': 'LOW'}
-    RISK_SEV   = {'VERY HIGH': 'Severe', 'HIGH': 'Severe',
-                  'MEDIUM': 'Moderate',
-                  'LOW': 'Minor', 'VERY LOW': 'Minor'}
+    RISK_SEV = {'VERY HIGH': 'Severe', 'HIGH': 'Severe',
+                'MEDIUM': 'Moderate',
+                'LOW': 'Minor', 'VERY LOW': 'Minor'}
     try:
         client = get_supabase_client()
         result = client.table('soil_layers').select(
@@ -749,12 +755,12 @@ def engineer_features_from_interpolated(interpolated_params, latitude, longitude
 
     target_depth = float(
         depth_m or interpolated_params.get("depth_mid_m") or 1.5)
-    spt    = float(interpolated_params.get("spt_n_value") or 20.0)
-    spt60  = float(interpolated_params.get("spt_n60")     or spt)
-    spt160 = float(interpolated_params.get("spt_n160")    or spt60)
-    uw     = float(interpolated_params.get("unit_weight") or 18.0)
-    fc     = float(interpolated_params.get("fines_content") or 10.0)
-    gwl    = float(interpolated_params.get("groundwater_depth_m") or 5.0)
+    spt = float(interpolated_params.get("spt_n_value") or 20.0)
+    spt60 = float(interpolated_params.get("spt_n60") or spt)
+    spt160 = float(interpolated_params.get("spt_n160") or spt60)
+    uw = float(interpolated_params.get("unit_weight") or 18.0)
+    fc = float(interpolated_params.get("fines_content") or 10.0)
+    gwl = float(interpolated_params.get("groundwater_depth_m") or 5.0)
 
     derived = {
         "spt_n_value":    spt,
@@ -765,7 +771,7 @@ def engineer_features_from_interpolated(interpolated_params, latitude, longitude
         "friction_angle": float(interpolated_params.get("friction_angle") or 30.0),
         "depth_mid_m":    target_depth,
         "depth_from_m":   float(interpolated_params.get("depth_from_m") or target_depth - 0.75),
-        "depth_to_m":     float(interpolated_params.get("depth_to_m")   or target_depth + 0.75),
+        "depth_to_m":     float(interpolated_params.get("depth_to_m") or target_depth + 0.75),
         "groundwater_depth_m":    gwl,
         "moisture_content":       float(interpolated_params.get("moisture_content") or fc),
         "plasticity_index":       float(interpolated_params.get("plasticity_index") or 0.0),
@@ -846,7 +852,7 @@ def run_full_workflow_background():
 # ── Routes ─────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"message": "Geotechnical Prediction API", "version": "2.6.0",
+    return {"message": "Geotechnical Prediction API", "version": "2.7.0",
             "status": "running", "model_loaded": _multi_model is not None}
 
 
@@ -907,11 +913,11 @@ async def predict(
     latitude:     Optional[float] = Query(None, ge=-90,   le=90),
     longitude:    Optional[float] = Query(None, ge=-180,  le=180),
     depth:        Optional[float] = Query(None, ge=0,     le=100),
-    municipality: Optional[str]  = Query(None),
-    n_boreholes:  Optional[int]  = Query(5,    ge=1,     le=10),
+    municipality: Optional[str] = Query(None),
+    n_boreholes:  Optional[int] = Query(5,    ge=1,     le=10),
     q_actual:     Optional[float] = Query(50.0, ge=0),
-    magnitude:    Optional[float] = Query(6.5,  ge=0,   le=9.5,  description='Moment magnitude Mw. Use 0 for static/no-earthquake analysis (sets MSF=1.0).'),
-    pga_g:        Optional[float] = Query(None, ge=0,   le=3.0,  description='Peak Ground Acceleration in g. Overrides DB value when provided.'),
+    magnitude:    Optional[float] = Query(
+        6.5,  ge=0,   le=9.5,  description='Moment magnitude Mw. Use 0 for static/no-earthquake analysis (sets MSF=1.0).'),
     b_increment:  Optional[float] = Query(0.1,  ge=0.05,  le=0.5),
     t_years:      Optional[float] = Query(None, ge=0,     le=200),
     _: None = Depends(verify_api_key),
@@ -921,22 +927,20 @@ async def predict(
         raise HTTPException(503, "Dependencies not available")
 
     if request:
-        lat       = request.latitude
-        lon       = request.longitude
-        depth_m   = request.depth_m
-        munic     = request.municipality
-        q_actual  = request.q_actual   if request.q_actual   is not None else q_actual
-        magnitude = request.magnitude  if request.magnitude  is not None else magnitude
-        pga_g     = request.pga_g      if request.pga_g      is not None else pga_g
-        t_years   = request.t_years    if request.t_years    is not None else t_years
+        lat = request.latitude
+        lon = request.longitude
+        depth_m = request.depth_m
+        munic = request.municipality
+        q_actual = request.q_actual if request.q_actual is not None else q_actual
+        magnitude = request.magnitude if request.magnitude is not None else magnitude
+        t_years = request.t_years if request.t_years is not None else t_years
     else:
         lat, lon, depth_m, munic = latitude, longitude, depth, municipality
 
-    q_actual    = float(q_actual)    if q_actual    is not None else 50.0
-    magnitude   = float(magnitude)   if magnitude   is not None else 6.5
-    pga_g       = float(pga_g)       if pga_g       is not None else None
+    q_actual = float(q_actual) if q_actual is not None else 50.0
+    magnitude = float(magnitude) if magnitude is not None else 6.5
     b_increment = float(b_increment) if b_increment is not None else 0.1
-    t_years     = float(t_years)     if t_years     is not None else None
+    t_years = float(t_years) if t_years is not None else None
 
     # magnitude=0 is a valid static/no-earthquake case — do not clamp it.
     # Only clamp the upper bound to a physically sane ceiling.
@@ -946,7 +950,7 @@ async def predict(
     if lat is None or lon is None:
         raise HTTPException(400, "Latitude and longitude required")
 
-    ck     = _cache_key(lat, lon, q_actual, magnitude)
+    ck = _cache_key(lat, lon, q_actual, magnitude)
     cached = _cache_get(ck)
     if cached is not None:
         return cached
@@ -963,28 +967,6 @@ async def predict(
         if not interpolated_layers:
             raise HTTPException(404, "No borehole data found within 100 km")
 
-        # ── PGA override ───────────────────────────────────────────────────
-        # If the user supplied pga_g, override every layer's stored PGA and
-        # recompute CSR from scratch using the Seed & Idriss (1971) formula.
-        # This ensures the user's site-specific PGA is used instead of the
-        # pipeline default (0.35g) that may have been stored in the DB.
-        GAMMA_W = 9.81
-        if pga_g is not None:
-            print(f"[INFO] User PGA override: {pga_g}g — recomputing CSR for all layers")
-            for lyr in interpolated_layers:
-                z    = (float(lyr.get('depth_from_m', 0)) +
-                        float(lyr.get('depth_to_m', 0))) / 2.0
-                gam  = float(lyr.get('unit_weight') or 18.0)
-                gwl  = float(lyr.get('groundwater_depth_m') or 5.0)
-                sv   = gam * z
-                u    = max(0.0, z - gwl) * GAMMA_W
-                sv_e = max(1.0, sv - u)
-                rd   = max(0.0, 1.0 - 0.00765 * z if z <= 9.15
-                           else 1.174 - 0.0267 * z if z <= 23.0 else 0.0)
-                csr_new = 0.65 * pga_g * (sv / sv_e) * rd
-                lyr['pga_g'] = pga_g
-                lyr['csr']   = round(csr_new, 6)
-
         # ── MSF (Magnitude Scaling Factor) ────────────────────────────────
         # magnitude=0 → static/no-earthquake case → MSF=1.0 (no seismic scaling).
         # magnitude>0 → Idriss (1999): MSF = (10^2.24) / (Mw^2.56).
@@ -993,8 +975,8 @@ async def predict(
             msf = 1.0
             print(f"[INFO] Mw=0 (static case) → MSF=1.0 (no seismic scaling)")
         else:
-            _mw    = min(magnitude, 9.5)
-            msf    = (10 ** 2.24) / (_mw ** 2.56)
+            _mw = min(magnitude, 9.5)
+            msf = (10 ** 2.24) / (_mw ** 2.56)
             print(f"[INFO] Mw={_mw:.2f}  MSF={msf:.4f}")
 
         # ── Per-layer FS resolution (four-tier priority) ──────────────────────
@@ -1008,24 +990,24 @@ async def predict(
         # Priority 4 — _DB_RISK_TO_FS proxy (LPI FIX 1, last resort).
         #
         for lyr in interpolated_layers:
-            crr_l    = lyr.get('cyclic_strength_ratio') or lyr.get('crr')
-            csr_l    = lyr.get('csr')
-            db_risk  = lyr.get('liquefaction_risk_level', 'VERY LOW')
+            crr_l = lyr.get('cyclic_strength_ratio') or lyr.get('crr')
+            csr_l = lyr.get('csr')
+            db_risk = lyr.get('liquefaction_risk_level', 'VERY LOW')
 
             if crr_l is not None and csr_l is not None and float(csr_l) > 0:
                 # Priority 1 — direct computation
-                fs_computed      = (float(crr_l) * msf) / (float(csr_l) + 1e-9)
+                fs_computed = (float(crr_l) * msf) / (float(csr_l) + 1e-9)
 
                 # BUG G FIX — apply DB risk ceiling to prevent IDW dilution
                 # from safe neighbours inflating FS above what is consistent
                 # with the worst per-layer DB classification.
-                fs_ceiling       = _DB_RISK_FS_CEILING.get(db_risk, 999.0)
-                fs_final         = min(fs_computed, fs_ceiling)
+                fs_ceiling = _DB_RISK_FS_CEILING.get(db_risk, 999.0)
+                fs_final = min(fs_computed, fs_ceiling)
                 if fs_final < fs_computed:
                     print(f"    [BUG G] Layer {lyr['layer_number']} risk={db_risk}: "
                           f"IDW FS={fs_computed:.4f} capped to ceiling {fs_ceiling:.2f} "
                           f"(IDW CRR/CSR diluted by safer neighbours)")
-                lyr['fs']        = fs_final
+                lyr['fs'] = fs_final
                 lyr['fs_source'] = 'computed' if fs_final == fs_computed else 'computed+capped'
 
             else:
@@ -1033,8 +1015,8 @@ async def predict(
                 lsf = lyr.get('lpi_severity_factor')
                 if lsf is not None:
                     try:
-                        lsf_float        = float(lsf)
-                        lyr['fs']        = max(0.0, 1.0 - lsf_float)
+                        lsf_float = float(lsf)
+                        lyr['fs'] = max(0.0, 1.0 - lsf_float)
                         lyr['fs_source'] = 'db_lsf'
                     except (TypeError, ValueError):
                         lsf = None
@@ -1044,18 +1026,18 @@ async def predict(
                     fs_db = lyr.get('factor_of_safety_db')
                     if fs_db is not None:
                         try:
-                            lyr['fs']        = float(fs_db)
+                            lyr['fs'] = float(fs_db)
                             lyr['fs_source'] = 'db_fs'
                         except (TypeError, ValueError):
                             fs_db = None
 
                     if fs_db is None:
                         # Priority 4 — recalibrated proxy (last resort)
-                        lyr['fs']        = _DB_RISK_TO_FS.get(db_risk, 2.0)
+                        lyr['fs'] = _DB_RISK_TO_FS.get(db_risk, 2.0)
                         lyr['fs_source'] = 'db_proxy'
 
         # Critical layer = lowest FS
-        critical_layer    = min(interpolated_layers, key=lambda l: l['fs'])
+        critical_layer = min(interpolated_layers, key=lambda l: l['fs'])
         interpolated_params = critical_layer
 
         if depth_m is None:
@@ -1084,12 +1066,12 @@ async def predict(
                 )
                 continue
 
-            h_i  = float(lyr.get('layer_thickness', 1.5))
+            h_i = float(lyr.get('layer_thickness', 1.5))
             fs_i = lyr['fs']
-            F_i  = max(0.0, 1.0 - fs_i)
-            W_i  = max(0.0, 10.0 - 0.5 * z_mid)
+            F_i = max(0.0, 1.0 - fs_i)
+            W_i = max(0.0, 10.0 - 0.5 * z_mid)
             contrib = F_i * W_i * h_i
-            lpi    += contrib
+            lpi += contrib
 
             lpi_debug_rows.append(
                 f"  Layer {lyr['layer_number']:2d} | z={z_mid:5.1f}m | "
@@ -1110,30 +1092,30 @@ async def predict(
 
         # Risk Level = LPI classification — single, authoritative, never overridden
         risk_level, severity = _lpi_to_risk(lpi)
-        liquefaction_prob    = _RISK_PROB[risk_level]
+        liquefaction_prob = _RISK_PROB[risk_level]
 
         print(
             f"[INFO] LPI = {lpi:.2f} ({lpi_severity})  →  Risk Level = {risk_level}")
 
         # ── DB source label (transparency only — does NOT change risk_level) ─
-        data_source     = "IDW Interpolation + LPI (Iwasaki 1978)"
+        data_source = "IDW Interpolation + LPI (Iwasaki 1978)"
         nearest_dist_km = interpolation_info.get('nearest_distance_km', 999)
         if nearest_dist_km < 5.0:
-            bh_uuid  = interpolation_info.get('_nearest_borehole_uuid')
+            bh_uuid = interpolation_info.get('_nearest_borehole_uuid')
             bh_label = interpolation_info.get('_nearest_borehole_label', 'N/A')
             if bh_uuid:
                 db_check = get_nearest_borehole_db_risk(bh_uuid, bh_label)
                 if db_check:
-                    data_source  = f"LPI Classification (nearest: {bh_label}, {nearest_dist_km:.1f} km)"
-                    db_risk_ord  = _RISK_ORDER.get(db_check['db_risk_level'], 0)
+                    data_source = f"LPI Classification (nearest: {bh_label}, {nearest_dist_km:.1f} km)"
+                    db_risk_ord = _RISK_ORDER.get(db_check['db_risk_level'], 0)
                     lpi_risk_ord = _RISK_ORDER.get(risk_level, 0)
-                    agreement    = "AGREE" if db_risk_ord == lpi_risk_ord else \
+                    agreement = "AGREE" if db_risk_ord == lpi_risk_ord else \
                         f"DB={db_check['db_risk_level']} vs LPI={risk_level}"
                     print(
                         f"[INFO] DB cross-check ({bh_label}): {agreement} — LPI classification used")
 
         # ── ANN foundation prediction ──────────────────────────────────────
-        features_df     = engineer_features_from_interpolated(
+        features_df = engineer_features_from_interpolated(
             interpolated_params, lat, lon, depth_m)
         features_scaled = scaler.transform(features_df)
 
@@ -1142,25 +1124,25 @@ async def predict(
             B_pred = max(1.0, min(10.0, float(predictions[0])))
             D_pred = max(0.5, min(6.0,  float(predictions[1])))
         else:
-            N_spt  = max(1.0, float(
+            N_spt = max(1.0, float(
                 interpolated_params.get('spt_n60', 15) or 15))
             B_pred = max(2.5, min(5.0, round(50.0 / (N_spt * 8.49) * 2) / 2))
             D_pred = 1.5
 
         # ── Critical-layer soil parameters ────────────────────────────────
-        spt_n60      = float(interpolated_params.get('spt_n60')      or 0)
-        unit_weight  = float(interpolated_params.get('unit_weight')  or 18)
-        csr_val      = float(interpolated_params.get('csr')          or 0) or 0.2
-        crr_raw      = interpolated_params.get(
+        spt_n60 = float(interpolated_params.get('spt_n60') or 0)
+        unit_weight = float(interpolated_params.get('unit_weight') or 18)
+        csr_val = float(interpolated_params.get('csr') or 0) or 0.2
+        crr_raw = interpolated_params.get(
             'crr') or interpolated_params.get('cyclic_strength_ratio')
-        crr_val      = float(crr_raw) if crr_raw is not None else 0.3
-        gwl          = float(interpolated_params.get('groundwater_depth_m') or 5)
+        crr_val = float(crr_raw) if crr_raw is not None else 0.3
+        gwl = float(interpolated_params.get('groundwater_depth_m') or 5)
         fines_percent = float(interpolated_params.get('fines_content') or 10)
-        fs_adjusted  = critical_layer['fs']
+        fs_adjusted = critical_layer['fs']
 
         # ── Bearing capacity ───────────────────────────────────────────────
-        MAX_B   = 5.0
-        MAX_D   = 3.5
+        MAX_B = 5.0
+        MAX_D = 3.5
         SI_ALLOW = 25.0
 
         # BUG E FIX — idw_bearing receives borehole_data explicitly
@@ -1179,24 +1161,24 @@ async def predict(
             total_w = sum(w for _, w in vals)
             return sum(v * w for v, w in vals) / total_w if total_w > 0 else None
 
-        crit_ln       = critical_layer['layer_number']
-        qa_from_db    = idw_bearing(crit_ln, 'bearing_qa_kpa', borehole_data)
+        crit_ln = critical_layer['layer_number']
+        qa_from_db = idw_bearing(crit_ln, 'bearing_qa_kpa', borehole_data)
 
         if qa_from_db and qa_from_db > 1.0:
-            qa_site  = qa_from_db
-            qu_site  = qa_site * 3.0
-            B        = B_pred
-            D        = D_pred
+            qa_site = qa_from_db
+            qu_site = qa_site * 3.0
+            B = B_pred
+            D = D_pred
             print(
                 f"[INFO] Bearing capacity from DB (FIX 12): qa={qa_site:.1f} kPa")
         else:
-            B  = B_pred
-            D  = D_pred
-            N  = max(1.0, spt_n60)
+            B = B_pred
+            D = D_pred
+            N = max(1.0, spt_n60)
             Kd = 1.0 + 0.33 * (D / B)
             size_factor = ((B + 0.3) / B) ** 2
-            qa_site  = max(1.0, 8.0 * N * size_factor * Kd)
-            qu_site  = qa_site * 3.0
+            qa_site = max(1.0, 8.0 * N * size_factor * Kd)
+            qu_site = qa_site * 3.0
             print(
                 f"[INFO] Bearing capacity fallback (Meyerhof SPT): qa={qa_site:.1f} kPa")
 
@@ -1215,11 +1197,11 @@ async def predict(
         # ── Tokimatsu & Seed (1987) volumetric settlement ─────────────────
         _DPWH_TO_4 = {'VERY HIGH': 'VERY HIGH', 'HIGH': 'HIGH',
                       'MEDIUM': 'LOW', 'LOW': 'VERY LOW', 'VERY LOW': 'VERY LOW'}
-        total_settle_cm  = 0.0
+        total_settle_cm = 0.0
         liquefiable_layers = []
         for lyr in interpolated_layers:
-            fs_lyr  = lyr['fs']
-            risk_4  = _DPWH_TO_4.get(
+            fs_lyr = lyr['fs']
+            risk_4 = _DPWH_TO_4.get(
                 lyr.get('liquefaction_risk_level', 'VERY LOW'), 'VERY LOW')
             if risk_4 == 'VERY HIGH':
                 fs_settle = min(fs_lyr, 0.6)
@@ -1231,14 +1213,14 @@ async def predict(
                 fs_settle = fs_lyr
 
             if fs_settle < 1.0:
-                N_l    = max(1.0, float(lyr.get('spt_n_value', 20) or 20))
-                csr_l  = float(lyr.get('csr') or 0.2) or 0.2
-                thick  = float(lyr.get('layer_thickness', 1.5))
+                N_l = max(1.0, float(lyr.get('spt_n_value', 20) or 20))
+                csr_l = float(lyr.get('csr') or 0.2) or 0.2
+                thick = float(lyr.get('layer_thickness', 1.5))
                 ev_max = {N_l < 5: 4.0, N_l < 10: 3.0, N_l < 15: 2.0,
                           N_l < 20: 1.0}.get(True, 0.5)
-                ev     = max(0.0, min(ev_max, ev_max *
-                             min(csr_l / 0.3, 1.0) * (1.0 - fs_settle)))
-                lyr_s  = round((ev / 100.0) * thick * 100.0, 2)
+                ev = max(0.0, min(ev_max, ev_max *
+                                  min(csr_l / 0.3, 1.0) * (1.0 - fs_settle)))
+                lyr_s = round((ev / 100.0) * thick * 100.0, 2)
                 total_settle_cm += lyr_s
                 liquefiable_layers.append({
                     'layer':         lyr['layer_number'],
@@ -1249,21 +1231,22 @@ async def predict(
                 })
 
         # BUG C FIX — minimum settlement floors driven by LPI-based risk_level
-        floors          = {'VERY HIGH': 7.0, 'HIGH': 4.0, 'MEDIUM': 2.0, 'LOW': 1.0}
+        floors = {'VERY HIGH': 7.0, 'HIGH': 4.0, 'MEDIUM': 2.0, 'LOW': 1.0}
         total_settle_cm = max(total_settle_cm, floors.get(risk_level, 0.0))
-        settlement_cm   = round(pre_liq_settlement_cm + total_settle_cm, 2)
-        settlement_mm   = settlement_cm * 10.0
+        settlement_cm = round(pre_liq_settlement_cm + total_settle_cm, 2)
+        settlement_mm = settlement_cm * 10.0
 
         # ── Bearing capacity reduction ─────────────────────────────────────
-        reductions   = {'VERY HIGH': 0.10, 'HIGH': 0.35, 'MEDIUM': 0.65, 'LOW': 0.75}
+        reductions = {'VERY HIGH': 0.10,
+                      'HIGH': 0.35, 'MEDIUM': 0.65, 'LOW': 0.75}
         post_bearing = max(0.0, qa_site * reductions.get(risk_level, 1.0))
         cap_reduction = ((qa_site - post_bearing) /
                          qa_site * 100) if qa_site > 0 else 0
 
-        settle_fs  = qa_site / q_actual if q_actual > 0 else float('inf')
+        settle_fs = qa_site / q_actual if q_actual > 0 else float('inf')
         settle_sev = "High" if settlement_cm > 10 else "Moderate" if settlement_cm > 5 else "Low"
 
-        at_max     = (B_pred >= MAX_B and D_pred >= MAX_D)
+        at_max = (B_pred >= MAX_B and D_pred >= MAX_D)
         mitigation = settlement_mm > SI_ALLOW and at_max
 
         # ── Recommendations ────────────────────────────────────────────────
@@ -1426,9 +1409,9 @@ async def get_boreholes(
                          if isinstance(b.get('municipalities'), dict)
                          and b['municipalities'].get('name', '').lower() == municipality.lower()]
 
-        bh_ids    = [b['id'] for b in boreholes]
+        bh_ids = [b['id'] for b in boreholes]
         all_layers = []
-        offset     = 0
+        offset = 0
         while True:
             page = client.table('soil_layers').select(
                 'borehole_id, liquefaction_risk_level, liquefaction, csr, cyclic_strength_ratio, spt_n_value'
@@ -1440,9 +1423,9 @@ async def get_boreholes(
                 break
             offset += 1000
 
-        COLOR_MAP  = {'VERY HIGH': 'red',   'HIGH': 'red',
-                      'MEDIUM':    'orange',
-                      'LOW':       'green',  'VERY LOW': 'green'}
+        COLOR_MAP = {'VERY HIGH': 'red',   'HIGH': 'red',
+                     'MEDIUM':    'orange',
+                     'LOW':       'green',  'VERY LOW': 'green'}
         STATUS_MAP = {'VERY HIGH': 'LIQUEFIABLE', 'HIGH': 'LIQUEFIABLE',
                       'MEDIUM':    'MARGINAL',
                       'LOW':       'NON-LIQUEFIABLE', 'VERY LOW': 'NON-LIQUEFIABLE'}
@@ -1475,9 +1458,9 @@ async def get_boreholes(
                 'avg_spt_n':           _avg([l.get('spt_n_value') for l in layers]),
             }
 
-        NO_DATA  = {'risk_level': 'NO DATA', 'marker_color': 'gray',
-                    'liquefaction_status': 'NO DATA', 'layer_count': 0,
-                    'liquefiable_layers': 0, 'avg_csr': None, 'avg_crr': None, 'avg_spt_n': None}
+        NO_DATA = {'risk_level': 'NO DATA', 'marker_color': 'gray',
+                   'liquefaction_status': 'NO DATA', 'layer_count': 0,
+                   'liquefiable_layers': 0, 'avg_csr': None, 'avg_crr': None, 'avg_spt_n': None}
 
         features = []
         for bh in boreholes:
