@@ -1070,20 +1070,31 @@ async def predict(
         lpi = 0.0
         lpi_debug_rows = []
 
-        # Find the layer that contains the user's input depth
-        # Fall back to critical layer if no match found
+        # Find the layer whose depth_to matches the user's input depth.
+        # The manual spreadsheet uses depth as the BOTTOM of the analyzed layer:
+        #   depth=6 → layer 3.0–6.0m → z_mid=4.5m → W_i=7.75
+        # Priority: exact depth_to match → layer containing depth → critical layer
         target_depth = float(depth_m) if depth_m else float(
             critical_layer.get('depth_to_m') or 1.5)
+
         depth_layer = next(
             (l for l in interpolated_layers
-             if float(l.get('depth_from_m', 0)) <= target_depth <=
-             float(l.get('depth_to_m', 0))),
-            critical_layer
+             if abs(float(l.get('depth_to_m', 0)) - target_depth) < 0.01),
+            None
         )
+        if depth_layer is None:
+            # fallback: layer that contains the depth value
+            depth_layer = next(
+                (l for l in interpolated_layers
+                 if float(l.get('depth_from_m', 0)) < target_depth <=
+                 float(l.get('depth_to_m', 0))),
+                critical_layer
+            )
         lpi_layers = [depth_layer]
         print(f"[LPI] Using layer #{depth_layer['layer_number']} "
               f"({depth_layer['depth_from_m']}–{depth_layer['depth_to_m']}m) "
-              f"for depth_m={target_depth}")
+              f"z_mid={(float(depth_layer.get('depth_from_m', 0))+float(depth_layer.get('depth_to_m', 0)))/2:.2f}m "
+              f"for input depth_m={target_depth}")
 
         # NOTE: LPI uses raw FS = CRR/CSR (without MSF) to match manual sheet.
         # MSF is applied to the displayed FS and risk classification,
