@@ -143,7 +143,7 @@ except ImportError as e:
 app = FastAPI(
     title="Geotechnical Prediction API - Spatial Interpolation",
     description="API with multi-borehole spatial interpolation",
-    version="2.9.0"
+    version="3.0.0"
 )
 
 app.add_middleware(
@@ -857,7 +857,7 @@ def run_full_workflow_background():
 # ── Routes ─────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"message": "Geotechnical Prediction API", "version": "2.9.0",
+    return {"message": "Geotechnical Prediction API", "version": "3.0.0",
             "status": "running", "model_loaded": _multi_model is not None}
 
 
@@ -1554,6 +1554,224 @@ async def get_boreholes(
         import traceback
         print(f"[ERROR] /boreholes: {traceback.format_exc()}")
         raise HTTPException(500, str(e))
+
+
+# ── Direct prediction — for validation without DB ──────────────────────────
+class DirectLayerInput(BaseModel):
+    depth_from_m:        float
+    depth_to_m:          float
+    spt_n_value:         float
+    unit_weight:         float = 18.0
+    fines_content:       float = 10.0
+    groundwater_depth_m: float = 5.0
+    pga_g:               float = 0.4
+    csr:                 Optional[float] = None   # computed if absent
+    cyclic_strength_ratio: Optional[float] = None  # computed if absent
+
+
+class DirectPredictionRequest(BaseModel):
+    """
+    Supply raw soil parameters — no DB, no interpolation.
+    Use for validation: pass exactly what the manual spreadsheet used
+    and compare FS / LPI / risk with the manual result.
+    """
+    magnitude:    float = 7.0
+    q_actual_kpa: float = 166.67
+    depth_m:      float = 1.5
+    t_years:      Optional[float] = None
+    layers:       List[DirectLayerInput]
+
+
+@app.post("/predict-direct")
+async def predict_direct(
+    req: DirectPredictionRequest,
+    _: None = Depends(verify_api_key),
+):
+    """
+    Compute liquefaction FS, LPI, risk level, and settlement
+    directly from supplied soil parameters — no spatial interpolation.
+
+    Designed for validation against manual spreadsheet calculations.
+    Pass the same inputs (N, GWL, PGA, FC, Mw) and compare outputs.
+
+    CSR is computed via Seed & Idriss (1971) if not supplied.
+    CRR is computed via Robertson-Wride (1998) if not supplied.
+    """
+    GAMMA_W = 9.81
+
+    # MSF
+    if req.magnitude == 0:
+        msf = 1.0
+    else:
+        msf = (10 ** 2.24) / (min(req.magnitude, 9.5) ** 2.56)
+
+    processed_layers = []
+    for i, lyr in enumerate(req.layers):
+        z_mid = (lyr.depth_from_m + lyr.depth_to_m) / 2.0
+        h = max(1.0, lyr.depth_to_m - lyr.depth_from_m)
+        gam = lyr.unit_weight
+        gwl = lyr.groundwater_depth_m
+        pga = lyr.pga_g
+        N = max(1.0, lyr.spt_n_value)
+        FC = max(0.1, lyr.fines_content)
+
+        # Overburden
+        sv = gam * z_mid
+        u = max(0.0, z_mid - gwl) * GAMMA_W
+        sv_e = max(1.0, sv - u)
+
+        # rd (Seed & Idriss 1971)
+        if z_mid <= 9.15:
+            rd = 1.0 - 0.00765 * z_mid
+        elif z_mid <= 23.0:
+            rd = 1.174 - 0.0267 * z_mid
+        else:
+            rd = 0.0
+        rd = max(0.0, rd)
+
+        # CSR
+        if lyr.csr is not None:
+            csr = float(lyr.csr)
+        else:
+            csr = 0.65 * pga * (sv / sv_e) * rd
+
+        # N1(60) with Cn correction
+        Cn = min(1.7, (101.3 / sv_e) ** 0.5)
+        N_liq = min(N, 60.0)          # cap at 60 for liquefaction path
+        n160 = min(60.0, N_liq * Cn)
+
+        # Fines correction (NCEER)
+        if FC < 5.0:
+            alpha, beta = 0.0, 1.0
+        elif FC <= 35.0:
+            alpha = np.exp(1.76 - 190.0 / FC ** 2)
+            beta = 0.99 + FC ** 1.5 / 1000.0
+        else:
+            alpha, beta = 5.0, 1.2
+        n160cs = min(60.0, alpha + beta * n160)
+
+        # CRR (Robertson-Wride 1998)
+        if lyr.cyclic_strength_ratio is not None:
+            crr = float(lyr.cyclic_strength_ratio)
+        elif n160cs >= 30.0:
+            crr = 0.6
+        else:
+            crr = np.exp(
+                n160cs / 14.1 + (n160cs / 126.0) ** 2
+                - (n160cs / 23.6) ** 3 + (n160cs / 25.4) ** 4 - 2.67
+            )
+            crr = float(np.clip(crr, 0.0, 0.6))
+
+        # FS
+        fs = (crr * msf) / (csr + 1e-9)
+
+        # DPWH risk classification
+        if fs < 0.80:
+            risk_lv = 'VERY HIGH'
+        elif fs < 1.00:
+            risk_lv = 'HIGH'
+        elif fs < 1.20:
+            risk_lv = 'MEDIUM'
+        elif fs < 1.50:
+            risk_lv = 'LOW'
+        else:
+            risk_lv = 'VERY LOW'
+
+        processed_layers.append({
+            'layer_number':        i + 1,
+            'depth_from_m':        lyr.depth_from_m,
+            'depth_to_m':          lyr.depth_to_m,
+            'depth_mid_m':         round(z_mid, 3),
+            'layer_thickness':     round(h, 2),
+            'spt_n_value':         N,
+            'n1_60cs':             round(n160cs, 3),
+            'unit_weight':         gam,
+            'fines_content':       FC,
+            'groundwater_depth_m': gwl,
+            'pga_g':               pga,
+            'csr':                 round(csr, 6),
+            'crr':                 round(crr, 6),
+            'fs':                  round(fs, 6),
+            'liquefaction_risk_level': risk_lv,
+        })
+
+    # LPI — Iwasaki et al. (1978)
+    lpi = 0.0
+    for lyr in processed_layers:
+        z_mid = lyr['depth_mid_m']
+        if z_mid > 20.0:
+            continue
+        h_i = lyr['layer_thickness']
+        fs_i = lyr['fs']
+        F_i = max(0.0, 1.0 - fs_i)
+        W_i = max(0.0, 10.0 - 0.5 * z_mid)
+        lpi += F_i * W_i * h_i
+
+    lpi = round(lpi, 4)
+    risk_level, severity = _lpi_to_risk(lpi)
+    lpi_severity = _lpi_severity_label(lpi)
+
+    # Critical layer (lowest FS)
+    critical = min(processed_layers, key=lambda l: l['fs'])
+
+    # Bearing capacity — simple Meyerhof SPT
+    N_crit = max(1.0, critical['spt_n_value'])
+    B_est = 3.0    # assumed footing width
+    D_est = req.depth_m
+    Kd = 1.0 + 0.33 * (D_est / B_est)
+    sf = ((B_est + 0.3) / B_est) ** 2
+    qa_site = max(1.0, 8.0 * N_crit * sf * Kd)
+
+    reductions = {'VERY HIGH': 0.10, 'HIGH': 0.35, 'MEDIUM': 0.65, 'LOW': 0.75}
+    post_bearing = max(0.0, qa_site * reductions.get(risk_level, 1.0))
+    cap_reduction = ((qa_site - post_bearing) /
+                     qa_site * 100) if qa_site > 0 else 0
+
+    # Settlement (Tokimatsu & Seed 1987)
+    total_settle_cm = 0.0
+    for lyr in processed_layers:
+        if lyr['fs'] < 1.0:
+            N_l = max(1.0, lyr['spt_n_value'])
+            csr_l = lyr['csr'] or 0.2
+            thick = lyr['layer_thickness']
+            ev_max = {N_l < 5: 4.0, N_l < 10: 3.0, N_l < 15: 2.0,
+                      N_l < 20: 1.0}.get(True, 0.5)
+            ev = max(0.0, min(ev_max,
+                              ev_max * min(csr_l / 0.3, 1.0) * (1.0 - lyr['fs'])))
+            total_settle_cm += (ev / 100.0) * thick * 100.0
+
+    floors = {'VERY HIGH': 7.0, 'HIGH': 4.0, 'MEDIUM': 2.0, 'LOW': 1.0}
+    total_settle_cm = max(total_settle_cm, floors.get(risk_level, 0.0))
+    pre_liq_cm = (req.q_actual_kpa / max(1.0, qa_site)) * 2.5
+    settlement_cm = round(pre_liq_cm + total_settle_cm, 4)
+    settlement_mm = round(settlement_cm * 10.0, 3)
+
+    liquefaction_prob = _RISK_PROB[risk_level]
+
+    return {
+        "source":       "Direct computation — no interpolation",
+        "magnitude_mw": req.magnitude,
+        "msf":          round(msf, 4),
+        "risk_assessment": {
+            "risk_level":         risk_level,
+            "probability":        liquefaction_prob,
+            "severity":           severity,
+            "lpi":                lpi,
+            "lpi_severity":       lpi_severity,
+            "critical_layer":     critical['layer_number'],
+            "factor_of_safety":   round(critical['fs'], 4),
+        },
+        "layers": processed_layers,
+        "settlement": {
+            "settlement_cm": settlement_cm,
+            "settlement_mm": settlement_mm,
+        },
+        "bearing_capacity": {
+            "qa_kpa":                     round(qa_site, 1),
+            "allowable_bearing_kpa":      round(post_bearing, 1),
+            "capacity_reduction_percent": round(cap_reduction, 1),
+        },
+    }
 
 
 @app.get("/features")
