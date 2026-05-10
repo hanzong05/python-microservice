@@ -143,7 +143,7 @@ except ImportError as e:
 app = FastAPI(
     title="Geotechnical Prediction API - Spatial Interpolation",
     description="API with multi-borehole spatial interpolation",
-    version="3.0.0"
+    version="3.1.0"
 )
 
 app.add_middleware(
@@ -865,7 +865,7 @@ def run_full_workflow_background():
 # ── Routes ─────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"message": "Geotechnical Prediction API", "version": "3.0.0",
+    return {"message": "Geotechnical Prediction API", "version": "3.1.0",
             "status": "running", "model_loaded": _multi_model is not None}
 
 
@@ -1024,30 +1024,13 @@ async def predict(
                 lyr['fs_source'] = 'computed' if fs_final == fs_computed else 'computed+capped'
 
             else:
-                # Priority 2 — use stored lpi_severity_factor (F_i) from DB
-                lsf = lyr.get('lpi_severity_factor')
-                if lsf is not None:
-                    try:
-                        lsf_float = float(lsf)
-                        lyr['fs'] = max(0.0, 1.0 - lsf_float)
-                        lyr['fs_source'] = 'db_lsf'
-                    except (TypeError, ValueError):
-                        lsf = None
-
-                if lsf is None:
-                    # Priority 3 — raw factor_of_safety from DB
-                    fs_db = lyr.get('factor_of_safety_db')
-                    if fs_db is not None:
-                        try:
-                            lyr['fs'] = float(fs_db)
-                            lyr['fs_source'] = 'db_fs'
-                        except (TypeError, ValueError):
-                            fs_db = None
-
-                    if fs_db is None:
-                        # Priority 4 — recalibrated proxy (last resort)
-                        lyr['fs'] = _DB_RISK_TO_FS.get(db_risk, 2.0)
-                        lyr['fs_source'] = 'db_proxy'
+                # No CRR/CSR available — fall back to DB risk proxy.
+                # NOTE: stored factor_of_safety and lpi_severity_factor are
+                # computed with pipeline Mw=6.5 MSF, NOT the user's Mw=7.0.
+                # Using them would double-scale MSF. Use the risk-level proxy
+                # which gives a consistent FS band midpoint instead.
+                lyr['fs'] = _DB_RISK_TO_FS.get(db_risk, 2.0)
+                lyr['fs_source'] = 'db_proxy'
 
         # Critical layer = lowest FS
         critical_layer = min(interpolated_layers, key=lambda l: l['fs'])
@@ -1060,82 +1043,39 @@ async def predict(
               f"({critical_layer['depth_from_m']}–{critical_layer['depth_to_m']} m) "
               f"FS={critical_layer['fs']:.3f} source={critical_layer.get('fs_source')}")
 
-        # ── LPI — Iwasaki et al. (1978) ───────────────────────────────────
+        # ── LPI — Validation sheet methodology ────────────────────────────
         #
-        # Computed only for the layer containing the user-supplied depth_m.
-        # This matches the manual spreadsheet which evaluates LPI at the
-        # specific foundation depth the user enters in the form.
-        # e.g. depth=1.5m → use the layer that contains z=1.5m only.
+        # Matches the validation spreadsheet exactly (verified from Excel):
+        #   z     = depth_to of each layer (1.5, 3.0, 4.5 ... m)
+        #   W_i   = 10 - 0.5 × depth_to
+        #   FS    = CRR × MSF / CSR  (same MSF-adjusted FS as risk classification)
+        #   F_i   = max(0, 1 - FS)
+        #   LPI   = Σ (F_i × W_i × h_i) over ALL layers where depth_to ≤ 20m
         #
         lpi = 0.0
         lpi_debug_rows = []
+        print(f"[LPI] Computing over all {len(interpolated_layers)} layers "
+              f"using z=depth_to, MSF-adjusted FS (validation methodology)")
 
-        # ── LPI layer selection — matches manual spreadsheet methodology ──────
-        #
-        # Manual formula:
-        #   User inputs Depth D (e.g. 6m) = bottom of the analyzed depth interval
-        #   Layer thickness h = 1.5m (fixed per borehole sampling interval)
-        #   z used for W_i = D - h = 6 - 1.5 = 4.5m
-        #   W_i = 10 - 0.5 × z = 10 - 0.5 × 4.5 = 7.75
-        #   FS for LPI = CRR / CSR (raw, without MSF)
-        #   F_i = max(0, 1 - FS_raw)
-        #   LPI = F_i × W_i × h
-        #
-        target_depth = float(depth_m) if depth_m else float(
-            critical_layer.get('depth_to_m') or 1.5)
-
-        # Find the layer whose depth_to matches target_depth
-        depth_layer = next(
-            (l for l in interpolated_layers
-             if abs(float(l.get('depth_to_m', 0)) - target_depth) < 0.01),
-            None
-        )
-        if depth_layer is None:
-            depth_layer = next(
-                (l for l in interpolated_layers
-                 if float(l.get('depth_from_m', 0)) < target_depth <=
-                 float(l.get('depth_to_m', 0))),
-                critical_layer
-            )
-
-        # z = D - h (manual formula) — NOT z_mid
-        lyr_h = float(depth_layer.get('layer_thickness', 1.5))
-        lpi_z = target_depth - lyr_h   # e.g. 6 - 1.5 = 4.5m
-        lpi_z = max(0.0, lpi_z)
-
-        lpi_layers = [depth_layer]
-        print(f"[LPI] Layer #{depth_layer['layer_number']} "
-              f"({depth_layer['depth_from_m']}–{depth_layer['depth_to_m']}m) "
-              f"D={target_depth} h={lyr_h} z=D-h={lpi_z:.2f}m W_i={10-0.5*lpi_z:.3f}")
-
-        # FS for LPI = CRR/CSR without MSF (matches manual sheet)
-        for lyr in lpi_layers:
-            crr_raw = lyr.get('cyclic_strength_ratio') or lyr.get('crr')
-            csr_raw = lyr.get('csr')
-            if crr_raw is not None and csr_raw is not None and float(csr_raw) > 0:
-                lyr['fs_for_lpi'] = float(crr_raw) / (float(csr_raw) + 1e-9)
-            else:
-                lyr['fs_for_lpi'] = lyr['fs']
-
-        for lyr in lpi_layers:
-            if lpi_z > 20.0:
+        for lyr in interpolated_layers:
+            # validation uses depth_to as z
+            z = float(lyr.get('depth_to_m', 0))
+            if z > 20.0:
                 lpi_debug_rows.append(
-                    f"  Layer {lyr['layer_number']:2d} | z={lpi_z:5.1f}m | SKIPPED (z>20m)"
+                    f"  Layer {lyr['layer_number']:2d} | z={z:5.1f}m | SKIPPED (z>20m)"
                 )
                 continue
 
             h_i = float(lyr.get('layer_thickness', 1.5))
-            # Use raw FS (CRR/CSR without MSF) — matches manual sheet formula
-            fs_i = lyr.get('fs_for_lpi', lyr['fs'])
+            fs_i = lyr['fs']                          # MSF-adjusted FS
             F_i = max(0.0, 1.0 - fs_i)
-            # W_i uses z = D - h (manual formula), not z_mid
-            W_i = max(0.0, 10.0 - 0.5 * lpi_z)
+            W_i = max(0.0, 10.0 - 0.5 * z)          # z = depth_to
             contrib = F_i * W_i * h_i
             lpi += contrib
 
             lpi_debug_rows.append(
-                f"  Layer {lyr['layer_number']:2d} | z(D-h)={lpi_z:5.2f}m | "
-                f"h={h_i:.2f}m | FS_raw={fs_i:.4f} | F_i={F_i:.4f} | "
+                f"  Layer {lyr['layer_number']:2d} | z={z:5.2f}m | "
+                f"h={h_i:.2f}m | FS={fs_i:.4f} | F_i={F_i:.4f} | "
                 f"W_i={W_i:.4f} | contrib={contrib:.4f} | "
                 f"src={lyr.get('fs_source'):10s} | "
                 f"risk={lyr.get('liquefaction_risk_level')}"
