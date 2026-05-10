@@ -143,7 +143,7 @@ except ImportError as e:
 app = FastAPI(
     title="Geotechnical Prediction API - Spatial Interpolation",
     description="API with multi-borehole spatial interpolation",
-    version="2.7.0"
+    version="2.8.0"
 )
 
 app.add_middleware(
@@ -469,7 +469,7 @@ def interpolate_soil_parameters(
     # Below 0.5 km we use the nearest borehole's layers directly — no blending.
     # borehole_data is still returned in full so idw_bearing() can fall back
     # to farther boreholes for bearing capacity if the nearest has no qa value.
-    _DIRECT_USE_KM = 0.5
+    _DIRECT_USE_KM = 1.0
 
     if nearest_distance < _DIRECT_USE_KM:
         print(f"[INFO] Nearest borehole {primary_bh['borehole_id']} is "
@@ -852,7 +852,7 @@ def run_full_workflow_background():
 # ── Routes ─────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"message": "Geotechnical Prediction API", "version": "2.7.0",
+    return {"message": "Geotechnical Prediction API", "version": "2.8.0",
             "status": "running", "model_loaded": _multi_model is not None}
 
 
