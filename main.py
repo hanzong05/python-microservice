@@ -5,7 +5,7 @@ Enhanced API with Spatial Interpolation — FIXED v2.3.0
 All original bugs fixed (A–E) PLUS LPI fixes + BUG F:
 
 BUG A  (DATA/PIPELINE) — BH-381/382 have USCS='M' (single-char artifact).
-  Pipeline normalised 'M' → '' → treated as r eal soil with imputed SPT=15,
+  Pipeline normalised 'M' → '' → treated as real soil with imputed SPT=15,
   unit_weight=23, pga=0.47, producing VERY HIGH risk at depth.
   FIX: exclude boreholes/layers where is_core_sample=1 OR USCS is empty/rock
   from IDW by filtering them out in get_borehole_all_layers.
@@ -1054,14 +1054,30 @@ async def predict(
 
         # ── LPI — Iwasaki et al. (1978) ───────────────────────────────────
         #
-        # LPI FIX 3 — layer_thickness already floored at 1.0 m in
-        # interpolate_soil_parameters(), so h_i is always ≥ 1.0 m here.
-        # LPI FIX 4 — full per-layer debug table printed to server log.
+        # Computed only for the layer containing the user-supplied depth_m.
+        # This matches the manual spreadsheet which evaluates LPI at the
+        # specific foundation depth the user enters in the form.
+        # e.g. depth=1.5m → use the layer that contains z=1.5m only.
         #
         lpi = 0.0
         lpi_debug_rows = []
 
-        for lyr in interpolated_layers:
+        # Find the layer that contains the user's input depth
+        # Fall back to critical layer if no match found
+        target_depth = float(depth_m) if depth_m else float(
+            critical_layer.get('depth_to_m') or 1.5)
+        depth_layer = next(
+            (l for l in interpolated_layers
+             if float(l.get('depth_from_m', 0)) <= target_depth <=
+             float(l.get('depth_to_m', 0))),
+            critical_layer
+        )
+        lpi_layers = [depth_layer]
+        print(f"[LPI] Using layer #{depth_layer['layer_number']} "
+              f"({depth_layer['depth_from_m']}–{depth_layer['depth_to_m']}m) "
+              f"for depth_m={target_depth}")
+
+        for lyr in lpi_layers:
             z_mid = (float(lyr.get('depth_from_m', 0)) +
                      float(lyr.get('depth_to_m', 0))) / 2.0
 
@@ -1771,6 +1787,30 @@ async def predict_direct(
             "allowable_bearing_kpa":      round(post_bearing, 1),
             "capacity_reduction_percent": round(cap_reduction, 1),
         },
+    }
+
+
+@app.post("/cache/clear")
+async def cache_clear(_: None = Depends(verify_api_key)):
+    """Clear the prediction cache — call this after rerunning the pipeline."""
+    global _prediction_cache
+    size = len(_prediction_cache)
+    _prediction_cache = {}
+    print(f"[CACHE] Cleared {size} entries")
+    return {"message": f"Cache cleared", "entries_removed": size}
+
+
+@app.get("/cache/info")
+async def cache_info(_: None = Depends(verify_api_key)):
+    """Show current cache size and keys."""
+    return {
+        "size": len(_prediction_cache),
+        "ttl_seconds": _CACHE_TTL_SECONDS,
+        "entries": [
+            {"key": str(k), "age_seconds": round(
+                __import__('time').time() - v["ts"])}
+            for k, v in _prediction_cache.items()
+        ]
     }
 
 
