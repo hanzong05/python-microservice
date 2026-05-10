@@ -1070,65 +1070,73 @@ async def predict(
         lpi = 0.0
         lpi_debug_rows = []
 
-        # Find the layer whose depth_to matches the user's input depth.
-        # The manual spreadsheet uses depth as the BOTTOM of the analyzed layer:
-        #   depth=6 → layer 3.0–6.0m → z_mid=4.5m → W_i=7.75
-        # Priority: exact depth_to match → layer containing depth → critical layer
+        # ── LPI layer selection — matches manual spreadsheet methodology ──────
+        #
+        # Manual formula:
+        #   User inputs Depth D (e.g. 6m) = bottom of the analyzed depth interval
+        #   Layer thickness h = 1.5m (fixed per borehole sampling interval)
+        #   z used for W_i = D - h = 6 - 1.5 = 4.5m
+        #   W_i = 10 - 0.5 × z = 10 - 0.5 × 4.5 = 7.75
+        #   FS for LPI = CRR / CSR (raw, without MSF)
+        #   F_i = max(0, 1 - FS_raw)
+        #   LPI = F_i × W_i × h
+        #
         target_depth = float(depth_m) if depth_m else float(
             critical_layer.get('depth_to_m') or 1.5)
 
+        # Find the layer whose depth_to matches target_depth
         depth_layer = next(
             (l for l in interpolated_layers
              if abs(float(l.get('depth_to_m', 0)) - target_depth) < 0.01),
             None
         )
         if depth_layer is None:
-            # fallback: layer that contains the depth value
             depth_layer = next(
                 (l for l in interpolated_layers
                  if float(l.get('depth_from_m', 0)) < target_depth <=
                  float(l.get('depth_to_m', 0))),
                 critical_layer
             )
-        lpi_layers = [depth_layer]
-        print(f"[LPI] Using layer #{depth_layer['layer_number']} "
-              f"({depth_layer['depth_from_m']}–{depth_layer['depth_to_m']}m) "
-              f"z_mid={(float(depth_layer.get('depth_from_m', 0))+float(depth_layer.get('depth_to_m', 0)))/2:.2f}m "
-              f"for input depth_m={target_depth}")
 
-        # NOTE: LPI uses raw FS = CRR/CSR (without MSF) to match manual sheet.
-        # MSF is applied to the displayed FS and risk classification,
-        # but the manual LPI formula uses the unscaled FS.
+        # z = D - h (manual formula) — NOT z_mid
+        lyr_h = float(depth_layer.get('layer_thickness', 1.5))
+        lpi_z = target_depth - lyr_h   # e.g. 6 - 1.5 = 4.5m
+        lpi_z = max(0.0, lpi_z)
+
+        lpi_layers = [depth_layer]
+        print(f"[LPI] Layer #{depth_layer['layer_number']} "
+              f"({depth_layer['depth_from_m']}–{depth_layer['depth_to_m']}m) "
+              f"D={target_depth} h={lyr_h} z=D-h={lpi_z:.2f}m W_i={10-0.5*lpi_z:.3f}")
+
+        # FS for LPI = CRR/CSR without MSF (matches manual sheet)
         for lyr in lpi_layers:
             crr_raw = lyr.get('cyclic_strength_ratio') or lyr.get('crr')
             csr_raw = lyr.get('csr')
             if crr_raw is not None and csr_raw is not None and float(csr_raw) > 0:
                 lyr['fs_for_lpi'] = float(crr_raw) / (float(csr_raw) + 1e-9)
             else:
-                lyr['fs_for_lpi'] = lyr['fs']  # fallback to MSF-adjusted
+                lyr['fs_for_lpi'] = lyr['fs']
 
         for lyr in lpi_layers:
-            z_mid = (float(lyr.get('depth_from_m', 0)) +
-                     float(lyr.get('depth_to_m', 0))) / 2.0
-
-            if z_mid > 20.0:
+            if lpi_z > 20.0:
                 lpi_debug_rows.append(
-                    f"  Layer {lyr['layer_number']:2d} | z={z_mid:5.1f}m | SKIPPED (z>20m)"
+                    f"  Layer {lyr['layer_number']:2d} | z={lpi_z:5.1f}m | SKIPPED (z>20m)"
                 )
                 continue
 
             h_i = float(lyr.get('layer_thickness', 1.5))
-            # Use raw FS (CRR/CSR without MSF) for LPI — matches manual sheet
+            # Use raw FS (CRR/CSR without MSF) — matches manual sheet formula
             fs_i = lyr.get('fs_for_lpi', lyr['fs'])
             F_i = max(0.0, 1.0 - fs_i)
-            W_i = max(0.0, 10.0 - 0.5 * z_mid)
+            # W_i uses z = D - h (manual formula), not z_mid
+            W_i = max(0.0, 10.0 - 0.5 * lpi_z)
             contrib = F_i * W_i * h_i
             lpi += contrib
 
             lpi_debug_rows.append(
-                f"  Layer {lyr['layer_number']:2d} | z={z_mid:5.1f}m | "
+                f"  Layer {lyr['layer_number']:2d} | z(D-h)={lpi_z:5.2f}m | "
                 f"h={h_i:.2f}m | FS_raw={fs_i:.4f} | F_i={F_i:.4f} | "
-                f"W_i={W_i:.2f} | contrib={contrib:.4f} | "
+                f"W_i={W_i:.4f} | contrib={contrib:.4f} | "
                 f"src={lyr.get('fs_source'):10s} | "
                 f"risk={lyr.get('liquefaction_risk_level')}"
             )
