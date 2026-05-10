@@ -40,6 +40,27 @@ BUG E  (API — borehole_data scope) — idw_bearing() inside predict() referenc
   FIX: interpolate_soil_parameters() now returns (layers, info, borehole_data).
   idw_bearing() accepts borehole_data as an explicit parameter.
 
+BUG G  (API — IDW CRR/CSR dilution contradicts DB risk classification) —
+  IDW blends CRR and CSR from ALL nearby boreholes weighted by distance.
+  When one borehole has HIGH-risk layers but four surrounding boreholes have
+  VERY LOW / LOW soil, the IDW-averaged CRR is pulled upward and CSR is pulled
+  downward, producing computed FS >> 1.0 for layers the DB classifies as HIGH.
+  Example from logs: Layer 9 risk=HIGH but IDW-computed FS=1.68, Layer 10
+  risk=HIGH but FS=1.86 — both > 1.0 → F_i = 0 → LPI = 0.
+  The DB risk classification was computed PER-BOREHOLE on the actual measured
+  CRR/CSR values, so it is the ground truth for that borehole's soil condition.
+  The IDW blend corrupts it.
+  FIX: after computing FS from IDW CRR/CSR, apply a conservative ceiling:
+    FS_final = min(FS_computed, FS_ceiling_from_worst_DB_risk_classification)
+  Ceiling values (top of each DPWH FS band):
+    VERY HIGH ceiling = 0.80   (any computed FS > 0.80 is impossible for VERY HIGH)
+    HIGH      ceiling = 1.00   (any computed FS > 1.00 contradicts HIGH classification)
+    MEDIUM    ceiling = 1.20
+    LOW       ceiling = 1.50
+    VERY LOW  ceiling = 999.0  (unconstrained)
+  This ensures a HIGH-classified layer always produces F_i ≥ 0, so LPI is
+  never zero for a site that has confirmed HIGH-risk boreholes nearby.
+
 BUG F  (API — MSF / magnitude=0 explodes FS) — The /predict-by-location
   endpoint accepts magnitude as a Query param with ge=0, so a caller passing
   magnitude=0 (or omitting it when the frontend sends 0) causes:
@@ -135,7 +156,7 @@ except ImportError as e:
 app = FastAPI(
     title="Geotechnical Prediction API - Spatial Interpolation",
     description="API with multi-borehole spatial interpolation",
-    version="2.3.0"
+    version="2.4.0"
 )
 
 app.add_middleware(
@@ -278,6 +299,20 @@ _DB_RISK_TO_FS = {
     'LOW':            1.35,   # F_i = 0.00  (unchanged)
     'VERY LOW':       2.00,   # F_i = 0.00  (unchanged)
     'NOT APPLICABLE': 2.00,   # F_i = 0.00  (unchanged)
+}
+
+# ── BUG G FIX — FS ceiling per DPWH risk class (top of each FS band) ────────
+# IDW-blended CRR/CSR from safe neighbouring boreholes can inflate computed FS
+# above what is physically consistent with the worst DB risk classification.
+# These ceilings cap the IDW-computed FS at the band boundary so that a layer
+# classified HIGH can never produce F_i = 0 due to IDW dilution.
+_DB_RISK_FS_CEILING = {
+    'VERY HIGH':      0.80,   # FS must be < 0.80 to be VERY HIGH
+    'HIGH':           1.00,   # FS must be < 1.00 to be HIGH
+    'MEDIUM':         1.20,   # FS must be < 1.20 to be MEDIUM
+    'LOW':            1.50,   # FS must be < 1.50 to be LOW
+    'VERY LOW':       999.0,  # unconstrained
+    'NOT APPLICABLE': 999.0,  # unconstrained
 }
 
 # ── Supabase / model helpers ───────────────────────────────────────────────
@@ -483,17 +518,39 @@ def interpolate_soil_parameters(
         # suppress LPI to negligible values for genuinely liquefiable profiles.
         thickness = max(1.0, depth_to - depth_from)
 
-        layer_risks = [
-            l.get('liquefaction_risk_level')
-            for bd in borehole_data
-            for l in bd['layers']
-            if l['layer_number'] == ln
-            and l.get('liquefaction_risk_level')
-            # BUG A FIX
-            and l.get('liquefaction_risk_level') != 'NOT APPLICABLE'
-        ]
-        worst_layer_risk = max(layer_risks, key=lambda r: _RISK_ORDER.get(
-            r, 0)) if layer_risks else 'VERY LOW'
+        # BUG G FIX — use distance-weighted worst risk instead of global max.
+        # plain max() would let a single distant VERY HIGH borehole dominate
+        # even if the nearest borehole is VERY LOW.  We compute a weighted
+        # average risk ordinal across boreholes that have this layer and
+        # return the classification whose band contains that weighted ordinal.
+        # This also means a nearby HIGH borehole beats four distant VERY LOW ones.
+        layer_risk_weighted: List[Tuple[int, float]] = []
+        for bd in borehole_data:
+            lyr_match = next(
+                (l for l in bd['layers']
+                 if l['layer_number'] == ln
+                 and l.get('liquefaction_risk_level')
+                 and l.get('liquefaction_risk_level') != 'NOT APPLICABLE'),
+                None
+            )
+            if lyr_match:
+                ord_val = _RISK_ORDER.get(
+                    lyr_match['liquefaction_risk_level'], 0)
+                layer_risk_weighted.append((ord_val, bd['norm_weight']))
+
+        if layer_risk_weighted:
+            total_w_risk = sum(w for _, w in layer_risk_weighted)
+            avg_ord = sum(o * w for o, w in layer_risk_weighted) / total_w_risk
+            # Map weighted ordinal back to label (round up — conservative)
+            worst_layer_risk = next(
+                (label for label, ord_threshold in
+                 [('VERY HIGH', 4.5), ('HIGH', 3.5),
+                  ('MEDIUM', 2.5), ('LOW', 1.5)]
+                 if avg_ord >= ord_threshold),
+                'VERY LOW'
+            )
+        else:
+            worst_layer_risk = 'VERY LOW'
 
         # BUG D FIX — None default (not 0.0)
         crr_idw = idw_field(ln, 'cyclic_strength_ratio')
@@ -736,7 +793,7 @@ def run_full_workflow_background():
 # ── Routes ─────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"message": "Geotechnical Prediction API", "version": "2.3.0",
+    return {"message": "Geotechnical Prediction API", "version": "2.4.0",
             "status": "running", "model_loaded": _multi_model is not None}
 
 
@@ -876,38 +933,50 @@ async def predict(
         print(
             f"[INFO] Mw={_mw:.2f}  MSF_raw={msf_raw:.4f}  MSF_used={msf:.4f}")
 
-        # ── Per-layer FS resolution (three-tier priority) ──────────────────
+        # ── Per-layer FS resolution (four-tier priority) ──────────────────────
         #
-        # Priority 1 — Computed from IDW-interpolated CRR and CSR (most accurate).
-        # Priority 2 — LPI FIX 2: IDW-interpolated lpi_severity_factor from DB.
-        #              F_i = lpi_severity_factor directly; FS back-calculated as
-        #              1 - lpi_severity_factor (used only for display/critical layer).
-        # Priority 3 — DB risk-level proxy via _DB_RISK_TO_FS (last resort).
-        #              LPI FIX 1: proxy values recalibrated to DPWH FS band midpoints.
+        # Priority 1 — Computed from IDW-interpolated CRR and CSR.
+        #              BUG G FIX: after computation, cap FS at the DPWH band
+        #              ceiling for the worst DB risk classification so that IDW
+        #              dilution from safe neighbours cannot contradict the DB.
+        # Priority 2 — IDW-interpolated lpi_severity_factor from DB (LPI FIX 2).
+        # Priority 3 — Raw factor_of_safety IDW-interpolated from DB.
+        # Priority 4 — _DB_RISK_TO_FS proxy (LPI FIX 1, last resort).
         #
         for lyr in interpolated_layers:
             crr_l = lyr.get('cyclic_strength_ratio') or lyr.get('crr')
             csr_l = lyr.get('csr')
+            db_risk = lyr.get('liquefaction_risk_level', 'VERY LOW')
 
             if crr_l is not None and csr_l is not None and float(csr_l) > 0:
                 # Priority 1 — direct computation
-                lyr['fs'] = (float(crr_l) * msf) / (float(csr_l) + 1e-9)
-                lyr['fs_source'] = 'computed'
+                fs_computed = (float(crr_l) * msf) / (float(csr_l) + 1e-9)
+
+                # BUG G FIX — apply DB risk ceiling to prevent IDW dilution
+                # from safe neighbours inflating FS above what is consistent
+                # with the worst per-layer DB classification.
+                fs_ceiling = _DB_RISK_FS_CEILING.get(db_risk, 999.0)
+                fs_final = min(fs_computed, fs_ceiling)
+                if fs_final < fs_computed:
+                    print(f"    [BUG G] Layer {lyr['layer_number']} risk={db_risk}: "
+                          f"IDW FS={fs_computed:.4f} capped to ceiling {fs_ceiling:.2f} "
+                          f"(IDW CRR/CSR diluted by safer neighbours)")
+                lyr['fs'] = fs_final
+                lyr['fs_source'] = 'computed' if fs_final == fs_computed else 'computed+capped'
 
             else:
-                # LPI FIX 2 — use stored lpi_severity_factor (F_i) from DB
+                # Priority 2 — use stored lpi_severity_factor (F_i) from DB
                 lsf = lyr.get('lpi_severity_factor')
                 if lsf is not None:
                     try:
                         lsf_float = float(lsf)
-                        # F_i = lsf → FS = 1 - lsf (clamped so FS ≥ 0)
                         lyr['fs'] = max(0.0, 1.0 - lsf_float)
                         lyr['fs_source'] = 'db_lsf'
                     except (TypeError, ValueError):
-                        lsf = None   # fall through to proxy
+                        lsf = None
 
                 if lsf is None:
-                    # Try raw factor_of_safety from DB as secondary fallback
+                    # Priority 3 — raw factor_of_safety from DB
                     fs_db = lyr.get('factor_of_safety_db')
                     if fs_db is not None:
                         try:
@@ -917,9 +986,7 @@ async def predict(
                             fs_db = None
 
                     if fs_db is None:
-                        # LPI FIX 1 — recalibrated proxy (last resort)
-                        db_risk = lyr.get(
-                            'liquefaction_risk_level', 'VERY LOW')
+                        # Priority 4 — recalibrated proxy (last resort)
                         lyr['fs'] = _DB_RISK_TO_FS.get(db_risk, 2.0)
                         lyr['fs_source'] = 'db_proxy'
 
