@@ -4,7 +4,7 @@ Enhanced API with Spatial Interpolation — FIXED v2.3.0
 =======================================================
 All original bugs fixed (A–E) PLUS LPI fixes + BUG F:
 
-BUG A  (DATA/PIPELINE) — BH-381/382 have USCS='M' (single-char artifact).
+BUG A  (DATA/PIPELINE) — BH-381/382 have US CS='M' (single-char artifact).
   Pipeline normalised 'M' → '' → treated as real soil with imputed SPT=15,
   unit_weight=23, pga=0.47, producing VERY HIGH risk at depth.
   FIX: exclude boreholes/layers where is_core_sample=1 OR USCS is empty/rock
