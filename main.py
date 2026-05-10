@@ -143,7 +143,7 @@ except ImportError as e:
 app = FastAPI(
     title="Geotechnical Prediction API - Spatial Interpolation",
     description="API with multi-borehole spatial interpolation",
-    version="2.8.0"
+    version="2.9.0"
 )
 
 app.add_middleware(
@@ -224,7 +224,7 @@ class PredictionResponse(BaseModel):
     risk_assessment: Dict
     soil_parameters: Dict
     settlement: Dict
-    bearing_capacity: Dict
+    bearing_capacity: Dict          # allowable_bearing_capacity_kpa may be None for rock
     foundation_recommendation: Optional[Dict] = None
     recommendations: List[str]
     analysis_parameters: Optional[Dict] = None
@@ -392,7 +392,8 @@ def get_borehole_all_layers(borehole_uuid: int) -> List[Dict]:
             'pga_g, csr, cyclic_strength_ratio, friction_angle, cohesion_kpa, '
             'elastic_modulus_es, liquefaction_risk_level, liquefaction, '
             'bearing_qa_kpa, settlement_mm, '
-            'lpi_severity_factor, factor_of_safety'          # LPI FIX 2
+            'lpi_severity_factor, factor_of_safety, '
+            'soil_description, uscs_symbol'                  # rock check
         ).eq('borehole_id', borehole_uuid).order('layer_number').execute()
 
         layers = result.data if result.data else []
@@ -529,6 +530,8 @@ def interpolate_soil_parameters(
                 'risk_probability':        site_risk_prob,
                 'lpi_severity_factor':   lyr.get('lpi_severity_factor'),
                 'factor_of_safety_db':   lyr.get('factor_of_safety'),
+                'soil_description':      lyr.get('soil_description') or '',
+                'uscs_symbol':           lyr.get('uscs_symbol') or '',
             })
 
         interpolation_info = {
@@ -646,6 +649,8 @@ def interpolate_soil_parameters(
             'risk_probability':        site_risk_prob,
             'lpi_severity_factor':   lpi_sf_idw,
             'factor_of_safety_db':   fs_db_idw,
+            'soil_description':      idw_field(ln, 'soil_description') or '',
+            'uscs_symbol':           idw_field(ln, 'uscs_symbol') or '',
         })
 
     if nearest_distance > 10:
@@ -852,7 +857,7 @@ def run_full_workflow_background():
 # ── Routes ─────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"message": "Geotechnical Prediction API", "version": "2.8.0",
+    return {"message": "Geotechnical Prediction API", "version": "2.9.0",
             "status": "running", "model_loaded": _multi_model is not None}
 
 
@@ -1236,12 +1241,43 @@ async def predict(
         settlement_cm = round(pre_liq_settlement_cm + total_settle_cm, 2)
         settlement_mm = settlement_cm * 10.0
 
-        # ── Bearing capacity reduction ─────────────────────────────────────
-        reductions = {'VERY HIGH': 0.10,
-                      'HIGH': 0.35, 'MEDIUM': 0.65, 'LOW': 0.75}
-        post_bearing = max(0.0, qa_site * reductions.get(risk_level, 1.0))
-        cap_reduction = ((qa_site - post_bearing) /
-                         qa_site * 100) if qa_site > 0 else 0
+        # ── Rock / hard material within influence depth check ─────────────
+        # Influence depth = B (footing width) below foundation level.
+        # If any layer within that zone has a rock-type soil description,
+        # bearing capacity cannot be computed by SPT-based methods.
+        _ROCK_KEYWORDS = {
+            'sandstone', 'basalt', 'cobblestone', 'cobble stone',
+            'coring', 'tuff', 'rock', 'cobble'
+        }
+        influence_depth_bottom = D_pred + B_pred   # Df + B
+        rock_within_influence = False
+        for lyr in interpolated_layers:
+            lyr_top = float(lyr.get('depth_from_m', 0))
+            lyr_bot = float(lyr.get('depth_to_m',   0))
+            # layer overlaps the influence zone [Df, Df+B]
+            if lyr_bot > D_pred and lyr_top < influence_depth_bottom:
+                desc = str(lyr.get('soil_description') or '').lower()
+                uscs = str(lyr.get('uscs_symbol') or '').lower()
+                if any(kw in desc or kw in uscs for kw in _ROCK_KEYWORDS):
+                    rock_within_influence = True
+                    print(f"[INFO] Rock/hard material in influence zone "
+                          f"({lyr_top}–{lyr_bot}m): desc='{desc}' uscs='{uscs}'")
+                    break
+
+        # ── Bearing capacity reduction driven by LPI ───────────────────────
+        # Higher LPI → lower allowable bearing capacity.
+        # Reductions are conservative and consistent with post-liquefaction
+        # bearing capacity loss documented in DPWH BSDS 2013.
+        if rock_within_influence:
+            post_bearing = None   # cannot compute — use rock mechanics
+            cap_reduction = None
+            print("[INFO] Bearing capacity: N/A — rock within influence depth")
+        else:
+            reductions = {'VERY HIGH': 0.10,
+                          'HIGH': 0.35, 'MEDIUM': 0.65, 'LOW': 0.75}
+            post_bearing = max(0.0, qa_site * reductions.get(risk_level, 1.0))
+            cap_reduction = ((qa_site - post_bearing) /
+                             qa_site * 100) if qa_site > 0 else 0
 
         settle_fs = qa_site / q_actual if q_actual > 0 else float('inf')
         settle_sev = "High" if settlement_cm > 10 else "Moderate" if settlement_cm > 5 else "Low"
@@ -1323,6 +1359,13 @@ async def predict(
             recommendations.insert(
                 0, f"⚠️ Nearest data {nearest_dist:.1f} km away — moderate uncertainty")
 
+        # ── Rock remarks for recommendations ──────────────────────────────
+        if rock_within_influence:
+            recommendations.insert(0,
+                                   "⚠️ Rock/hard material (Sandstone/Basalt/Cobble/Tuff/Coring) detected "
+                                   "within foundation influence depth — N/A (Use Rock Mechanics) for "
+                                   "bearing capacity. Consult a geotechnical engineer.")
+
         result = PredictionResponse(
             location={
                 "latitude":  lat,
@@ -1354,8 +1397,18 @@ async def predict(
                 "lpi_severity":  lpi_severity,
             },
             bearing_capacity={
-                "allowable_bearing_capacity_kpa": round(post_bearing, 0),
-                "capacity_reduction_percent":     round(cap_reduction, 1),
+                "allowable_bearing_capacity_kpa": (
+                    None if rock_within_influence
+                    else round(post_bearing, 0)
+                ),
+                "capacity_reduction_percent": (
+                    None if rock_within_influence
+                    else round(cap_reduction, 1)
+                ),
+                "remarks": (
+                    "N/A (Use Rock Mechanics)" if rock_within_influence
+                    else None
+                ),
             },
             foundation_recommendation={
                 "base_m":                  round(B_pred, 2),
