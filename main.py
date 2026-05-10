@@ -1032,16 +1032,37 @@ async def predict(
                 lyr['fs'] = _DB_RISK_TO_FS.get(db_risk, 2.0)
                 lyr['fs_source'] = 'db_proxy'
 
-        # Critical layer = lowest FS
+        # Critical layer = lowest FS (used for foundation design and ANN)
         critical_layer = min(interpolated_layers, key=lambda l: l['fs'])
-        interpolated_params = critical_layer
 
-        if depth_m is None:
+        # Display layer = layer at user's input depth (matches manual validation)
+        # The manual validates one specific depth layer per row.
+        # depth_m is the bottom of that layer (e.g. depth=6 → layer 4.5–6.0m).
+        if depth_m is not None:
+            display_layer = next(
+                (l for l in interpolated_layers
+                 if abs(float(l.get('depth_to_m', 0)) - float(depth_m)) < 0.01),
+                None
+            ) or next(
+                (l for l in interpolated_layers
+                 if float(l.get('depth_from_m', 0)) < float(depth_m) <=
+                 float(l.get('depth_to_m', 0))),
+                critical_layer
+            )
+        else:
+            display_layer = critical_layer
             depth_m = float(critical_layer.get('depth_to_m') or 1.5)
+
+        # Use display layer for shown soil parameters and FS
+        # Use critical layer for ANN foundation prediction
+        interpolated_params = display_layer
 
         print(f"[DEBUG] Critical layer: #{critical_layer['layer_number']} "
               f"({critical_layer['depth_from_m']}–{critical_layer['depth_to_m']} m) "
               f"FS={critical_layer['fs']:.3f} source={critical_layer.get('fs_source')}")
+        print(f"[DEBUG] Display layer:  #{display_layer['layer_number']} "
+              f"({display_layer['depth_from_m']}–{display_layer['depth_to_m']} m) "
+              f"FS={display_layer['fs']:.3f} (user depth={depth_m})")
 
         # ── LPI — Validation sheet methodology ────────────────────────────
         #
@@ -1138,7 +1159,7 @@ async def predict(
         crr_val = float(crr_raw) if crr_raw is not None else 0.3
         gwl = float(interpolated_params.get('groundwater_depth_m') or 5)
         fines_percent = float(interpolated_params.get('fines_content') or 10)
-        fs_adjusted = critical_layer['fs']
+        fs_adjusted = display_layer['fs']   # FS at user's input depth
 
         # ── Bearing capacity ───────────────────────────────────────────────
         MAX_B = 5.0
@@ -1645,17 +1666,16 @@ async def predict_direct(
             alpha, beta = 5.0, 1.2
         n160cs = min(60.0, alpha + beta * n160)
 
-        # CRR (Robertson-Wride 1998)
+        # CRR (Robertson-Wride 1998) — no cap at N160cs=30
+        # Matches validation sheet which uses full formula for all N160cs values
         if lyr.cyclic_strength_ratio is not None:
             crr = float(lyr.cyclic_strength_ratio)
-        elif n160cs >= 30.0:
-            crr = 0.6
         else:
-            crr = np.exp(
+            crr = float(np.exp(
                 n160cs / 14.1 + (n160cs / 126.0) ** 2
                 - (n160cs / 23.6) ** 3 + (n160cs / 25.4) ** 4 - 2.67
-            )
-            crr = float(np.clip(crr, 0.0, 0.6))
+            ))
+            crr = max(0.0, crr)  # no upper cap — matches validation sheet
 
         # FS
         fs = (crr * msf) / (csr + 1e-9)
