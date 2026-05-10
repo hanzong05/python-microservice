@@ -1077,6 +1077,17 @@ async def predict(
               f"({depth_layer['depth_from_m']}–{depth_layer['depth_to_m']}m) "
               f"for depth_m={target_depth}")
 
+        # NOTE: LPI uses raw FS = CRR/CSR (without MSF) to match manual sheet.
+        # MSF is applied to the displayed FS and risk classification,
+        # but the manual LPI formula uses the unscaled FS.
+        for lyr in lpi_layers:
+            crr_raw = lyr.get('cyclic_strength_ratio') or lyr.get('crr')
+            csr_raw = lyr.get('csr')
+            if crr_raw is not None and csr_raw is not None and float(csr_raw) > 0:
+                lyr['fs_for_lpi'] = float(crr_raw) / (float(csr_raw) + 1e-9)
+            else:
+                lyr['fs_for_lpi'] = lyr['fs']  # fallback to MSF-adjusted
+
         for lyr in lpi_layers:
             z_mid = (float(lyr.get('depth_from_m', 0)) +
                      float(lyr.get('depth_to_m', 0))) / 2.0
@@ -1088,7 +1099,8 @@ async def predict(
                 continue
 
             h_i = float(lyr.get('layer_thickness', 1.5))
-            fs_i = lyr['fs']
+            # Use raw FS (CRR/CSR without MSF) for LPI — matches manual sheet
+            fs_i = lyr.get('fs_for_lpi', lyr['fs'])
             F_i = max(0.0, 1.0 - fs_i)
             W_i = max(0.0, 10.0 - 0.5 * z_mid)
             contrib = F_i * W_i * h_i
@@ -1096,7 +1108,7 @@ async def predict(
 
             lpi_debug_rows.append(
                 f"  Layer {lyr['layer_number']:2d} | z={z_mid:5.1f}m | "
-                f"h={h_i:.2f}m | FS={fs_i:.4f} | F_i={F_i:.4f} | "
+                f"h={h_i:.2f}m | FS_raw={fs_i:.4f} | F_i={F_i:.4f} | "
                 f"W_i={W_i:.2f} | contrib={contrib:.4f} | "
                 f"src={lyr.get('fs_source'):10s} | "
                 f"risk={lyr.get('liquefaction_risk_level')}"
