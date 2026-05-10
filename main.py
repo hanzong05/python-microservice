@@ -4,7 +4,7 @@ Enhanced API with Spatial Interpolation — FIXED v2.3.0
 =======================================================
 All original bugs fixed (A–E) PLUS LPI fixes + BUG F:
 
-BUG A  (DATA/PIPELINE) — BH-381/382 have US CS='M' (single-char artifact).
+BUG A  (DATA/PIPELINE) — BH-381/382 have USCS='M' (single-char artifact).
   Pipeline normalised 'M' → '' → treated as real soil with imputed SPT=15,
   unit_weight=23, pga=0.47, producing VERY HIGH risk at depth.
   FIX: exclude boreholes/layers where is_core_sample=1 OR USCS is empty/rock
@@ -171,8 +171,16 @@ _prediction_cache: dict = {}
 _CACHE_TTL_SECONDS = 3600
 
 
-def _cache_key(lat, lon, q_actual, magnitude):
-    return (round(lat, 4), round(lon, 4), round(q_actual, 1), round(magnitude, 1))
+def _cache_key(lat, lon, q_actual, magnitude, depth_m=None, t_years=None):
+    """All user inputs are part of the cache key so any change triggers a fresh prediction."""
+    return (
+        round(lat, 4),
+        round(lon, 4),
+        round(q_actual, 1),
+        round(magnitude, 1),
+        round(depth_m, 2) if depth_m is not None else None,
+        round(t_years, 1) if t_years is not None else None,
+    )
 
 
 def _cache_get(key):
@@ -955,7 +963,7 @@ async def predict(
     if lat is None or lon is None:
         raise HTTPException(400, "Latitude and longitude required")
 
-    ck = _cache_key(lat, lon, q_actual, magnitude)
+    ck = _cache_key(lat, lon, q_actual, magnitude, depth_m, t_years)
     cached = _cache_get(ck)
     if cached is not None:
         return cached
