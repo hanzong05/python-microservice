@@ -61,23 +61,10 @@ BUG G  (API — IDW CRR/CSR dilution contradicts DB risk classification) —
   This ensures a HIGH-classified layer always produces F_i ≥ 0, so LPI is
   never zero for a site that has confirmed HIGH-risk boreholes nearby.
 
-BUG F  (API — MSF / magnitude=0 explodes FS) — The /predict-by-location
-  endpoint accepts magnitude as a Query param with ge=0, so a caller passing
-  magnitude=0 (or omitting it when the frontend sends 0) causes:
-    _mw = max(4.0, 0) = 4.0
-    msf = (10**2.24) / (4.0**2.56) ≈ 5.86   (correct range is ~0.9–1.5)
-  Every computed FS is then multiplied by 5.86, turning a genuinely liquefiable
-  FS of 0.95 into 5.57, making ALL F_i = 0 and LPI = 0.00 regardless of soil
-  conditions. This is the single most impactful LPI bug in the stack.
-  FIX 1 — Query param changed to ge=4.5 so magnitude=0 is rejected at the
-           FastAPI validation layer (422 Unprocessable Entity).
-  FIX 2 — PredictionRequest model validator clamps magnitude to [5.0, 9.5]
-           if the caller somehow bypasses the query constraint.
-  FIX 3 — MSF is additionally hard-clamped to [0.82, 1.50] after computation,
-           matching the physically valid range for Mw 5–9 seismic scenarios.
-           This is a safety net; the real fix is the ge=4.5 constraint.
-  FIX 4 — A [MSF WARN] log line is printed whenever MSF would have exceeded
-           1.5 so past incidents are detectable in historical server logs.
+NOTE (magnitude=0) — magnitude=0 is a valid static/no-earthquake case.
+  MSF is set to 1.0 when magnitude=0 so FS = CRR/CSR without seismic scaling.
+  The Query param now uses ge=0 (unrestricted) and the MSF formula branches
+  cleanly on magnitude==0 instead of clamping or rejecting the input.
 
 LPI FIX 1 — DB proxy FS values were too high for HIGH/MEDIUM risk.
   OLD: HIGH→0.90 (F_i=0.10), MEDIUM→1.10 (F_i=0.00).
@@ -156,7 +143,7 @@ except ImportError as e:
 app = FastAPI(
     title="Geotechnical Prediction API - Spatial Interpolation",
     description="API with multi-borehole spatial interpolation",
-    version="2.4.0"
+    version="2.5.0"
 )
 
 app.add_middleware(
@@ -227,18 +214,9 @@ class PredictionRequest(BaseModel):
     depth_m: Optional[float] = None
     municipality: Optional[str] = None
     q_actual: Optional[float] = 50.0
+    # 0 = static/no-earthquake case (MSF=1.0)
     magnitude: Optional[float] = 6.5
     t_years: Optional[float] = None
-
-    # BUG F FIX 2 — clamp magnitude to physically valid range [5.0, 9.5].
-    # Prevents magnitude=0 from inflating MSF to ~5.86 and zeroing all LPI.
-    def model_post_init(self, __context) -> None:
-        if self.magnitude is not None and self.magnitude < 5.0:
-            print(f"[BUG F] PredictionRequest magnitude={self.magnitude} "
-                  f"clamped to 5.0 (below physical minimum)")
-            object.__setattr__(self, 'magnitude', 5.0)
-        if self.magnitude is not None and self.magnitude > 9.5:
-            object.__setattr__(self, 'magnitude', 9.5)
 
 
 class PredictionResponse(BaseModel):
@@ -793,7 +771,7 @@ def run_full_workflow_background():
 # ── Routes ─────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"message": "Geotechnical Prediction API", "version": "2.4.0",
+    return {"message": "Geotechnical Prediction API", "version": "2.5.0",
             "status": "running", "model_loaded": _multi_model is not None}
 
 
@@ -858,7 +836,7 @@ async def predict(
     n_boreholes:  Optional[int] = Query(5,    ge=1,     le=10),
     q_actual:     Optional[float] = Query(50.0, ge=0),
     magnitude:    Optional[float] = Query(
-        6.5,  ge=4.5, le=9.5,  description='Moment magnitude Mw — must be ≥ 4.5; passing 0 inflates MSF by ~5× and zeros all LPI'),
+        6.5,  ge=0,   le=9.5,  description='Moment magnitude Mw. Use 0 for static/no-earthquake analysis (sets MSF=1.0).'),
     b_increment:  Optional[float] = Query(0.1,  ge=0.05,  le=0.5),
     t_years:      Optional[float] = Query(None, ge=0,     le=200),
     _: None = Depends(verify_api_key),
@@ -883,13 +861,9 @@ async def predict(
     b_increment = float(b_increment) if b_increment is not None else 0.1
     t_years = float(t_years) if t_years is not None else None
 
-    # BUG F — normalise magnitude early so every downstream path is safe.
-    # The Query ge=4.5 constraint is the first line of defence; this is the second.
-    if magnitude < 5.0:
-        print(
-            f"[BUG F] magnitude={magnitude} normalised to 5.0 at predict() entry")
-        magnitude = 5.0
-    elif magnitude > 9.5:
+    # magnitude=0 is a valid static/no-earthquake case — do not clamp it.
+    # Only clamp the upper bound to a physically sane ceiling.
+    if magnitude > 9.5:
         magnitude = 9.5
 
     if lat is None or lon is None:
@@ -912,26 +886,17 @@ async def predict(
         if not interpolated_layers:
             raise HTTPException(404, "No borehole data found within 100 km")
 
-        # ── MSF ────────────────────────────────────────────────────────────
-        # BUG F FIX 3 — clamp magnitude to [5.0, 9.5] before MSF computation.
-        # magnitude=0 → _mw=4.0 → MSF≈5.86 → every FS inflated ×5.86 → LPI=0.
-        # Physical MSF range for Mw 5–9 is approximately [0.82, 1.50].
-        if magnitude < 5.0:
-            print(f"[BUG F WARN] magnitude={magnitude} received in predict(); "
-                  f"clamping to 5.0. This inflated MSF would have been "
-                  f"{(10**2.24)/(max(4.0, magnitude)**2.56):.3f}.")
-            magnitude = 5.0
-        if magnitude > 9.5:
-            magnitude = 9.5
-        _mw = magnitude
-        msf_raw = (10 ** 2.24) / (_mw ** 2.56)
-        # BUG F FIX 4 — hard safety clamp; logs if triggered
-        if msf_raw > 1.50:
-            print(f"[MSF WARN] msf_raw={msf_raw:.4f} for Mw={_mw} exceeds 1.50 — "
-                  f"clamping. Check magnitude input.")
-        msf = min(max(msf_raw, 0.82), 1.50)
-        print(
-            f"[INFO] Mw={_mw:.2f}  MSF_raw={msf_raw:.4f}  MSF_used={msf:.4f}")
+        # ── MSF (Magnitude Scaling Factor) ────────────────────────────────
+        # magnitude=0 → static/no-earthquake case → MSF=1.0 (no seismic scaling).
+        # magnitude>0 → Idriss (1999): MSF = (10^2.24) / (Mw^2.56).
+        # Upper bound capped at 9.5; no lower clamp so 0 passes through cleanly.
+        if magnitude == 0:
+            msf = 1.0
+            print(f"[INFO] Mw=0 (static case) → MSF=1.0 (no seismic scaling)")
+        else:
+            _mw = min(magnitude, 9.5)
+            msf = (10 ** 2.24) / (_mw ** 2.56)
+            print(f"[INFO] Mw={_mw:.2f}  MSF={msf:.4f}")
 
         # ── Per-layer FS resolution (four-tier priority) ──────────────────────
         #
