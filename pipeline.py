@@ -1064,7 +1064,7 @@ class GeotechnicalPipeline:
             for opt_col in ['moisture_content', 'friction_angle', 'cohesion_kpa', 'plasticity_index', 'mean_particle_size_d50']:
                 if opt_col in row.index and pd.notna(row.get(opt_col)):
                     record[opt_col] = self.safe_float(row[opt_col])
-            if 'Elastic Modulus (Es) (MN/m²)' in row and pd.notna(row['Elastic Modulus (Es) (MN/m²))']):
+            if 'Elastic Modulus (Es) (MN/m²)' in row and pd.notna(row['Elastic Modulus (Es) (MN/m²)']):
                 record['elastic_modulus_es'] = self.safe_float(
                     row['Elastic Modulus (Es) (MN/m²)'])
             records.append(record)
