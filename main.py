@@ -1503,6 +1503,10 @@ async def predict(
                 "severity":      settle_sev,
                 "lpi":           lpi,
                 "lpi_severity":  lpi_severity,
+                "lpi_warning": (
+                    f"Warning: Nearest Borehole Data was {nearest_dist_km:.1f} km away — "
+                    "LPI may be unreliable due to insufficient local data."
+                ) if nearest_dist_km > 5.0 else None,
             },
             bearing_capacity={
                 "allowable_bearing_capacity_kpa": (
