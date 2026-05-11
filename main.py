@@ -102,6 +102,7 @@ import sys
 import asyncio
 from typing import Optional, Dict, List, Tuple
 from datetime import datetime
+import math
 from math import radians, sin, cos, sqrt, atan2
 from pathlib import Path
 
@@ -1203,80 +1204,145 @@ async def predict(
             total_w = sum(w for _, w in vals)
             return sum(v * w for v, w in vals) / total_w if total_w > 0 else None
 
-        crit_ln       = critical_layer['layer_number']
-        qa_from_db    = idw_bearing(crit_ln, 'bearing_qa_kpa', borehole_data)
+        crit_ln = critical_layer['layer_number']
 
+        # ── Settlement: Schmertmann (1978) elastic + volumetric strain ────
+        # Matches Data-Validation (Liquefaction) (K).xlsx — Settlement sheet.
+        P_kN  = 1500.0                    # building load (kN)
+        Wf_kN = P_kN * 0.1               # footing weight = 10% of P
+        Df    = D_pred                    # foundation depth (m)
+        t_se  = max(0.1, t_years if t_years and t_years > 0 else 3.0)
+        C2_se = 1.0 + 0.2 * math.log10(10.0 * t_se)   # creep factor (global)
+
+        def _Es_MPa(n: float) -> float:
+            """Young's modulus from SPT N-value (DPWH stepped table)."""
+            if n <= 5:   return 10.0
+            if n <= 10:  return 13.5
+            if n <= 14:  return 20.0
+            if n <= 20:  return 27.5
+            if n <= 30:  return 32.5
+            if n <= 50:  return 35.0
+            if n < 100:  return 65.0
+            return 650.0                  # rock / CS (N=100)
+
+        def _schmertmann(B_m: float):
+            """
+            Schmertmann-Hartman-Alpan (1978) elastic settlement
+            + volumetric settlement for footing width B_m.
+            Returns (total_mm, elastic_mm, vol_mm, liquefiable_layer_list).
+            """
+            q_g        = (P_kN + Wf_kN) / (B_m ** 2)   # gross bearing pressure (kPa)
+            elastic_mm = 0.0
+            vol_mm     = 0.0
+            liq_lyrs   = []
+
+            for i, lyr in enumerate(interpolated_layers):
+                z_bot  = float(lyr.get('depth_to_m',   0))
+                z_prev = float(interpolated_layers[i - 1].get('depth_to_m', 0)) if i > 0 else 0.0
+                thick  = z_bot - z_prev
+                if thick <= 0:
+                    continue
+
+                # Layer midpoint depth from surface (Excel: D - (D-D_prev)/2)
+                z_mid_abs = z_bot - thick / 2.0
+                z_mid_rel = z_mid_abs - Df      # depth below foundation
+
+                gamma_l = float(lyr.get('unit_weight') or unit_weight)
+                N_l     = max(1.0, float(lyr.get('spt_n_value') or 15))
+                fs_l    = float(lyr.get('fs') or 2.0) or 2.0
+                rl      = str(lyr.get('liquefaction_risk_level') or '').upper()
+
+                # ── Elastic settlement (only layers BELOW foundation) ──────
+                if z_mid_rel > 0:
+                    u_df   = max(0.0, 9.81 * (Df - gwl))
+                    sv0_l  = max(1.0, gamma_l * Df - u_df)        # σ'v0 at Df
+                    qn_l   = max(1.0, q_g - sv0_l)                # net contact pressure
+                    Po_l   = max(1.0, gamma_l * (Df + B_m / 2.0) - u_df)  # σ'v at peak Iz
+                    Izp_l  = 0.5 + 0.1 * math.sqrt(qn_l / Po_l)
+                    C1_l   = max(0.5, 1.0 - 0.5 * (sv0_l / qn_l))
+                    Es_l   = _Es_MPa(N_l)
+
+                    # Bilinear Iz: 0.1 at z=0, peak Izp at B/2, 0 at 2B
+                    if z_mid_rel <= B_m / 2.0:
+                        Iz = (2.0 * z_mid_rel / B_m) * (Izp_l - 0.1) + 0.1
+                    elif z_mid_rel <= 2.0 * B_m:
+                        Iz = ((2.0 * B_m - z_mid_rel) / (1.5 * B_m)) * Izp_l
+                    else:
+                        Iz = 0.0
+
+                    if Iz > 0:
+                        # Se [mm] = qn * Iz * thick * C1 * C2 / Es  (qn kPa, Es MPa, thick m)
+                        elastic_mm += max(0.0, qn_l * Iz * thick * C1_l * C2_se / Es_l)
+
+                # ── Volumetric settlement (layers within 2B from surface) ──
+                # εv = 0 only when FS ≥ 2 or layer is beyond influence zone.
+                # Matches Excel formula (rows 2-4): no "NOT LIQUEFIABLE" override.
+                if z_bot <= 2.0 * B_m:
+                    if fs_l >= 2.0:
+                        ev = 0.0
+                    elif fs_l <= 0.5:
+                        ev = 0.05
+                    else:
+                        ev = (2.0 - fs_l) * 0.025
+                    if ev > 0:
+                        v_mm = ev * thick * 1000.0
+                        vol_mm += v_mm
+                        liq_lyrs.append({
+                            'layer':          lyr['layer_number'],
+                            'depth':          f"{lyr['depth_from_m']}–{lyr['depth_to_m']} m",
+                            'spt_n':          round(N_l, 1),
+                            'fs':             round(fs_l, 3),
+                            'settlement_mm':  round(v_mm, 2),
+                        })
+
+            total = round(elastic_mm + vol_mm, 2)
+            return total, elastic_mm, vol_mm, liq_lyrs
+
+        # ── Width iteration: try B = 1 → 3 m to satisfy settlement ≤ 25 mm ──
+        settlement_passed             = False
+        recommended_different_footing = False
+        settlement_mm                 = 0.0
+        liquefiable_layers            = []
+        qa_iter                       = 1.0
+
+        for B_try in range(1, 4):           # B = 1, 2, 3
+            B_f                    = float(B_try)
+            s_mm, e_mm, v_mm, liq = _schmertmann(B_f)
+            N_bc   = max(1.0, spt_n60)
+            Kd_try = 1.0 + 0.33 * (D_pred / B_f)
+            sf_try = ((B_f + 0.3) / B_f) ** 2
+            qa_try = max(1.0, 8.0 * N_bc * sf_try * Kd_try)
+            status = "PASS" if s_mm <= SI_ALLOW else "FAIL"
+            print(f"[WIDTH ITER] B={B_try}m | qa={qa_try:.1f}kPa | "
+                  f"elastic={e_mm:.1f}mm | vol={v_mm:.1f}mm | "
+                  f"total={s_mm:.1f}mm | {status}")
+            settlement_mm  = s_mm
+            liquefiable_layers = liq
+            qa_iter        = qa_try
+            if s_mm <= SI_ALLOW:
+                settlement_passed = True
+                B_pred = B_f
+                break
+            if B_try == 3:
+                recommended_different_footing = True
+                B_pred = 3.0
+
+        settlement_cm = round(settlement_mm / 10.0, 2)
+
+        # ── Bearing capacity at the design width ──────────────────────────
+        qa_from_db = idw_bearing(crit_ln, 'bearing_qa_kpa', borehole_data)
         if qa_from_db and qa_from_db > 1.0:
-            qa_site  = qa_from_db
-            qu_site  = qa_site * 3.0
-            B        = B_pred
-            D        = D_pred
-            print(
-                f"[INFO] Bearing capacity from DB (FIX 12): qa={qa_site:.1f} kPa")
+            qa_site = qa_from_db
+            qu_site = qa_site * 3.0
+            B       = B_pred
+            D       = D_pred
+            print(f"[INFO] Bearing capacity from DB (FIX 12): qa={qa_site:.1f} kPa")
         else:
-            B  = B_pred
-            D  = D_pred
-            N  = max(1.0, spt_n60)
-            Kd = 1.0 + 0.33 * (D / B)
-            size_factor = ((B + 0.3) / B) ** 2
-            qa_site  = max(1.0, 8.0 * N * size_factor * Kd)
-            qu_site  = qa_site * 3.0
-            print(
-                f"[INFO] Bearing capacity fallback (Meyerhof SPT): qa={qa_site:.1f} kPa")
-
-        # ── Settlement ─────────────────────────────────────────────────────
-        settle_from_db = idw_bearing(crit_ln, 'settlement_mm', borehole_data)
-
-        if settle_from_db and settle_from_db > 0:
-            pre_liq_settlement_cm = settle_from_db / 10.0
-            print(
-                f"[INFO] Settlement from DB (FIX 12): {settle_from_db:.1f} mm")
-        else:
-            pre_liq_settlement_cm = (q_actual / max(1.0, qa_site)) * 2.5
-            print(
-                f"[INFO] Settlement fallback: {pre_liq_settlement_cm:.1f} cm")
-
-        # ── Tokimatsu & Seed (1987) volumetric settlement ─────────────────
-        _DPWH_TO_4 = {'VERY HIGH': 'VERY HIGH', 'HIGH': 'HIGH',
-                      'MEDIUM': 'LOW', 'LOW': 'VERY LOW', 'VERY LOW': 'VERY LOW'}
-        total_settle_cm  = 0.0
-        liquefiable_layers = []
-        for lyr in interpolated_layers:
-            fs_lyr  = lyr['fs']
-            risk_4  = _DPWH_TO_4.get(
-                lyr.get('liquefaction_risk_level', 'VERY LOW'), 'VERY LOW')
-            if risk_4 == 'VERY HIGH':
-                fs_settle = min(fs_lyr, 0.6)
-            elif risk_4 == 'HIGH':
-                fs_settle = min(fs_lyr, 0.8)
-            elif risk_4 == 'LOW':
-                fs_settle = min(fs_lyr, 0.95)
-            else:
-                fs_settle = fs_lyr
-
-            if fs_settle < 1.0:
-                N_l    = max(1.0, float(lyr.get('spt_n_value', 20) or 20))
-                csr_l  = float(lyr.get('csr') or 0.2) or 0.2
-                thick  = float(lyr.get('layer_thickness', 1.5))
-                ev_max = {N_l < 5: 4.0, N_l < 10: 3.0, N_l < 15: 2.0,
-                          N_l < 20: 1.0}.get(True, 0.5)
-                ev     = max(0.0, min(ev_max, ev_max *
-                             min(csr_l / 0.3, 1.0) * (1.0 - fs_settle)))
-                lyr_s  = round((ev / 100.0) * thick * 100.0, 2)
-                total_settle_cm += lyr_s
-                liquefiable_layers.append({
-                    'layer':         lyr['layer_number'],
-                    'depth':         f"{lyr['depth_from_m']}–{lyr['depth_to_m']} m",
-                    'spt_n':         round(N_l, 1),
-                    'fs':            round(fs_lyr, 3),
-                    'settlement_cm': lyr_s,
-                })
-
-        # BUG C FIX — minimum settlement floors driven by LPI-based risk_level
-        floors          = {'VERY HIGH': 7.0, 'HIGH': 4.0, 'MEDIUM': 2.0, 'LOW': 1.0}
-        total_settle_cm = max(total_settle_cm, floors.get(risk_level, 0.0))
-        settlement_cm   = round(pre_liq_settlement_cm + total_settle_cm, 2)
-        settlement_mm   = settlement_cm * 10.0
+            B       = B_pred
+            D       = D_pred
+            qa_site = qa_iter
+            qu_site = qa_site * 3.0
+            print(f"[INFO] Bearing capacity (Meyerhof B={B:.0f}m): qa={qa_site:.1f} kPa")
 
         # ── Rock / hard material within influence depth check ─────────────
         # Influence depth = B (footing width) below foundation level.
@@ -1318,8 +1384,7 @@ async def predict(
         settle_fs  = qa_site / q_actual if q_actual > 0 else float('inf')
         settle_sev = "High" if settlement_cm > 10 else "Moderate" if settlement_cm > 5 else "Low"
 
-        at_max     = (B_pred >= MAX_B and D_pred >= MAX_D)
-        mitigation = settlement_mm > SI_ALLOW and at_max
+        mitigation = recommended_different_footing
 
         # ── Recommendations ────────────────────────────────────────────────
         recommendations = []
@@ -1378,14 +1443,20 @@ async def predict(
                 f"Design life = {t_years:.0f} yr: verify long-term consolidation within {SI_ALLOW:.0f} mm limit."
             )
 
-        if mitigation:
+        if recommended_different_footing:
             recommendations.extend([
-                "⚠️ CRITICAL: Settlement exceeds 25 mm at maximum practical dimensions. Mitigation required.",
-                "Option 1 — Deep foundations (piles/caissons) to competent stratum below liquefiable zone",
-                "Option 2 — Ground densification: vibro-compaction or dynamic compaction",
-                "Option 3 — Jet grouting or deep soil mixing (DSM)",
-                "Option 4 — Preloading with prefabricated vertical drains (PVDs)",
+                f"⚠️ Settlement exceeds {SI_ALLOW:.0f} mm at all tested widths (B = 1–3 m). "
+                "A different foundation type is required.",
+                "Option 1 — Raft/mat foundation to distribute load over a larger area",
+                "Option 2 — Deep foundations (piles/caissons) to competent stratum below liquefiable zone",
+                "Option 3 — Ground densification: vibro-compaction or dynamic compaction",
+                "Option 4 — Jet grouting or deep soil mixing (DSM)",
             ])
+        elif settlement_passed:
+            recommendations.append(
+                f"Settlement within allowable limit ({settlement_mm:.1f} mm ≤ {SI_ALLOW:.0f} mm) "
+                f"at footing width B = {B_pred:.0f} m."
+            )
 
         nearest_dist = interpolation_info.get('nearest_distance_km', 0)
         if nearest_dist > 20:
@@ -1447,11 +1518,13 @@ async def predict(
                 ),
             },
             foundation_recommendation={
-                "base_m":                  round(B_pred, 2),
-                "depth_m":                 round(D_pred, 2),
-                "mitigation_required":     mitigation,
-                "settlement_mm":           round(settlement_mm, 1),
-                "allowable_settlement_mm": SI_ALLOW,
+                "base_m":                   round(B_pred, 2),
+                "depth_m":                  round(D_pred, 2),
+                "mitigation_required":      mitigation,
+                "settlement_mm":            round(settlement_mm, 1),
+                "allowable_settlement_mm":  SI_ALLOW,
+                "settlement_passed":        settlement_passed,
+                "recommend_footing_change": recommended_different_footing,
             },
             recommendations=recommendations,
             analysis_parameters={
