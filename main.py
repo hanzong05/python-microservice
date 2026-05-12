@@ -1523,7 +1523,7 @@ async def predict(
                 ),
             },
             foundation_recommendation={
-                "base_m":                   None if recommended_different_footing else round(B_pred, 2),
+                "base_m":                   round(B_pred, 2),
                 "depth_m":                  round(D_pred, 2),
                 "mitigation_required":      mitigation,
                 "settlement_mm":            round(settlement_mm, 1),
